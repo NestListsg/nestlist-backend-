@@ -1,0 +1,277 @@
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from supabase import create_client
+import bcrypt
+import os
+import jwt
+import anthropic
+import requests
+from datetime import datetime, timedelta
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://osxxngwryyairxbjqixr.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", "nestlist-secret-2026")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+FB_PAGE_ACCESS_TOKEN = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
+FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+security = HTTPBearer()
+
+# ================================
+# MODELS
+# ================================
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str
+    agency: str
+    specialty: str
+
+class ListingRequest(BaseModel):
+    property_type: str
+    location: str
+    land_size: int = 0
+    built_up: int = 0
+    bedrooms: str
+    price: str
+    features: str
+    plot_width: float = 0
+    plot_depth: float = 0
+    storeys: int = 0
+    site_coverage: float = 0
+    sg_citizen: bool = False
+
+class ProfileUpdate(BaseModel):
+    name: str
+    agency: str
+    specialty: str
+    tone: str
+    emphasis: str
+    signature: str
+    contact: str = ""
+
+class FacebookPostRequest(BaseModel):
+    listing_id: str
+
+# ================================
+# AUTH HELPERS
+# ================================
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        if hashed.startswith("$2b$") or hashed.startswith("$2a$"):
+            return bcrypt.checkpw(password.encode(), hashed.encode())
+        return password == hashed
+    except:
+        return False
+
+def create_token(agent_id: str) -> str:
+    payload = {"agent_id": agent_id, "exp": datetime.utcnow() + timedelta(days=7)}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        agent_id = payload["agent_id"]
+        result = supabase.table("agents").select("*").eq("id", agent_id).execute()
+        if not result.data:
+            raise HTTPException(status_code=401, detail="Agent not found")
+        return result.data[0]
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ================================
+# AUTH ROUTES
+# ================================
+@app.post("/api/login")
+def login(req: LoginRequest):
+    result = supabase.table("agents").select("*").eq("email", req.email).execute()
+    if not result.data:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    agent = result.data[0]
+    if not verify_password(req.password, agent["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not (agent["password_hash"].startswith("$2b$") or agent["password_hash"].startswith("$2a$")):
+        supabase.table("agents").update({"password_hash": hash_password(req.password)}).eq("id", agent["id"]).execute()
+    token = create_token(str(agent["id"]))
+    return {"token": token, "agent": {k: v for k, v in agent.items() if k != "password_hash"}}
+
+@app.post("/api/register")
+def register(req: RegisterRequest):
+    existing = supabase.table("agents").select("id").eq("email", req.email).execute()
+    if existing.data:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    result = supabase.table("agents").insert({
+        "email": req.email,
+        "password_hash": hash_password(req.password),
+        "name": req.name,
+        "agency": req.agency,
+        "specialty": req.specialty,
+        "tone": "Warm & Conversational",
+        "emphasis": "Lifestyle & Prestige",
+        "signature": "Where your next chapter begins."
+    }).execute()
+    agent = result.data[0]
+    token = create_token(str(agent["id"]))
+    return {"token": token, "agent": {k: v for k, v in agent.items() if k != "password_hash"}}
+
+# ================================
+# LISTINGS ROUTES
+# ================================
+@app.get("/api/listings")
+def get_listings(agent=Depends(get_current_agent)):
+    result = supabase.table("listings").select("*").eq("agent_id", agent["id"]).order("created_at", desc=True).execute()
+    return result.data or []
+
+@app.post("/api/listings/generate")
+def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)):
+    # URA Compliance Check
+    gcb_zones = [
+        "nassim", "cluny", "white house park", "dalvey", "ladyhill",
+        "cornwall", "king albert park", "raffles park", "swiss club",
+        "victoria park", "holland", "bin tong park", "leedon",
+        "maryland", "bishopsgate", "fourth avenue", "grange", "jervois",
+        "rochalie", "linden", "chee hoon", "swettenham", "tanglin",
+        "chestnut", "sunset", "upper bukit timah", "rifle range",
+        "spring grove", "belmont", "windsor"
+    ]
+    issues, warnings, passed = [], [], []
+    is_gcb = "gcb" in req.property_type.lower() or "bungalow" in req.property_type.lower()
+
+    if is_gcb:
+        if any(z in req.location.lower() for z in gcb_zones):
+            passed.append("Location confirmed within gazetted GCBa zone")
+        else:
+            warnings.append("Location could not be verified as GCBa zone — please confirm with URA.")
+        if req.land_size >= 15069:
+            passed.append(f"Land size {req.land_size:,} sqft meets URA minimum")
+        elif req.land_size >= 14000:
+            warnings.append(f"Land size {req.land_size:,} sqft is slightly below URA minimum")
+        elif req.land_size > 0:
+            issues.append(f"Land size {req.land_size:,} sqft does not meet GCB minimum of 15,069 sqft")
+        if req.plot_width >= 18.5:
+            passed.append(f"Plot width {req.plot_width}m meets URA minimum")
+        elif req.plot_width > 0:
+            issues.append(f"Plot width {req.plot_width}m does not meet URA minimum of 18.5m")
+        if req.plot_depth >= 30:
+            passed.append(f"Plot depth {req.plot_depth}m meets URA minimum")
+        elif req.plot_depth > 0:
+            issues.append(f"Plot depth {req.plot_depth}m does not meet URA minimum of 30m")
+        if req.site_coverage > 0:
+            if req.site_coverage <= 40:
+                passed.append(f"Site coverage {req.site_coverage}% within URA maximum")
+            else:
+                issues.append(f"Site coverage {req.site_coverage}% exceeds URA maximum of 40%")
+        if req.storeys > 0:
+            if req.storeys <= 2:
+                passed.append(f"{req.storeys} storey(s) meets URA maximum")
+            else:
+                issues.append(f"{req.storeys} storeys exceeds URA maximum of 2 for GCB")
+        if not req.sg_citizen:
+            issues.append("GCB purchases restricted to Singapore Citizens only")
+        else:
+            passed.append("Buyer confirmed as Singapore Citizen")
+
+    if issues:
+        return {"compliance": {"passed": passed, "warnings": warnings, "issues": issues}, "listing": None}
+
+    # Generate listing with Claude
+    prompt = f"""You are {agent['name']} from {agent['agency']}, a specialist in {agent['specialty']}.
+Your tone: {agent.get('tone', 'Warm & Conversational')}
+You emphasise: {agent.get('emphasis', 'Lifestyle & Prestige')}
+Your signature phrase: "{agent.get('signature', 'Where your next chapter begins.')}"
+Weave this phrase in naturally.
+
+Write a premium property listing for:
+- Type: {req.property_type}
+- Location: {req.location}
+- Land size: {req.land_size:,} sqft
+- Built-up: {req.built_up:,} sqft
+- Bedrooms: {req.bedrooms}
+- Price: SGD {req.price}
+- Features: {req.features}
+
+Write:
+1. A compelling headline in your style
+2. Three paragraphs in your personal voice
+3. A warm call to action
+4. End with: {agent['name']} | {agent['agency']} Specialist"""
+
+    claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    response = claude.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    listing_text = response.content[0].text
+
+    saved = supabase.table("listings").insert({
+        "agent_id": agent["id"],
+        "location": req.location,
+        "price": req.price,
+        "property_type": req.property_type,
+        "content": listing_text
+    }).execute()
+
+    return {
+        "compliance": {"passed": passed, "warnings": warnings, "issues": issues},
+        "listing": saved.data[0]
+    }
+
+@app.post("/api/listings/{listing_id}/post-facebook")
+def post_to_facebook(listing_id: str, agent=Depends(get_current_agent)):
+    result = supabase.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = result.data[0]
+    post_message = f"""NEW LISTING | {listing['property_type']}
+{listing['location']}
+SGD {listing['price']}
+
+{listing['content'][:800]}...
+
+Contact us at nestlist.sg to find out more!
+
+#NestList #NestListPrestige #Singapore #SingaporeProperty #GCB #LandedProperty #PropertySG #RealEstate"""
+    response = requests.post(
+        f"https://graph.facebook.com/v25.0/{FB_PAGE_ID}/feed",
+        data={"message": post_message, "access_token": FB_PAGE_ACCESS_TOKEN}
+    )
+    result = response.json()
+    if "id" in result:
+        return {"success": True, "post_id": result["id"]}
+    else:
+        raise HTTPException(status_code=400, detail=result.get("error", {}).get("message", "Unknown error"))
+
+# ================================
+# PROFILE ROUTE
+# ================================
+@app.put("/api/profile")
+def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
+    supabase.table("agents").update(req.dict()).eq("id", agent["id"]).execute()
+    result = supabase.table("agents").select("*").eq("id", agent["id"]).execute()
+    agent = result.data[0]
+    return {k: v for k, v in agent.items() if k != "password_hash"}
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "service": "NestList Prestige API"}
