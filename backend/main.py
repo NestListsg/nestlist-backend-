@@ -20,15 +20,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://osxxngwryyairxbjqixr.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 JWT_SECRET = os.environ.get("JWT_SECRET", "nestlist-secret-2026")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-FB_PAGE_ACCESS_TOKEN = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
-FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 security = HTTPBearer()
+
+_supabase = None
+
+def get_db():
+    global _supabase
+    if _supabase is None:
+        url = os.environ.get("SUPABASE_URL", "")
+        key = os.environ.get("SUPABASE_KEY", "")
+        _supabase = create_client(url, key)
+    return _supabase
 
 # ================================
 # MODELS
@@ -67,9 +70,6 @@ class ProfileUpdate(BaseModel):
     signature: str
     contact: str = ""
 
-class FacebookPostRequest(BaseModel):
-    listing_id: str
-
 # ================================
 # AUTH HELPERS
 # ================================
@@ -92,7 +92,7 @@ def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(securi
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
         agent_id = payload["agent_id"]
-        result = supabase.table("agents").select("*").eq("id", agent_id).execute()
+        result = get_db().table("agents").select("*").eq("id", agent_id).execute()
         if not result.data:
             raise HTTPException(status_code=401, detail="Agent not found")
         return result.data[0]
@@ -104,23 +104,21 @@ def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(securi
 # ================================
 @app.post("/api/login")
 def login(req: LoginRequest):
-    result = supabase.table("agents").select("*").eq("email", req.email).execute()
+    result = get_db().table("agents").select("*").eq("email", req.email).execute()
     if not result.data:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     agent = result.data[0]
     if not verify_password(req.password, agent["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    if not (agent["password_hash"].startswith("$2b$") or agent["password_hash"].startswith("$2a$")):
-        supabase.table("agents").update({"password_hash": hash_password(req.password)}).eq("id", agent["id"]).execute()
     token = create_token(str(agent["id"]))
     return {"token": token, "agent": {k: v for k, v in agent.items() if k != "password_hash"}}
 
 @app.post("/api/register")
 def register(req: RegisterRequest):
-    existing = supabase.table("agents").select("id").eq("email", req.email).execute()
+    existing = get_db().table("agents").select("id").eq("email", req.email).execute()
     if existing.data:
         raise HTTPException(status_code=400, detail="Email already registered")
-    result = supabase.table("agents").insert({
+    result = get_db().table("agents").insert({
         "email": req.email,
         "password_hash": hash_password(req.password),
         "name": req.name,
@@ -139,12 +137,11 @@ def register(req: RegisterRequest):
 # ================================
 @app.get("/api/listings")
 def get_listings(agent=Depends(get_current_agent)):
-    result = supabase.table("listings").select("*").eq("agent_id", agent["id"]).order("created_at", desc=True).execute()
+    result = get_db().table("listings").select("*").eq("agent_id", agent["id"]).order("created_at", desc=True).execute()
     return result.data or []
 
 @app.post("/api/listings/generate")
 def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)):
-    # URA Compliance Check
     gcb_zones = [
         "nassim", "cluny", "white house park", "dalvey", "ladyhill",
         "cornwall", "king albert park", "raffles park", "swiss club",
@@ -194,12 +191,11 @@ def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)):
     if issues:
         return {"compliance": {"passed": passed, "warnings": warnings, "issues": issues}, "listing": None}
 
-    # Generate listing with Claude
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     prompt = f"""You are {agent['name']} from {agent['agency']}, a specialist in {agent['specialty']}.
 Your tone: {agent.get('tone', 'Warm & Conversational')}
 You emphasise: {agent.get('emphasis', 'Lifestyle & Prestige')}
 Your signature phrase: "{agent.get('signature', 'Where your next chapter begins.')}"
-Weave this phrase in naturally.
 
 Write a premium property listing for:
 - Type: {req.property_type}
@@ -211,12 +207,12 @@ Write a premium property listing for:
 - Features: {req.features}
 
 Write:
-1. A compelling headline in your style
+1. A compelling headline
 2. Three paragraphs in your personal voice
 3. A warm call to action
 4. End with: {agent['name']} | {agent['agency']} Specialist"""
 
-    claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    claude = anthropic.Anthropic(api_key=api_key)
     response = claude.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=1024,
@@ -224,7 +220,7 @@ Write:
     )
     listing_text = response.content[0].text
 
-    saved = supabase.table("listings").insert({
+    saved = get_db().table("listings").insert({
         "agent_id": agent["id"],
         "location": req.location,
         "price": req.price,
@@ -239,10 +235,12 @@ Write:
 
 @app.post("/api/listings/{listing_id}/post-facebook")
 def post_to_facebook(listing_id: str, agent=Depends(get_current_agent)):
-    result = supabase.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
+    fb_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
+    fb_page_id = os.environ.get("FB_PAGE_ID", "")
     post_message = f"""NEW LISTING | {listing['property_type']}
 {listing['location']}
 SGD {listing['price']}
@@ -253,22 +251,22 @@ Contact us at nestlist.sg to find out more!
 
 #NestList #NestListPrestige #Singapore #SingaporeProperty #GCB #LandedProperty #PropertySG #RealEstate"""
     response = requests.post(
-        f"https://graph.facebook.com/v25.0/{FB_PAGE_ID}/feed",
-        data={"message": post_message, "access_token": FB_PAGE_ACCESS_TOKEN}
+        f"https://graph.facebook.com/v25.0/{fb_page_id}/feed",
+        data={"message": post_message, "access_token": fb_token}
     )
-    result = response.json()
-    if "id" in result:
-        return {"success": True, "post_id": result["id"]}
+    data = response.json()
+    if "id" in data:
+        return {"success": True, "post_id": data["id"]}
     else:
-        raise HTTPException(status_code=400, detail=result.get("error", {}).get("message", "Unknown error"))
+        raise HTTPException(status_code=400, detail=data.get("error", {}).get("message", "Unknown error"))
 
 # ================================
 # PROFILE ROUTE
 # ================================
 @app.put("/api/profile")
 def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
-    supabase.table("agents").update(req.dict()).eq("id", agent["id"]).execute()
-    result = supabase.table("agents").select("*").eq("id", agent["id"]).execute()
+    get_db().table("agents").update(req.dict()).eq("id", agent["id"]).execute()
+    result = get_db().table("agents").select("*").eq("id", agent["id"]).execute()
     agent = result.data[0]
     return {k: v for k, v in agent.items() if k != "password_hash"}
 
