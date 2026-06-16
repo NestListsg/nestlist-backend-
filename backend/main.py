@@ -11,7 +11,23 @@ import requests
 from datetime import datetime, timedelta
 
 app = FastAPI()
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
+class CORSManualMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            from starlette.responses import Response
+            response = Response()
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+            return response
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+
+app.add_middleware(CORSManualMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[*],
