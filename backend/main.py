@@ -282,3 +282,58 @@ def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "NestList Prestige API"}
+
+
+@app.post("/api/extract-listing-image")
+async def extract_listing_image(request: Request):
+    try:
+        body = await request.json()
+        image_data = body.get("image_data")
+        media_type = body.get("media_type", "image/jpeg")
+        
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        
+        message = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1000,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_data
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": """Extract property listing details from this image and return ONLY a JSON object with these exact fields:
+{
+  "property_type": "one of: Good Class Bungalow (GCB), Landed Bungalow, Semi-Detached, Terrace House, Penthouse, Ultra Luxury Investment Property, HDB Flat, Condominium",
+  "location": "full address or area",
+  "land_size": number in sqft or 0,
+  "built_up": number in sqft or 0,
+  "bedrooms": "e.g. 4 bedrooms, 3 bathrooms",
+  "price": "e.g. 25,000,000",
+  "features": "special features as comma separated text",
+  "plot_width": number in metres or 0,
+  "plot_depth": number in metres or 0,
+  "storeys": number or 0,
+  "site_coverage": number as percentage or 0
+}
+Return only valid JSON, nothing else."""
+                    }
+                ]
+            }]
+        )
+        
+        import json
+        text = message.content[0].text.strip()
+        clean = text.replace("```json", "").replace("```", "").strip()
+        extracted = json.loads(clean)
+        return extracted
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
