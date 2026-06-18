@@ -291,7 +291,9 @@ async def extract_listing_image(request: Request):
         image_data = body.get("image_data")
         media_type = body.get("media_type", "image/jpeg")
         
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        print(f"API KEY FOUND: {api_key[:10] if api_key else 'NONE'}", flush=True)
+        client = anthropic.Anthropic(api_key=api_key)
         
         message = client.messages.create(
             model="claude-sonnet-4-5",
