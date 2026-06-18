@@ -336,4 +336,5 @@ Return only valid JSON, nothing else."""
         return extracted
         
     except Exception as e:
+        print(f"EXTRACT IMAGE ERROR: {str(e)}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
