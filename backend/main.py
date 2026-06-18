@@ -287,6 +287,7 @@ def health():
 @app.post("/api/extract-listing-image")
 async def extract_listing_image(request: Request):
     try:
+        print("ENDPOINT REACHED", flush=True)
         body = await request.json()
         image_data = body.get("image_data")
         media_type = body.get("media_type", "image/jpeg")
