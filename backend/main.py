@@ -287,32 +287,33 @@ def health():
 @app.post("/api/extract-listing-image")
 async def extract_listing_image(request: Request):
     try:
-        print("ENDPOINT REACHED", flush=True)
         body = await request.json()
-        image_data = body.get("image_data")
-        media_type = body.get("media_type", "image/jpeg")
-        
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        print(f"API KEY FOUND: {api_key[:10] if api_key else 'NONE'}", flush=True)
-        client = anthropic.Anthropic(api_key=api_key)
-        
-        message = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=1000,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": image_data
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": """Extract property listing details from this image and return ONLY a JSON object with these exact fields:
+        images = body.get("images", [])
+        if not images:
+            image_data = body.get("image_data")
+            media_type = body.get("media_type", "image/jpeg")
+            if image_data:
+                images = [{"image_data": image_data, "media_type": media_type}]
+
+        if not images:
+            raise HTTPException(status_code=400, detail="No images provided")
+
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+        content = []
+        for img in images[:5]:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.get("media_type", "image/jpeg"),
+                    "data": img.get("image_data")
+                }
+            })
+
+        content.append({
+            "type": "text",
+            "text": """Extract property listing details from these images and return ONLY a JSON object with these exact fields:
 {
   "property_type": "one of: Good Class Bungalow (GCB), Landed Bungalow, Semi-Detached, Terrace House, Penthouse, Ultra Luxury Investment Property, HDB Flat, Condominium",
   "location": "full address or area",
@@ -327,16 +328,22 @@ async def extract_listing_image(request: Request):
   "site_coverage": number as percentage or 0
 }
 Return only valid JSON, nothing else."""
-                    }
-                ]
-            }]
-        )
-        
+        })
+
         import json
+        message = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": content}]
+        )
+
         text = message.content[0].text.strip()
         clean = text.replace("```json", "").replace("```", "").strip()
         extracted = json.loads(clean)
         return extracted
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
         
     except Exception as e:
         print(f"EXTRACT IMAGE ERROR: {str(e)}", flush=True)
