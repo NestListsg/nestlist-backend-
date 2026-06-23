@@ -66,7 +66,7 @@ class ListingRequest(BaseModel):
     features: str
     plot_width: float = 0
     plot_depth: float = 0
-    storeys: int = 0
+    storeys: float = 0
     site_coverage: float = 0
     sg_citizen: bool = False
 
