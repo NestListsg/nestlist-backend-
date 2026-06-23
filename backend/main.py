@@ -242,8 +242,7 @@ Write:
             "plot_depth": req.plot_depth,
             "storeys": req.storeys,
             "site_coverage": req.site_coverage,
-            "features": req.features,
-            "images": []
+            "features": req.features,        
         }).execute()
         
     return {
