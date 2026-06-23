@@ -230,13 +230,22 @@ Write:
     listing_text = response.content[0].text
 
     saved = get_db().table("listings").insert({
-        "agent_id": agent["id"],
-        "location": req.location,
-        "price": req.price,
-        "property_type": req.property_type,
-        "content": listing_text
-    }).execute()
-
+            "agent_id": agent["id"],
+            "location": req.location,
+            "price": req.price,
+            "property_type": req.property_type,
+            "content": listing_text,
+            "land_size": req.land_size,
+            "built_up": req.built_up,
+            "bedrooms": req.bedrooms,
+            "plot_width": req.plot_width,
+            "plot_depth": req.plot_depth,
+            "storeys": req.storeys,
+            "site_coverage": req.site_coverage,
+            "features": req.features,
+            "images": []
+        }).execute()
+        
     return {
         "compliance": {"passed": passed, "warnings": warnings, "issues": issues},
         "listing": saved.data[0]
