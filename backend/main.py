@@ -243,7 +243,6 @@ Write:
             "storeys": req.storeys,
             "site_coverage": req.site_coverage,
             "features": req.features,
-            "images": []
         }).execute()
         
     return {
