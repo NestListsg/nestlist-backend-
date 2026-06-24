@@ -357,3 +357,53 @@ Return only valid JSON, nothing else."""
     except Exception as e:
         print(f"EXTRACT IMAGE ERROR: {str(e)}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+        @app.post("/api/listings/{listing_id}/upload-images")
+async def upload_listing_images(listing_id: str, request: Request, agent=Depends(get_current_agent)):
+    try:
+        import base64
+        import io
+        from PIL import Image as PILImage
+
+        body = await request.json()
+        images = body.get("images", [])
+
+        if not images:
+            raise HTTPException(status_code=400, detail="No images provided")
+
+        if len(images) > 15:
+            images = images[:15]
+
+        supabase = get_db()
+        image_urls = []
+
+        for i, img in enumerate(images):
+            image_data = img.get("image_data")
+            media_type = img.get("media_type", "image/jpeg")
+
+            img_bytes = base64.b64decode(image_data)
+            pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+            pil_img.thumbnail((1920, 1920))
+
+            buffer = io.BytesIO()
+            pil_img.save(buffer, format="JPEG", quality=80)
+            buffer.seek(0)
+            compressed = buffer.read()
+
+            filename = f"{listing_id}/{i}_{listing_id[:8]}.jpg"
+            supabase.storage.from_("listings-images").upload(
+                filename,
+                compressed,
+                {"content-type": "image/jpeg", "upsert": "true"}
+            )
+
+            url = supabase.storage.from_("listings-images").get_public_url(filename)
+            image_urls.append(url)
+
+        supabase.table("listings").update({"images": image_urls}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+
+        return {"success": True, "image_urls": image_urls}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
