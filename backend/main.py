@@ -135,7 +135,7 @@ def register(req: RegisterRequest):
         "specialty": req.specialty,
         "tone": "Warm & Conversational",
         "emphasis": "Lifestyle & Prestige",
-        "signature": "Where your next chapter begins."
+        "signature": "Where your next chapter begins.",
         "tier": "prestige"
     }).execute()
     agent = result.data[0]
