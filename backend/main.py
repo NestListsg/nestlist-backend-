@@ -8,7 +8,11 @@ import os
 import jwt
 import anthropic
 import requests
+import base64
+import io
+import json
 from datetime import datetime, timedelta
+from PIL import Image as PILImage
 
 app = FastAPI()
 
@@ -231,25 +235,68 @@ Write:
     listing_text = response.content[0].text
 
     saved = get_db().table("listings").insert({
-            "agent_id": agent["id"],
-            "location": req.location,
-            "price": req.price,
-            "property_type": req.property_type,
-            "content": listing_text,
-            "land_size": req.land_size,
-            "built_up": req.built_up,
-            "bedrooms": req.bedrooms,
-            "plot_width": req.plot_width,
-            "plot_depth": req.plot_depth,
-            "storeys": req.storeys,
-            "site_coverage": req.site_coverage,
-            "features": req.features,
-        }).execute()
-        
+        "agent_id": agent["id"],
+        "location": req.location,
+        "price": req.price,
+        "property_type": req.property_type,
+        "content": listing_text,
+        "land_size": req.land_size,
+        "built_up": req.built_up,
+        "bedrooms": req.bedrooms,
+        "plot_width": req.plot_width,
+        "plot_depth": req.plot_depth,
+        "storeys": req.storeys,
+        "site_coverage": req.site_coverage,
+        "features": req.features,
+    }).execute()
+
     return {
         "compliance": {"passed": passed, "warnings": warnings, "issues": issues},
         "listing": saved.data[0]
     }
+
+@app.post("/api/listings/{listing_id}/upload-images")
+async def upload_listing_images(listing_id: str, request: Request, agent=Depends(get_current_agent)):
+    try:
+        body = await request.json()
+        images = body.get("images", [])
+
+        if not images:
+            raise HTTPException(status_code=400, detail="No images provided")
+
+        if len(images) > 15:
+            images = images[:15]
+
+        supabase = get_db()
+        image_urls = []
+
+        for i, img in enumerate(images):
+            image_data = img.get("image_data")
+            img_bytes = base64.b64decode(image_data)
+            pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+            pil_img.thumbnail((1920, 1920))
+
+            buffer = io.BytesIO()
+            pil_img.save(buffer, format="JPEG", quality=80)
+            buffer.seek(0)
+            compressed = buffer.read()
+
+            filename = f"{listing_id}/{i}_{listing_id[:8]}.jpg"
+            supabase.storage.from_("listings-images").upload(
+                filename,
+                compressed,
+                {"content-type": "image/jpeg", "upsert": "true"}
+            )
+
+            url = supabase.storage.from_("listings-images").get_public_url(filename)
+            image_urls.append(url)
+
+        supabase.table("listings").update({"images": image_urls}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+
+        return {"success": True, "image_urls": image_urls}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/listings/{listing_id}/post-facebook")
 def post_to_facebook(listing_id: str, agent=Depends(get_current_agent)):
@@ -291,7 +338,6 @@ def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "NestList Prestige API"}
-
 
 @app.post("/api/extract-listing-image")
 async def extract_listing_image(request: Request):
@@ -339,7 +385,6 @@ async def extract_listing_image(request: Request):
 Return only valid JSON, nothing else."""
         })
 
-        import json
         message = client.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=1000,
@@ -350,60 +395,6 @@ Return only valid JSON, nothing else."""
         clean = text.replace("```json", "").replace("```", "").strip()
         extracted = json.loads(clean)
         return extracted
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-        
-    except Exception as e:
-        print(f"EXTRACT IMAGE ERROR: {str(e)}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-        @app.post("/api/listings/{listing_id}/upload-images")
-async def upload_listing_images(listing_id: str, request: Request, agent=Depends(get_current_agent)):
-    try:
-        import base64
-        import io
-        from PIL import Image as PILImage
-
-        body = await request.json()
-        images = body.get("images", [])
-
-        if not images:
-            raise HTTPException(status_code=400, detail="No images provided")
-
-        if len(images) > 15:
-            images = images[:15]
-
-        supabase = get_db()
-        image_urls = []
-
-        for i, img in enumerate(images):
-            image_data = img.get("image_data")
-            media_type = img.get("media_type", "image/jpeg")
-
-            img_bytes = base64.b64decode(image_data)
-            pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
-            pil_img.thumbnail((1920, 1920))
-
-            buffer = io.BytesIO()
-            pil_img.save(buffer, format="JPEG", quality=80)
-            buffer.seek(0)
-            compressed = buffer.read()
-
-            filename = f"{listing_id}/{i}_{listing_id[:8]}.jpg"
-            supabase.storage.from_("listings-images").upload(
-                filename,
-                compressed,
-                {"content-type": "image/jpeg", "upsert": "true"}
-            )
-
-            url = supabase.storage.from_("listings-images").get_public_url(filename)
-            image_urls.append(url)
-
-        supabase.table("listings").update({"images": image_urls}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
-
-        return {"success": True, "image_urls": image_urls}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
