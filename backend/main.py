@@ -136,6 +136,7 @@ def register(req: RegisterRequest):
         "tone": "Warm & Conversational",
         "emphasis": "Lifestyle & Prestige",
         "signature": "Where your next chapter begins."
+        "tier": "prestige"
     }).execute()
     agent = result.data[0]
     token = create_token(str(agent["id"]))
