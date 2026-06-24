@@ -8,3 +8,4 @@ requests
 python-multipart
 pydantic
 httpx
+Pillow
