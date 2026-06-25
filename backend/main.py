@@ -398,3 +398,29 @@ Return only valid JSON, nothing else."""
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+        @app.get("/api/market-pulse")
+def get_market_pulse():
+    result = get_db().table("market_pulse").select("*").eq("id", 1).execute()
+    if result.data:
+        return result.data[0]
+    return {
+        "gcb_transactions": "~36 units",
+        "gcb_total_value": "SGD 1.36B",
+        "gcb_avg_psf": "SGD 2,134",
+        "gcb_largest": "SGD 148M",
+        "nassim_range": "SGD 2,500–4,000 psf",
+        "last_updated": "Jan 2026"
+    }
+
+
+@app.put("/api/market-pulse")
+def update_market_pulse(request: Request, agent=Depends(get_current_agent)):
+    if agent["email"] != "leesbjane@gmail.com":
+        raise HTTPException(status_code=403, detail="Not authorised")
+    from datetime import date
+    body = await request.json()
+    body["last_updated"] = date.today().strftime("%b %Y")
+    get_db().table("market_pulse").upsert({"id": 1, **body}).execute()
+    return {"success": True}
