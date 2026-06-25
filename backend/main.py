@@ -424,3 +424,30 @@ async def update_market_pulse(request: Request, agent=Depends(get_current_agent)
     body["last_updated"] = date.today().strftime("%b %Y")
     get_db().table("market_pulse").upsert({"id": 1, **body}).execute()
     return {"success": True}
+
+
+# ================================
+# ENQUIRIES ROUTES
+# ================================
+@app.get("/api/enquiries")
+def get_enquiries(agent=Depends(get_current_agent)):
+    result = get_db().table("enquiries").select("*").eq("agent_id", agent["id"]).order("created_at", desc=True).execute()
+    return result.data or []
+
+@app.post("/api/enquiries")
+async def create_enquiry(request: Request, agent=Depends(get_current_agent)):
+    body = await request.json()
+    body["agent_id"] = agent["id"]
+    result = get_db().table("enquiries").insert(body).execute()
+    return result.data[0]
+
+@app.put("/api/enquiries/{enquiry_id}")
+async def update_enquiry(enquiry_id: str, request: Request, agent=Depends(get_current_agent)):
+    body = await request.json()
+    result = get_db().table("enquiries").update(body).eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
+    return result.data[0]
+
+@app.delete("/api/enquiries/{enquiry_id}")
+def delete_enquiry(enquiry_id: str, agent=Depends(get_current_agent)):
+    get_db().table("enquiries").delete().eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
+    return {"success": True}
