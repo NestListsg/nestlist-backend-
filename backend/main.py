@@ -400,7 +400,7 @@ Return only valid JSON, nothing else."""
         raise HTTPException(status_code=500, detail=str(e))
 
 
-        @app.get("/api/market-pulse")
+@app.get("/api/market-pulse")
 def get_market_pulse():
     result = get_db().table("market_pulse").select("*").eq("id", 1).execute()
     if result.data:
