@@ -304,8 +304,10 @@ def post_to_facebook(listing_id: str, agent=Depends(get_current_agent)):
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
+
     fb_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
     fb_page_id = os.environ.get("FB_PAGE_ID", "")
+
     post_message = f"""NEW LISTING | {listing['property_type']}
 {listing['location']}
 SGD {listing['price']}
@@ -315,10 +317,44 @@ SGD {listing['price']}
 Contact us at nestlist.sg to find out more!
 
 #NestList #NestListPrestige #Singapore #SingaporeProperty #GCB #LandedProperty #PropertySG #RealEstate"""
-    response = requests.post(
-        f"https://graph.facebook.com/v25.0/{fb_page_id}/feed",
-        data={"message": post_message, "access_token": fb_token}
-    )
+
+    image_urls = listing.get("images") or []
+
+    if image_urls:
+        # Upload each photo as unpublished and collect media IDs
+        media_ids = []
+        for url in image_urls[:5]:
+            photo_response = requests.post(
+                f"https://graph.facebook.com/v25.0/{fb_page_id}/photos",
+                data={
+                    "url": url,
+                    "published": "false",
+                    "access_token": fb_token
+                }
+            )
+            photo_data = photo_response.json()
+            if "id" in photo_data:
+                media_ids.append({"media_fbid": photo_data["id"]})
+
+        # Build post data with attached photos
+        post_data = {
+            "message": post_message,
+            "access_token": fb_token
+        }
+        for i, media in enumerate(media_ids):
+            post_data[f"attached_media[{i}]"] = json.dumps(media)
+
+        response = requests.post(
+            f"https://graph.facebook.com/v25.0/{fb_page_id}/feed",
+            data=post_data
+        )
+    else:
+        # No photos, post text only
+        response = requests.post(
+            f"https://graph.facebook.com/v25.0/{fb_page_id}/feed",
+            data={"message": post_message, "access_token": fb_token}
+        )
+
     data = response.json()
     if "id" in data:
         return {"success": True, "post_id": data["id"]}
@@ -424,7 +460,6 @@ async def update_market_pulse(request: Request, agent=Depends(get_current_agent)
     body["last_updated"] = date.today().strftime("%b %Y")
     get_db().table("market_pulse").upsert({"id": 1, **body}).execute()
     return {"success": True}
-
 
 # ================================
 # ENQUIRIES ROUTES
