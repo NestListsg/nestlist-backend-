@@ -482,7 +482,7 @@ async def update_enquiry(enquiry_id: str, request: Request, agent=Depends(get_cu
     result = get_db().table("enquiries").update(body).eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
     return result.data[0]
 
-@app.delete("/api/enquiries/{enquiry_id}")
-def delete_enquiry(enquiry_id: str, agent=Depends(get_current_agent)):
-    get_db().table("enquiries").delete().eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
+@app.delete("/api/listings/{listing_id}")
+def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
+    get_db().table("listings").delete().eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return {"success": True}
