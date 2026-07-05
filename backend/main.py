@@ -486,3 +486,36 @@ async def update_enquiry(enquiry_id: str, request: Request, agent=Depends(get_cu
 def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
     get_db().table("listings").delete().eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return {"success": True}
+
+@app.get("/api/listings/{listing_id}/download-images")
+def download_listing_images(listing_id: str, agent=Depends(get_current_agent)):
+    import zipfile
+    from fastapi.responses import StreamingResponse
+
+    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    listing = result.data[0]
+    image_urls = listing.get("images") or []
+
+    if not image_urls:
+        raise HTTPException(status_code=404, detail="No images found for this listing")
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for i, url in enumerate(image_urls):
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    zip_file.writestr(f"property-photo-{i+1}.jpg", response.content)
+            except Exception:
+                continue
+
+    zip_buffer.seek(0)
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=listing-photos-{listing_id[:8]}.zip"}
+    )    
