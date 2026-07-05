@@ -232,7 +232,7 @@ Write:
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}]
     )
-    listing_text = response.content[0].text.strip().replace('---', '').strip()
+    listing_text = response.content[0].text.strip().replace('**', '').replace('---', '').replace('# ', '').strip()
 
     saved = get_db().table("listings").insert({
         "agent_id": agent["id"],
