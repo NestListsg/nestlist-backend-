@@ -9,3 +9,4 @@ python-multipart
 pydantic
 httpx
 Pillow
+httpx
