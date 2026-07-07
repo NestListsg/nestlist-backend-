@@ -11,10 +11,51 @@ import requests
 import base64
 import io
 import json
+import asyncio
+import httpx
 from datetime import datetime, timedelta, date
 from PIL import Image as PILImage
 
 app = FastAPI()
+
+async def send_telegram_alert(message: str):
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not bot_token or not chat_id:
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+            )
+    except Exception:
+        pass
+
+async def monitor_api_key():
+    while True:
+        await asyncio.sleep(3600)
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            await send_telegram_alert("🚨 <b>NestList Alert</b>\n\nANTHROPIC_API_KEY is missing.\n\nAgents cannot generate listings.\n\nFix: Add key at console.anthropic.com")
+            continue
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": "ping"}]},
+                    timeout=10
+                )
+                if response.status_code == 401:
+                    await send_telegram_alert("🚨 <b>NestList Alert</b>\n\nAnthropic API key has expired.\n\nAgents cannot generate listings.\n\nFix:\n1. console.anthropic.com\n2. Generate new key\n3. Update ANTHROPIC_API_KEY in Railway\n\nTime: " + datetime.now().strftime("%d %b %Y %H:%M"))
+        except Exception as e:
+            await send_telegram_alert(f"⚠️ <b>NestList Warning</b>\n\nCannot reach Anthropic API.\n\nError: {str(e)}\n\nTime: {datetime.now().strftime('%d %b %Y %H:%M')}")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(monitor_api_key())
+    await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -321,7 +362,6 @@ Contact us at nestlist.sg to find out more!
     image_urls = listing.get("images") or []
 
     if image_urls:
-        # Upload each photo as unpublished and collect media IDs
         media_ids = []
         for url in image_urls[:5]:
             photo_response = requests.post(
@@ -336,7 +376,6 @@ Contact us at nestlist.sg to find out more!
             if "id" in photo_data:
                 media_ids.append({"media_fbid": photo_data["id"]})
 
-        # Build post data with attached photos
         post_data = {
             "message": post_message,
             "access_token": fb_token
@@ -349,7 +388,6 @@ Contact us at nestlist.sg to find out more!
             data=post_data
         )
     else:
-        # No photos, post text only
         response = requests.post(
             f"https://graph.facebook.com/v25.0/{fb_page_id}/feed",
             data={"message": post_message, "access_token": fb_token}
@@ -482,6 +520,11 @@ async def update_enquiry(enquiry_id: str, request: Request, agent=Depends(get_cu
     result = get_db().table("enquiries").update(body).eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
     return result.data[0]
 
+@app.delete("/api/enquiries/{enquiry_id}")
+def delete_enquiry(enquiry_id: str, agent=Depends(get_current_agent)):
+    get_db().table("enquiries").delete().eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
+    return {"success": True}
+
 @app.delete("/api/listings/{listing_id}")
 def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
     get_db().table("listings").delete().eq("id", listing_id).eq("agent_id", agent["id"]).execute()
@@ -518,4 +561,4 @@ def download_listing_images(listing_id: str, agent=Depends(get_current_agent)):
         zip_buffer,
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=listing-photos-{listing_id[:8]}.zip"}
-    )    
+    )
