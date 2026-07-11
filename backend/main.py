@@ -63,9 +63,16 @@ async def _check_anthropic_key(api_key: str) -> bool:
     except Exception:
         return False
 
+async def _supabase_heartbeat():
+    try:
+        get_db().table("agents").select("id").limit(1).execute()
+    except Exception:
+        pass
+
 async def monitor_api_key():
     while True:
         await asyncio.sleep(3600)
+        await _supabase_heartbeat()
         primary_key = os.environ.get("ANTHROPIC_API_KEY", "")
         backup_key = os.environ.get("ANTHROPIC_API_KEY_BACKUP", "")
         if not primary_key:
