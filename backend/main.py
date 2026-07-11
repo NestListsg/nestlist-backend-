@@ -48,25 +48,49 @@ async def register_telegram_webhook():
     except Exception:
         pass
 
+async def _check_anthropic_key(api_key: str) -> bool:
+    if not api_key:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": "ping"}]},
+                timeout=10
+            )
+            return response.status_code != 401
+    except Exception:
+        return False
+
 async def monitor_api_key():
     while True:
         await asyncio.sleep(3600)
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
+        primary_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        backup_key = os.environ.get("ANTHROPIC_API_KEY_BACKUP", "")
+        if not primary_key:
             await send_telegram_alert("🚨 <b>NestList Alert</b>\n\nANTHROPIC_API_KEY is missing.\n\nAgents cannot generate listings.\n\nFix: Add key at console.anthropic.com")
             continue
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": "ping"}]},
-                    timeout=10
-                )
-                if response.status_code == 401:
-                    await send_telegram_alert("🚨 <b>NestList Alert</b>\n\nAnthropic API key has expired.\n\nAgents cannot generate listings.\n\nFix:\n1. console.anthropic.com\n2. Generate new key\n3. Update ANTHROPIC_API_KEY in Railway\n\nTime: " + datetime.now().strftime("%d %b %Y %H:%M"))
-        except Exception as e:
-            await send_telegram_alert(f"⚠️ <b>NestList Warning</b>\n\nCannot reach Anthropic API.\n\nError: {str(e)}\n\nTime: {datetime.now().strftime('%d %b %Y %H:%M')}")
+        primary_ok = await _check_anthropic_key(primary_key)
+        if not primary_ok:
+            backup_ok = await _check_anthropic_key(backup_key)
+            if backup_ok:
+                await send_telegram_alert("⚠️ <b>NestList Warning</b>\n\nPrimary Anthropic API key is invalid, but the backup key is active — agents are unaffected.\n\nPlease replace the primary key in Railway when convenient (no rush).\n\nTime: " + datetime.now().strftime("%d %b %Y %H:%M"))
+            else:
+                await send_telegram_alert("🚨 <b>NestList Alert</b>\n\nBoth the primary and backup Anthropic API keys are invalid. Agents CANNOT generate listings.\n\nFix:\n1. console.anthropic.com\n2. Generate new key(s)\n3. Update ANTHROPIC_API_KEY and/or ANTHROPIC_API_KEY_BACKUP in Railway\n\nTime: " + datetime.now().strftime("%d %b %Y %H:%M"))
+
+async def create_claude_message(**kwargs):
+    primary_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    try:
+        client = anthropic.Anthropic(api_key=primary_key)
+        return client.messages.create(**kwargs)
+    except anthropic.AuthenticationError:
+        backup_key = os.environ.get("ANTHROPIC_API_KEY_BACKUP", "")
+        if not backup_key:
+            raise
+        await send_telegram_alert("⚠️ <b>NestList Alert</b>\n\nPrimary Anthropic API key failed — automatically switched to the backup key, agents are unaffected.\n\nPlease check/replace the primary key in Railway when convenient (no rush).")
+        client = anthropic.Anthropic(api_key=backup_key)
+        return client.messages.create(**kwargs)
 
 @app.on_event("startup")
 async def startup_event():
@@ -221,7 +245,7 @@ def get_listings(agent=Depends(get_current_agent)):
     return result.data or []
 
 @app.post("/api/listings/generate")
-def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)):
+async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)):
     gcb_zones = [
         "nassim", "cluny", "white house park", "dalvey", "ladyhill",
         "cornwall", "king albert park", "raffles park", "swiss club",
@@ -271,7 +295,6 @@ def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)):
     if issues:
         return {"compliance": {"passed": passed, "warnings": warnings, "issues": issues}, "listing": None}
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     prompt = f"""You are {agent['name']} from {agent['agency']}, a specialist in {agent['specialty']}.
 Your tone: {agent.get('tone', 'Warm & Conversational')}
 You emphasise: {agent.get('emphasis', 'Lifestyle & Prestige')}
@@ -292,8 +315,7 @@ Write:
 3. A warm call to action
 4. End with: {agent['name']} | {agent['agency']} Specialist"""
 
-    claude = anthropic.Anthropic(api_key=api_key)
-    response = claude.messages.create(
+    response = await create_claude_message(
         model="claude-sonnet-4-5",
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}]
@@ -472,8 +494,6 @@ async def extract_listing_image(request: Request):
         if not images:
             raise HTTPException(status_code=400, detail="No images provided")
 
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
         content = []
         for img in images[:5]:
             content.append({
@@ -504,7 +524,7 @@ async def extract_listing_image(request: Request):
 Return only valid JSON, nothing else."""
         })
 
-        message = client.messages.create(
+        message = await create_claude_message(
             model="claude-sonnet-4-5",
             max_tokens=1000,
             messages=[{"role": "user", "content": content}]
@@ -609,7 +629,6 @@ async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if api_key and message:
         try:
-            client = anthropic.Anthropic(api_key=api_key)
             prompt = f"""A prospective buyer submitted this enquiry for a Singapore property listing ({listing['property_type']} in {listing['location']}, asking SGD {listing['price']}):
 
 "{message}"
@@ -621,7 +640,7 @@ Classify buyer intent and return ONLY a JSON object:
 }}
 Hot = clear budget/timeline mentioned, ready to view/buy soon. Warm = genuine interest, some detail, no urgency stated. Cold = vague, generic, or likely not a real buyer.
 Return only valid JSON, nothing else."""
-            ai_response = client.messages.create(
+            ai_response = await create_claude_message(
                 model="claude-sonnet-4-5",
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}]
