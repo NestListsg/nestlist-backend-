@@ -19,16 +19,31 @@ from PIL import Image as PILImage
 
 app = FastAPI()
 
-async def send_telegram_alert(message: str):
+async def send_telegram_alert(message: str, chat_id: str = None):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-    if not bot_token or not chat_id:
+    target_chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not bot_token or not target_chat_id:
         return
     try:
         async with httpx.AsyncClient() as client:
             await client.post(
                 f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+                json={"chat_id": target_chat_id, "text": message, "parse_mode": "HTML"}
+            )
+    except Exception:
+        pass
+
+async def register_telegram_webhook():
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not bot_token:
+        return
+    webhook_url = "https://nestlist-backend-production-870a.up.railway.app/api/telegram/webhook"
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{bot_token}/setWebhook",
+                json={"url": webhook_url},
+                timeout=10
             )
     except Exception:
         pass
@@ -57,6 +72,7 @@ async def monitor_api_key():
 async def startup_event():
     asyncio.create_task(monitor_api_key())
     await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
+    await register_telegram_webhook()
 
 app.add_middleware(
     CORSMiddleware,
@@ -418,6 +434,17 @@ def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
     agent = result.data[0]
     return {k: v for k, v in agent.items() if k != "password_hash"}
 
+@app.get("/api/profile")
+def get_profile(agent=Depends(get_current_agent)):
+    return {k: v for k, v in agent.items() if k != "password_hash"}
+
+@app.get("/api/profile/telegram-connect-link")
+def get_telegram_connect_link(agent=Depends(get_current_agent)):
+    bot_username = os.environ.get("TELEGRAM_BOT_USERNAME", "")
+    if not bot_username:
+        raise HTTPException(status_code=503, detail="Telegram connect is not configured")
+    return {"link": f"https://t.me/{bot_username}?start={agent['id']}"}
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "NestList Prestige API"}
@@ -613,6 +640,9 @@ Return only valid JSON, nothing else."""
         "ai_summary": ai_summary,
     }).execute()
 
+    agent_chat_result = get_db().table("agents").select("telegram_chat_id").eq("id", listing["agent_id"]).execute()
+    agent_chat_id = agent_chat_result.data[0].get("telegram_chat_id") if agent_chat_result.data else None
+
     score_emoji = {"Hot": "🔥", "Warm": "🌤️", "Cold": "❄️"}.get(lead_score, "")
     await send_telegram_alert(
         f"{score_emoji} <b>New Lead: {lead_score}</b>\n\n"
@@ -620,10 +650,37 @@ Return only valid JSON, nothing else."""
         f"Listing: {listing['property_type']} — {listing['location']}\n"
         f"Phone: {req.phone or 'not provided'}\n"
         f"Email: {req.email or 'not provided'}\n"
-        f"Summary: {ai_summary or message[:200]}"
+        f"Summary: {ai_summary or message[:200]}",
+        chat_id=agent_chat_id
     )
 
     return {"success": True, "id": saved.data[0]["id"]}
+
+@app.post("/api/telegram/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        body = await request.json()
+        message = body.get("message", {})
+        text = message.get("text", "")
+        chat_id = message.get("chat", {}).get("id")
+        if text.startswith("/start ") and chat_id:
+            payload = text[len("/start "):].strip()
+            if _is_valid_uuid(payload):
+                existing = get_db().table("agents").select("telegram_chat_id").eq("id", payload).execute()
+                old_chat_id = existing.data[0].get("telegram_chat_id") if existing.data else None
+                get_db().table("agents").update({"telegram_chat_id": chat_id}).eq("id", payload).execute()
+                if old_chat_id and old_chat_id != chat_id:
+                    await send_telegram_alert(
+                        "⚠️ <b>Telegram connection replaced</b>\n\nYour NestList lead alerts were just redirected to a different Telegram chat. If this wasn't you, contact support immediately.",
+                        chat_id=old_chat_id
+                    )
+                await send_telegram_alert(
+                    "✅ <b>Connected!</b>\n\nYou'll now receive new lead alerts here.",
+                    chat_id=chat_id
+                )
+    except Exception:
+        pass
+    return {"ok": True}
 
 # ================================
 # ENQUIRIES ROUTES
