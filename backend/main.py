@@ -13,6 +13,7 @@ import io
 import json
 import asyncio
 import httpx
+import uuid
 from datetime import datetime, timedelta, date
 from PIL import Image as PILImage
 
@@ -519,8 +520,17 @@ def _rate_limited(ip: str, limit: int = 5, window_seconds: int = 3600) -> bool:
     _public_enquiry_hits[ip] = hits
     return len(hits) > limit
 
+def _is_valid_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
 @app.get("/api/public/listings/{listing_id}")
 def get_public_listing(listing_id: str):
+    if not _is_valid_uuid(listing_id):
+        raise HTTPException(status_code=404, detail="Listing not found")
     result = get_db().table("listings").select("*").eq("id", listing_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -549,6 +559,9 @@ async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
     client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
     if _rate_limited(client_ip):
         raise HTTPException(status_code=429, detail="Too many enquiries — please try again later")
+
+    if not _is_valid_uuid(req.listing_id):
+        raise HTTPException(status_code=404, detail="Listing not found")
 
     listing_result = get_db().table("listings").select("id, agent_id, location, property_type, price").eq("id", req.listing_id).execute()
     if not listing_result.data:
