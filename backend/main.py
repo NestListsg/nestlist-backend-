@@ -449,6 +449,15 @@ def get_telegram_connect_link(agent=Depends(get_current_agent)):
 def health():
     return {"status": "ok", "service": "NestList Prestige API"}
 
+@app.get("/api/telegram/debug-webhook")
+async def debug_telegram_webhook():
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not bot_token:
+        return {"error": "TELEGRAM_BOT_TOKEN not set"}
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"https://api.telegram.org/bot{bot_token}/getWebhookInfo", timeout=10)
+        return response.json()
+
 @app.post("/api/extract-listing-image")
 async def extract_listing_image(request: Request):
     try:
