@@ -188,19 +188,44 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 def create_token(agent_id: str) -> str:
-    payload = {"agent_id": agent_id, "exp": datetime.utcnow() + timedelta(days=7)}
+    payload = {"agent_id": agent_id, "exp": datetime.utcnow() + timedelta(days=30)}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(security)):
+_last_alert_times = {}
+
+async def send_telegram_alert_throttled(key: str, message: str, cooldown_seconds: int = 600):
+    now = datetime.utcnow()
+    last = _last_alert_times.get(key)
+    if last and (now - last).total_seconds() < cooldown_seconds:
+        return
+    _last_alert_times[key] = now
+    await send_telegram_alert(message)
+
+async def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
-        agent_id = payload["agent_id"]
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Your session has expired. Please log in again.")
+    except jwt.InvalidTokenError:
+        await send_telegram_alert_throttled(
+            "jwt_invalid",
+            "🚨 <b>NestList Alert</b>\n\nAgents are being rejected with an invalid-signature token error — this usually means JWT_SECRET changed on Railway. Every logged-in agent will need to log in again. Check the JWT_SECRET env var."
+        )
+        raise HTTPException(status_code=401, detail="Invalid session. Please log in again.")
+
+    agent_id = payload["agent_id"]
+    try:
         result = get_db().table("agents").select("*").eq("id", agent_id).execute()
-        if not result.data:
-            raise HTTPException(status_code=401, detail="Agent not found")
-        return result.data[0]
-    except:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        await send_telegram_alert_throttled(
+            "db_unreachable",
+            "⚠️ <b>NestList Warning</b>\n\nAgents are being blocked from logging in — the database is temporarily unreachable. This is not an auth problem; check Supabase status."
+        )
+        raise HTTPException(status_code=503, detail="Temporarily unable to verify your session. Please try again in a moment.")
+
+    if not result.data:
+        raise HTTPException(status_code=401, detail="Agent not found. Please log in again.")
+    return result.data[0]
 
 # ================================
 # AUTH ROUTES
