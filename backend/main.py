@@ -124,6 +124,14 @@ class ProfileUpdate(BaseModel):
     signature: str
     contact: str = ""
 
+class PublicEnquiryRequest(BaseModel):
+    listing_id: str
+    client_name: str
+    phone: str = ""
+    email: str = ""
+    message: str = ""
+    website: str = ""  # honeypot field, must stay empty
+
 # ================================
 # AUTH HELPERS
 # ================================
@@ -498,6 +506,111 @@ async def update_market_pulse(request: Request, agent=Depends(get_current_agent)
     body["last_updated"] = date.today().strftime("%b %Y")
     get_db().table("market_pulse").upsert({"id": 1, **body}).execute()
     return {"success": True}
+
+# ================================
+# PUBLIC ROUTES (no auth — buyer-facing)
+# ================================
+_public_enquiry_hits = {}
+
+def _rate_limited(ip: str, limit: int = 5, window_seconds: int = 3600) -> bool:
+    now = datetime.utcnow()
+    hits = [t for t in _public_enquiry_hits.get(ip, []) if (now - t).total_seconds() < window_seconds]
+    hits.append(now)
+    _public_enquiry_hits[ip] = hits
+    return len(hits) > limit
+
+@app.get("/api/public/listings/{listing_id}")
+def get_public_listing(listing_id: str):
+    result = get_db().table("listings").select("*").eq("id", listing_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = result.data[0]
+    agent_result = get_db().table("agents").select("name, agency, specialty").eq("id", listing["agent_id"]).execute()
+    agent_info = agent_result.data[0] if agent_result.data else {}
+    return {
+        "id": listing["id"],
+        "property_type": listing["property_type"],
+        "location": listing["location"],
+        "price": listing["price"],
+        "content": listing["content"],
+        "images": listing.get("images") or [],
+        "bedrooms": listing.get("bedrooms"),
+        "land_size": listing.get("land_size"),
+        "built_up": listing.get("built_up"),
+        "features": listing.get("features"),
+        "agent": {"name": agent_info.get("name"), "agency": agent_info.get("agency")}
+    }
+
+@app.post("/api/public/enquiries")
+async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
+    if req.website:
+        return {"success": True}
+
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if _rate_limited(client_ip):
+        raise HTTPException(status_code=429, detail="Too many enquiries — please try again later")
+
+    listing_result = get_db().table("listings").select("id, agent_id, location, property_type, price").eq("id", req.listing_id).execute()
+    if not listing_result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = listing_result.data[0]
+
+    message = req.message.strip()[:2000]
+    lead_score, ai_summary = "Warm", ""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key and message:
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            prompt = f"""A prospective buyer submitted this enquiry for a Singapore property listing ({listing['property_type']} in {listing['location']}, asking SGD {listing['price']}):
+
+"{message}"
+
+Classify buyer intent and return ONLY a JSON object:
+{{
+  "lead_score": "Hot" or "Warm" or "Cold",
+  "ai_summary": "one sentence, max 20 words, plain English summary of buyer intent, budget signal, and timeline if mentioned"
+}}
+Hot = clear budget/timeline mentioned, ready to view/buy soon. Warm = genuine interest, some detail, no urgency stated. Cold = vague, generic, or likely not a real buyer.
+Return only valid JSON, nothing else."""
+            ai_response = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = ai_response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(text)
+            lead_score = parsed.get("lead_score", "Warm")
+            ai_summary = parsed.get("ai_summary", "")
+        except Exception:
+            pass
+
+    saved = get_db().table("enquiries").insert({
+        "agent_id": listing["agent_id"],
+        "client_name": req.client_name,
+        "phone": req.phone,
+        "email": req.email,
+        "client_type": "Buyer",
+        "property_interest": f"{listing['property_type']} — {listing['location']}",
+        "notes": message,
+        "status": "Active",
+        "source": "Public Listing Page",
+        "listing_id": req.listing_id,
+        "message": message,
+        "lead_score": lead_score,
+        "ai_summary": ai_summary,
+    }).execute()
+
+    score_emoji = {"Hot": "🔥", "Warm": "🌤️", "Cold": "❄️"}.get(lead_score, "")
+    await send_telegram_alert(
+        f"{score_emoji} <b>New Lead: {lead_score}</b>\n\n"
+        f"<b>{req.client_name}</b>\n"
+        f"Listing: {listing['property_type']} — {listing['location']}\n"
+        f"Phone: {req.phone or 'not provided'}\n"
+        f"Email: {req.email or 'not provided'}\n"
+        f"Summary: {ai_summary or message[:200]}"
+    )
+
+    return {"success": True, "id": saved.data[0]["id"]}
 
 # ================================
 # ENQUIRIES ROUTES
