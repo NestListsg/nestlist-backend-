@@ -172,6 +172,9 @@ class ProfileUpdate(BaseModel):
     signature: str
     contact: str = ""
 
+class TokenExchangeRequest(BaseModel):
+    user_token: str
+
 class PublicEnquiryRequest(BaseModel):
     listing_id: str
     client_name: str
@@ -607,6 +610,49 @@ async def update_market_pulse(request: Request, agent=Depends(get_current_agent)
     body["last_updated"] = date.today().strftime("%b %Y")
     get_db().table("market_pulse").upsert({"id": 1, **body}).execute()
     return {"success": True}
+
+@app.post("/api/facebook/exchange-long-lived-token")
+def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_current_agent)):
+    if agent["email"] != "leesbjane@gmail.com":
+        raise HTTPException(status_code=403, detail="Not authorised")
+
+    app_id = os.environ.get("FB_APP_ID", "")
+    app_secret = os.environ.get("FB_APP_SECRET", "")
+    fb_page_id = os.environ.get("FB_PAGE_ID", "")
+    if not app_id or not app_secret:
+        raise HTTPException(status_code=503, detail="FB_APP_ID or FB_APP_SECRET not configured in Railway")
+
+    exchange_response = requests.get(
+        "https://graph.facebook.com/v25.0/oauth/access_token",
+        params={
+            "grant_type": "fb_exchange_token",
+            "client_id": app_id,
+            "client_secret": app_secret,
+            "fb_exchange_token": req.user_token
+        }
+    )
+    exchange_data = exchange_response.json()
+    if "access_token" not in exchange_data:
+        raise HTTPException(status_code=400, detail=f"User token exchange failed: {exchange_data.get('error', {}).get('message', 'unknown error')}")
+    long_lived_user_token = exchange_data["access_token"]
+
+    accounts_response = requests.get(
+        "https://graph.facebook.com/v25.0/me/accounts",
+        params={"access_token": long_lived_user_token}
+    )
+    accounts_data = accounts_response.json()
+    if "data" not in accounts_data:
+        raise HTTPException(status_code=400, detail=f"Could not fetch Pages: {accounts_data.get('error', {}).get('message', 'unknown error')}")
+
+    page_entry = next((p for p in accounts_data["data"] if p.get("id") == fb_page_id), None)
+    if not page_entry:
+        raise HTTPException(status_code=404, detail="NestList Page not found in returned accounts — check FB_PAGE_ID or that this account still has Page access")
+
+    return {
+        "long_lived_page_access_token": page_entry["access_token"],
+        "page_name": page_entry.get("name"),
+        "instructions": "Copy the long_lived_page_access_token value above into Railway as FB_PAGE_ACCESS_TOKEN, replacing the current short-lived one."
+    }
 
 # ================================
 # PUBLIC ROUTES (no auth — buyer-facing)
