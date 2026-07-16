@@ -172,6 +172,7 @@ class ProfileUpdate(BaseModel):
     emphasis: str
     signature: str
     contact: str = ""
+    poster_color: str = "#1a1a5c"
 
 class ProfilePhotoRequest(BaseModel):
     image_data: str
@@ -427,6 +428,18 @@ async def upload_listing_images(listing_id: str, request: Request, agent=Depends
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/api/listings/{listing_id}/images/{image_index}")
+def delete_listing_image(listing_id: str, image_index: int, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    images = result.data[0].get("images") or []
+    if image_index < 0 or image_index >= len(images):
+        raise HTTPException(status_code=400, detail="Invalid image index")
+    images.pop(image_index)
+    get_db().table("listings").update({"images": images}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    return {"images": images}
+
 @app.post("/api/listings/{listing_id}/post-facebook")
 def post_to_facebook(listing_id: str, agent=Depends(get_current_agent)):
     result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
@@ -497,7 +510,7 @@ def _to_number(value) -> float:
 # POSTER GENERATION (Placid.app)
 # ================================
 @app.post("/api/listings/{listing_id}/generate-poster")
-async def generate_poster(listing_id: str, agent=Depends(get_current_agent)):
+async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(get_current_agent)):
     result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -506,6 +519,8 @@ async def generate_poster(listing_id: str, agent=Depends(get_current_agent)):
     images = listing.get("images") or []
     if not images:
         raise HTTPException(status_code=400, detail="Upload at least one photo before generating a poster")
+    if photo_index < 0 or photo_index >= len(images):
+        photo_index = 0
 
     placid_token = os.environ.get("PLACID_API_TOKEN", "")
     template_uuid = os.environ.get("PLACID_TEMPLATE_UUID", "")
@@ -515,18 +530,20 @@ async def generate_poster(listing_id: str, agent=Depends(get_current_agent)):
     price_num = _to_number(listing.get("price"))
     built_up_num = _to_number(listing.get("built_up"))
     price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
+    bar_color = agent.get("poster_color") or "#1a1a5c"
 
     layers = {
-        "photo": {"image": images[0]},
+        "photo": {"image": images[photo_index]},
         "title": {"text": f"{listing['location']}, {listing['property_type']}"},
         "price": {"text": f"SGD {listing['price']}"},
         "rooms": {"text": f"{listing.get('bedrooms', '')} Rooms"},
         "baths": {"text": f"{listing.get('bathrooms', '')} Baths"},
         "size": {"text": f"{built_up_num:,.0f} sqft" if built_up_num else ""},
         "price_psf": {"text": f"SGD {price_psf:,} psf" if price_psf else ""},
-        "agent_name": {"text": agent["name"]},
-        "agency": {"text": agent.get("agency", "")},
-        "agent_phone": {"text": agent.get("contact", "")},
+        "agent_name": {"text": agent["name"], "text_color": "#F8F4EC"},
+        "agency": {"text": agent.get("agency", ""), "text_color": "#F8F4EC"},
+        "agent_phone": {"text": agent.get("contact", ""), "text_color": "#F8F4EC"},
+        "agent-bar": {"background_color": bar_color},
     }
     if agent.get("photo_url"):
         layers["agent_photo"] = {"image": agent["photo_url"]}
