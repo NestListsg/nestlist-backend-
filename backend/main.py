@@ -76,15 +76,15 @@ async def monitor_api_key():
         primary_key = os.environ.get("ANTHROPIC_API_KEY", "")
         backup_key = os.environ.get("ANTHROPIC_API_KEY_BACKUP", "")
         if not primary_key:
-            await send_telegram_alert("üö® <b>NestList Alert</b>\n\nANTHROPIC_API_KEY is missing.\n\nAgents cannot generate listings.\n\nFix: Add key at console.anthropic.com")
+            await send_telegram_alert("🚨 <b>NestList Alert</b>\n\nANTHROPIC_API_KEY is missing.\n\nAgents cannot generate listings.\n\nFix: Add key at console.anthropic.com")
             continue
         primary_ok = await _check_anthropic_key(primary_key)
         if not primary_ok:
             backup_ok = await _check_anthropic_key(backup_key)
             if backup_ok:
-                await send_telegram_alert("‚ö†Ô∏è <b>NestList Warning</b>\n\nPrimary Anthropic API key is invalid, but the backup key is active ‚Äî agents are unaffected.\n\nPlease replace the primary key in Railway when convenient (no rush).\n\nTime: " + datetime.now().strftime("%d %b %Y %H:%M"))
+                await send_telegram_alert("⚠️ <b>NestList Warning</b>\n\nPrimary Anthropic API key is invalid, but the backup key is active — agents are unaffected.\n\nPlease replace the primary key in Railway when convenient (no rush).\n\nTime: " + datetime.now().strftime("%d %b %Y %H:%M"))
             else:
-                await send_telegram_alert("üö® <b>NestList Alert</b>\n\nBoth the primary and backup Anthropic API keys are invalid. Agents CANNOT generate listings.\n\nFix:\n1. console.anthropic.com\n2. Generate new key(s)\n3. Update ANTHROPIC_API_KEY and/or ANTHROPIC_API_KEY_BACKUP in Railway\n\nTime: " + datetime.now().strftime("%d %b %Y %H:%M"))
+                await send_telegram_alert("🚨 <b>NestList Alert</b>\n\nBoth the primary and backup Anthropic API keys are invalid. Agents CANNOT generate listings.\n\nFix:\n1. console.anthropic.com\n2. Generate new key(s)\n3. Update ANTHROPIC_API_KEY and/or ANTHROPIC_API_KEY_BACKUP in Railway\n\nTime: " + datetime.now().strftime("%d %b %Y %H:%M"))
 
 async def create_claude_message(**kwargs):
     primary_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -95,14 +95,14 @@ async def create_claude_message(**kwargs):
         backup_key = os.environ.get("ANTHROPIC_API_KEY_BACKUP", "")
         if not backup_key:
             raise
-        await send_telegram_alert("‚ö†Ô∏è <b>NestList Alert</b>\n\nPrimary Anthropic API key failed ‚Äî automatically switched to the backup key, agents are unaffected.\n\nPlease check/replace the primary key in Railway when convenient (no rush).")
+        await send_telegram_alert("⚠️ <b>NestList Alert</b>\n\nPrimary Anthropic API key failed — automatically switched to the backup key, agents are unaffected.\n\nPlease check/replace the primary key in Railway when convenient (no rush).")
         client = anthropic.Anthropic(api_key=backup_key)
         return client.messages.create(**kwargs)
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(monitor_api_key())
-    await send_telegram_alert("‚úÖ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
+    await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
     await register_telegram_webhook()
 
 app.add_middleware(
@@ -223,7 +223,7 @@ async def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(
     except jwt.InvalidTokenError:
         await send_telegram_alert_throttled(
             "jwt_invalid",
-            "üö® <b>NestList Alert</b>\n\nAgents are being rejected with an invalid-signature token error ‚Äî this usually means JWT_SECRET changed on Railway. Every logged-in agent will need to log in again. Check the JWT_SECRET env var."
+            "🚨 <b>NestList Alert</b>\n\nAgents are being rejected with an invalid-signature token error — this usually means JWT_SECRET changed on Railway. Every logged-in agent will need to log in again. Check the JWT_SECRET env var."
         )
         raise HTTPException(status_code=401, detail="Invalid session. Please log in again.")
 
@@ -233,7 +233,7 @@ async def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(
     except Exception:
         await send_telegram_alert_throttled(
             "db_unreachable",
-            "‚ö†Ô∏è <b>NestList Warning</b>\n\nAgents are being blocked from logging in ‚Äî the database is temporarily unreachable. This is not an auth problem; check Supabase status."
+            "⚠️ <b>NestList Warning</b>\n\nAgents are being blocked from logging in — the database is temporarily unreachable. This is not an auth problem; check Supabase status."
         )
         raise HTTPException(status_code=503, detail="Temporarily unable to verify your session. Please try again in a moment.")
 
@@ -301,7 +301,7 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
         if any(z in req.location.lower() for z in gcb_zones):
             passed.append("Location confirmed within gazetted GCBa zone")
         else:
-            warnings.append("Location could not be verified as GCBa zone ‚Äî please confirm with URA.")
+            warnings.append("Location could not be verified as GCBa zone — please confirm with URA.")
         if req.land_size >= 15069:
             passed.append(f"Land size {req.land_size:,} sqft meets URA minimum")
         elif req.land_size >= 14000:
@@ -559,7 +559,7 @@ async def generate_poster(listing_id: str, agent=Depends(get_current_agent)):
                 raise HTTPException(status_code=502, detail="Placid failed to render the poster")
 
     if not poster_url:
-        raise HTTPException(status_code=504, detail="Poster is taking longer than expected ‚Äî please try again shortly")
+        raise HTTPException(status_code=504, detail="Poster is taking longer than expected — please try again shortly")
 
     get_db().table("listings").update({"poster_url": poster_url}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
 
@@ -758,7 +758,7 @@ def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_curre
 
     page_entry = next((p for p in accounts_data["data"] if p.get("id") == fb_page_id), None)
     if not page_entry:
-        raise HTTPException(status_code=404, detail="NestList Page not found in returned accounts ‚Äî check FB_PAGE_ID or that this account still has Page access")
+        raise HTTPException(status_code=404, detail="NestList Page not found in returned accounts — check FB_PAGE_ID or that this account still has Page access")
 
     return {
         "long_lived_page_access_token": page_entry["access_token"],
@@ -767,7 +767,7 @@ def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_curre
     }
 
 # ================================
-# PUBLIC ROUTES (no auth ‚Äî buyer-facing)
+# PUBLIC ROUTES (no auth — buyer-facing)
 # ================================
 _public_enquiry_hits = {}
 
@@ -816,7 +816,7 @@ async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
 
     client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
     if _rate_limited(client_ip):
-        raise HTTPException(status_code=429, detail="Too many enquiries ‚Äî please try again later")
+        raise HTTPException(status_code=429, detail="Too many enquiries — please try again later")
 
     if not _is_valid_uuid(req.listing_id):
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -860,7 +860,7 @@ Return only valid JSON, nothing else."""
         "phone": req.phone,
         "email": req.email,
         "client_type": "Buyer",
-        "property_interest": f"{listing['property_type']} ‚Äî {listing['location']}",
+        "property_interest": f"{listing['property_type']} — {listing['location']}",
         "notes": message,
         "status": "Active",
         "source": "Public Listing Page",
@@ -873,11 +873,11 @@ Return only valid JSON, nothing else."""
     agent_chat_result = get_db().table("agents").select("telegram_chat_id").eq("id", listing["agent_id"]).execute()
     agent_chat_id = agent_chat_result.data[0].get("telegram_chat_id") if agent_chat_result.data else None
 
-    score_emoji = {"Hot": "üî•", "Warm": "üå§Ô∏è", "Cold": "‚ùÑÔ∏è"}.get(lead_score, "")
+    score_emoji = {"Hot": "🔥", "Warm": "🌤️", "Cold": "❄️"}.get(lead_score, "")
     await send_telegram_alert(
         f"{score_emoji} <b>New Lead: {lead_score}</b>\n\n"
         f"<b>{req.client_name}</b>\n"
-        f"Listing: {listing['property_type']} ‚Äî {listing['location']}\n"
+        f"Listing: {listing['property_type']} — {listing['location']}\n"
         f"Phone: {req.phone or 'not provided'}\n"
         f"Email: {req.email or 'not provided'}\n"
         f"Summary: {ai_summary or message[:200]}",
@@ -901,11 +901,11 @@ async def telegram_webhook(request: Request):
                 get_db().table("agents").update({"telegram_chat_id": chat_id}).eq("id", payload).execute()
                 if old_chat_id and old_chat_id != chat_id:
                     await send_telegram_alert(
-                        "‚ö†Ô∏è <b>Telegram connection replaced</b>\n\nYour NestList lead alerts were just redirected to a different Telegram chat. If this wasn't you, contact support immediately.",
+                        "⚠️ <b>Telegram connection replaced</b>\n\nYour NestList lead alerts were just redirected to a different Telegram chat. If this wasn't you, contact support immediately.",
                         chat_id=old_chat_id
                     )
                 await send_telegram_alert(
-                    "‚úÖ <b>Connected!</b>\n\nYou'll now receive new lead alerts here.",
+                    "✅ <b>Connected!</b>\n\nYou'll now receive new lead alerts here.",
                     chat_id=chat_id
                 )
     except Exception:
