@@ -723,6 +723,7 @@ async def extract_listing_image(request: Request):
   "storeys": number or 0,
   "site_coverage": number as percentage or 0
 }
+Do not guess or estimate any value that is not clearly shown or stated in the images. If a field cannot be determined from the images, use "" for text fields and 0 for number fields.
 Return only valid JSON, nothing else."""
         })
 
