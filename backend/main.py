@@ -556,12 +556,6 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
     layers = {
         "photo": {"image": images[photo_index]},
         "title": {"text": listing.get("property_type") or listing.get("location", "")},
-    
-    
-
-    layers = {
-        "photo": {"image": images[photo_index]},
-        "title": {"text": f"{listing['location']}, {listing['property_type']}"},
         "price": {"text": f"SGD {listing['price']}"},
         "rooms": {"text": f"{bedrooms_val} Rooms" if bedrooms_val else ""},
         "baths": {"text": f"{bathrooms_val} Baths" if bathrooms_val else ""},
