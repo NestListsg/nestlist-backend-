@@ -555,7 +555,7 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
 
     district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
     property_type_text = (listing.get("property_type") or "").upper()
-    title_text = f"{district_match.group(0).upper()} · {property_type_text}" if district_match else property_type_text
+    title_text = f"{property_type_text} · {district_match.group(0).upper()}" if district_match else property_type_text
     contact_line = " · ".join(p for p in [agent.get("contact", ""), agent.get("agency", "")] if p)
 
     layers = {
