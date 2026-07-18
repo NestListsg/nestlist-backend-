@@ -14,6 +14,7 @@ import json
 import asyncio
 import httpx
 import uuid
+import re
 from datetime import datetime, timedelta, date
 from PIL import Image as PILImage
 
@@ -547,8 +548,16 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
     built_up_num = _to_number(listing.get("built_up"))
     price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
     bar_color = agent.get("poster_color") or "#1a1a5c"
-    bedrooms_val = listing.get("bedrooms") or ""
-    bathrooms_val = listing.get("bathrooms") or ""
+    bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
+    bathrooms_match = re.search(r"\d+", str(listing.get("bathrooms") or ""))
+    bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
+    bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
+
+    layers = {
+        "photo": {"image": images[photo_index]},
+        "title": {"text": listing.get("property_type") or listing.get("location", "")},
+    
+    
 
     layers = {
         "photo": {"image": images[photo_index]},
