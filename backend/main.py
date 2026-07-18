@@ -173,6 +173,7 @@ class ProfileUpdate(BaseModel):
     signature: str
     contact: str = ""
     poster_color: str = "#1a1a5c"
+    poster_template_id: str = "editorial"
 
 class ProfilePhotoRequest(BaseModel):
     image_data: str
@@ -509,6 +510,21 @@ def _to_number(value) -> float:
 # ================================
 # POSTER GENERATION (Placid.app)
 # ================================
+POSTER_TEMPLATES = [
+    {"id": "editorial", "name": "Editorial", "placid_uuid": "djmsagsiw2i7f", "thumbnail_url": ""},
+]
+
+def _template_uuid_for(agent) -> str:
+    template_id = agent.get("poster_template_id")
+    for t in POSTER_TEMPLATES:
+        if t["id"] == template_id:
+            return t["placid_uuid"]
+    return os.environ.get("PLACID_TEMPLATE_UUID", "")
+
+@app.get("/api/poster-templates")
+def get_poster_templates(agent=Depends(get_current_agent)):
+    return [{"id": t["id"], "name": t["name"], "thumbnail_url": t["thumbnail_url"]} for t in POSTER_TEMPLATES]
+
 @app.post("/api/listings/{listing_id}/generate-poster")
 async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(get_current_agent)):
     result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
@@ -523,7 +539,7 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
         photo_index = 0
 
     placid_token = os.environ.get("PLACID_API_TOKEN", "")
-    template_uuid = os.environ.get("PLACID_TEMPLATE_UUID", "")
+    template_uuid = _template_uuid_for(agent)
     if not placid_token or not template_uuid:
         raise HTTPException(status_code=503, detail="Poster generation is not configured yet")
 
@@ -531,13 +547,15 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
     built_up_num = _to_number(listing.get("built_up"))
     price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
     bar_color = agent.get("poster_color") or "#1a1a5c"
+    bedrooms_val = listing.get("bedrooms") or ""
+    bathrooms_val = listing.get("bathrooms") or ""
 
     layers = {
         "photo": {"image": images[photo_index]},
         "title": {"text": f"{listing['location']}, {listing['property_type']}"},
         "price": {"text": f"SGD {listing['price']}"},
-        "rooms": {"text": f"{listing.get('bedrooms', '')} Rooms"},
-        "baths": {"text": f"{listing.get('bathrooms', '')} Baths"},
+        "rooms": {"text": f"{bedrooms_val} Rooms" if bedrooms_val else ""},
+        "baths": {"text": f"{bathrooms_val} Baths" if bathrooms_val else ""},
         "size": {"text": f"{built_up_num:,.0f} sqft" if built_up_num else ""},
         "price_psf": {"text": f"SGD {price_psf:,} psf" if price_psf else ""},
         "agent_name": {"text": agent["name"], "text_color": "#F8F4EC"},
