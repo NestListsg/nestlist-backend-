@@ -550,20 +550,25 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
     bar_color = agent.get("poster_color") or "#1a1a5c"
     bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
     bathrooms_match = re.search(r"\d+", str(listing.get("bathrooms") or ""))
-    bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
+        bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
     bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
+
+    district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
+    property_type_text = (listing.get("property_type") or "").upper()
+    title_text = f"{district_match.group(0).upper()} · {property_type_text}" if district_match else property_type_text
+    contact_line = " · ".join(p for p in [agent.get("contact", ""), agent.get("agency", "")] if p)
 
     layers = {
         "photo": {"image": images[photo_index]},
-        "title": {"text": listing.get("property_type") or listing.get("location", ""), "text_color": "#FFFFFF"},
+        "title": {"text": title_text, "text_color": "#FFFFFF"},
         "price": {"text": f"SGD {listing['price']}", "text_color": "#F0C84A"},
         "rooms": {"text": f"{bedrooms_val} Rooms" if bedrooms_val else "", "text_color": "#FFFFFF"},
         "baths": {"text": f"{bathrooms_val} Baths" if bathrooms_val else "", "text_color": "#FFFFFF"},
         "size": {"text": f"{built_up_num:,.0f} sqft" if built_up_num else "", "text_color": "#FFFFFF"},
         "price_psf": {"text": f"SGD {price_psf:,} psf" if price_psf else "", "text_color": "#FFFFFF"},
         "agent_name": {"text": agent["name"], "text_color": "#F8F4EC"},
-        "agency": {"text": agent.get("agency", ""), "text_color": "#F8F4EC"},
-        "agent_phone": {"text": agent.get("contact", ""), "text_color": "#F8F4EC"},
+        "agency": {"text": "", "text_color": "#F8F4EC"},
+        "agent_phone": {"text": contact_line, "text_color": "#F8F4EC"},
         "agent-bar": {"background_color": bar_color},
     }
     if agent.get("photo_url"):
