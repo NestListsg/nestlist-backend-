@@ -555,7 +555,7 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
 
     district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
     property_type_text = (listing.get("property_type") or "").upper()
-    title_text = f"{property_type_text} · {district_match.group(0).upper()}" if district_match else property_type_text
+    title_text = f"{property_type_text}\n{district_match.group(0).upper()}" if district_match else property_type_text
     contact_line = " · ".join(p for p in [agent.get("contact", ""), agent.get("agency", "")] if p)
 
     layers = {
@@ -977,10 +977,31 @@ async def update_enquiry(enquiry_id: str, request: Request, agent=Depends(get_cu
     result = get_db().table("enquiries").update(body).eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
     return result.data[0]
 
-@app.delete("/api/enquiries/{enquiry_id}")
-def delete_enquiry(enquiry_id: str, agent=Depends(get_current_agent)):
-    get_db().table("enquiries").delete().eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
+@app.delete("/api/listings/{listing_id}")
+def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
+    get_db().table("listings").delete().eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return {"success": True}
+
+@app.patch("/api/listings/{listing_id}")
+def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_current_agent)):
+    existing = get_db().table("listings").select("id").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    updated = get_db().table("listings").update({
+        "property_type": req.property_type,
+        "location": req.location,
+        "land_size": req.land_size,
+        "built_up": req.built_up,
+        "bedrooms": req.bedrooms,
+        "bathrooms": req.bathrooms,
+        "price": req.price,
+        "features": req.features,
+        "plot_width": req.plot_width,
+        "plot_depth": req.plot_depth,
+        "storeys": req.storeys,
+        "site_coverage": req.site_coverage,
+    }).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    return updated.data[0]
 
 @app.delete("/api/listings/{listing_id}")
 def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
