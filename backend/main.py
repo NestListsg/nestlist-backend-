@@ -550,7 +550,7 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
     bar_color = agent.get("poster_color") or "#1a1a5c"
     bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
     bathrooms_match = re.search(r"\d+", str(listing.get("bathrooms") or ""))
-    obedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
+    bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
     bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
 
     district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
