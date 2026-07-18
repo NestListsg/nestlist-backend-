@@ -555,12 +555,12 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
 
     layers = {
         "photo": {"image": images[photo_index]},
-        "title": {"text": listing.get("property_type") or listing.get("location", "")},
-        "price": {"text": f"SGD {listing['price']}"},
-        "rooms": {"text": f"{bedrooms_val} Rooms" if bedrooms_val else ""},
-        "baths": {"text": f"{bathrooms_val} Baths" if bathrooms_val else ""},
-        "size": {"text": f"{built_up_num:,.0f} sqft" if built_up_num else ""},
-        "price_psf": {"text": f"SGD {price_psf:,} psf" if price_psf else ""},
+        "title": {"text": listing.get("property_type") or listing.get("location", ""), "text_color": "#FFFFFF"},
+        "price": {"text": f"SGD {listing['price']}", "text_color": "#F0C84A"},
+        "rooms": {"text": f"{bedrooms_val} Rooms" if bedrooms_val else "", "text_color": "#FFFFFF"},
+        "baths": {"text": f"{bathrooms_val} Baths" if bathrooms_val else "", "text_color": "#FFFFFF"},
+        "size": {"text": f"{built_up_num:,.0f} sqft" if built_up_num else "", "text_color": "#FFFFFF"},
+        "price_psf": {"text": f"SGD {price_psf:,} psf" if price_psf else "", "text_color": "#FFFFFF"},
         "agent_name": {"text": agent["name"], "text_color": "#F8F4EC"},
         "agency": {"text": agent.get("agency", ""), "text_color": "#F8F4EC"},
         "agent_phone": {"text": agent.get("contact", ""), "text_color": "#F8F4EC"},
