@@ -116,7 +116,7 @@ def render_poster(property_type, district, price_text, stats, agent_name, agent_
     base.alpha_composite(right_overlay, dest=(photo_w, bar_top))
 
     if agent_photo:
-        photo = ImageOps.fit(agent_photo.convert("RGB"), (photo_w, bar_h), centering=(0.5, 0.25))
+        photo = ImageOps.fit(agent_photo.convert("RGB"), (photo_w, bar_h), centering=(0.5, 0.42))
         base.paste(photo, (0, bar_top))
     else:
         draw.rectangle((0, bar_top, photo_w, H), fill=(40, 40, 36, 255))
