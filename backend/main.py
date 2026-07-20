@@ -17,6 +17,7 @@ import uuid
 import re
 from datetime import datetime, timedelta, date
 from PIL import Image as PILImage
+import poster_renderer
 
 app = FastAPI()
 
@@ -509,25 +510,18 @@ def _to_number(value) -> float:
         return 0
 
 # ================================
-# POSTER GENERATION (Placid.app)
+# POSTER GENERATION
 # ================================
 POSTER_TEMPLATES = [
-    {"id": "editorial", "name": "Editorial", "placid_uuid": "djmsagsiw2i7f", "thumbnail_url": ""},
+    {"id": "editorial", "name": "Editorial", "thumbnail_url": ""},
 ]
-
-def _template_uuid_for(agent) -> str:
-    template_id = agent.get("poster_template_id")
-    for t in POSTER_TEMPLATES:
-        if t["id"] == template_id:
-            return t["placid_uuid"]
-    return os.environ.get("PLACID_TEMPLATE_UUID", "")
 
 @app.get("/api/poster-templates")
 def get_poster_templates(agent=Depends(get_current_agent)):
     return [{"id": t["id"], "name": t["name"], "thumbnail_url": t["thumbnail_url"]} for t in POSTER_TEMPLATES]
 
 @app.post("/api/listings/{listing_id}/generate-poster")
-async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(get_current_agent)):
+def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(get_current_agent)):
     result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -539,15 +533,9 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
     if photo_index < 0 or photo_index >= len(images):
         photo_index = 0
 
-    placid_token = os.environ.get("PLACID_API_TOKEN", "")
-    template_uuid = _template_uuid_for(agent)
-    if not placid_token or not template_uuid:
-        raise HTTPException(status_code=503, detail="Poster generation is not configured yet")
-
     price_num = _to_number(listing.get("price"))
     built_up_num = _to_number(listing.get("built_up"))
     price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
-    bar_color = agent.get("poster_color") or "#1a1a5c"
     bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
     bathrooms_match = re.search(r"\d+", str(listing.get("bathrooms") or ""))
     bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
@@ -555,54 +543,41 @@ async def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(g
 
     district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
     property_type_text = (listing.get("property_type") or "").upper()
-    title_text = f"{property_type_text}\n{district_match.group(0).upper()}" if district_match else property_type_text
-    contact_line = " · ".join(p for p in [agent.get("contact", ""), agent.get("agency", "")] if p)
+    district_text = district_match.group(0).upper() if district_match else ""
 
-    layers = {
-        "photo": {"image": images[photo_index]},
-        "title": {"text": title_text, "text_color": "#FFFFFF"},
-        "price": {"text": f"SGD {listing['price']}", "text_color": "#F0C84A"},
-        "rooms": {"text": f"{bedrooms_val} Rooms" if bedrooms_val else " ", "text_color": "#FFFFFF"},
-        "baths": {"text": f"{bathrooms_val} Baths" if bathrooms_val else " ", "text_color": "#FFFFFF"},
-        "size": {"text": f"{built_up_num:,.0f} sqft" if built_up_num else " ", "text_color": "#FFFFFF"},
-        "price_psf": {"text": f"SGD {price_psf:,} psf" if price_psf else " ", "text_color": "#FFFFFF"},
-        "agent_name": {"text": agent["name"], "text_color": "#F8F4EC"},
-        "agency": {"text": "", "text_color": "#F8F4EC"},
-        "agent_phone": {"text": contact_line, "text_color": "#F8F4EC"},
-        "agent-bar": {"background_color": bar_color},
-    }
-    if agent.get("photo_url"):
-        layers["agent_photo"] = {"image": agent["photo_url"]}
+    stats = [
+        f"{bedrooms_val} Rooms" if bedrooms_val else "",
+        f"{bathrooms_val} Baths" if bathrooms_val else "",
+        f"{built_up_num:,.0f} sqft" if built_up_num else "",
+        f"SGD {price_psf:,} psf" if price_psf else "",
+    ]
 
-    async with httpx.AsyncClient() as client:
-        create_response = await client.post(
-            "https://api.placid.app/api/rest/images",
-            headers={"Authorization": f"Bearer {placid_token}"},
-            json={"template_uuid": template_uuid, "layers": layers},
-            timeout=20
+    try:
+        poster_image = poster_renderer.render_poster(
+            property_type=property_type_text,
+            district=district_text,
+            price_text=f"SGD {listing['price']}",
+            stats=stats,
+            agent_name=agent["name"],
+            agent_contact_line=agent.get("contact", ""),
+            property_photo_url=images[photo_index],
+            agent_photo_url=agent.get("photo_url"),
         )
-        create_data = create_response.json()
-        image_id = create_data.get("id")
-        if not image_id:
-            raise HTTPException(status_code=502, detail="Poster generation failed to start")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Poster rendering failed: {e}")
 
-        poster_url = None
-        for _ in range(15):
-            await asyncio.sleep(2)
-            poll_response = await client.get(
-                f"https://api.placid.app/api/rest/images/{image_id}",
-                headers={"Authorization": f"Bearer {placid_token}"},
-                timeout=20
-            )
-            poll_data = poll_response.json()
-            if poll_data.get("status") == "finished" and poll_data.get("image_url"):
-                poster_url = poll_data["image_url"]
-                break
-            if poll_data.get("status") == "error":
-                raise HTTPException(status_code=502, detail="Placid failed to render the poster")
+    buffer = io.BytesIO()
+    poster_image.save(buffer, format="JPEG", quality=92)
+    buffer.seek(0)
 
-    if not poster_url:
-        raise HTTPException(status_code=504, detail="Poster is taking longer than expected — please try again shortly")
+    supabase = get_db()
+    filename = f"posters/{listing_id}.jpg"
+    supabase.storage.from_("listings-images").upload(
+        filename,
+        buffer.read(),
+        {"content-type": "image/jpeg", "upsert": "true"}
+    )
+    poster_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
 
     get_db().table("listings").update({"poster_url": poster_url}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
 
