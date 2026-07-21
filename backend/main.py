@@ -183,6 +183,13 @@ class ProfilePhotoRequest(BaseModel):
 class TokenExchangeRequest(BaseModel):
     user_token: str
 
+class InstagramOAuthCallbackRequest(BaseModel):
+    code: str
+    state: str
+
+class InstagramPostRequest(BaseModel):
+    caption: str
+
 class PublicEnquiryRequest(BaseModel):
     listing_id: str
     client_name: str
@@ -246,6 +253,20 @@ async def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(
     return result.data[0]
 
 # ================================
+# INSTAGRAM AUTO-POSTING (hidden beta, allowlisted accounts only until Meta App Review is approved)
+# ================================
+INSTAGRAM_BETA_ALLOWLIST = {"leesbjane@gmail.com"}
+INSTAGRAM_OAUTH_REDIRECT_URI = "https://nestlist.sg/auth/instagram/callback"
+
+def _can_use_instagram_beta(agent) -> bool:
+    return agent.get("email") in INSTAGRAM_BETA_ALLOWLIST
+
+def _agent_response(agent) -> dict:
+    out = {k: v for k, v in agent.items() if k != "password_hash"}
+    out["can_use_instagram_beta"] = _can_use_instagram_beta(agent)
+    return out
+
+# ================================
 # AUTH ROUTES
 # ================================
 @app.post("/api/login")
@@ -257,7 +278,7 @@ def login(req: LoginRequest):
     if not verify_password(req.password, agent["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_token(str(agent["id"]))
-    return {"token": token, "agent": {k: v for k, v in agent.items() if k != "password_hash"}}
+    return {"token": token, "agent": _agent_response(agent)}
 
 @app.post("/api/register")
 def register(req: RegisterRequest):
@@ -277,7 +298,7 @@ def register(req: RegisterRequest):
     }).execute()
     agent = result.data[0]
     token = create_token(str(agent["id"]))
-    return {"token": token, "agent": {k: v for k, v in agent.items() if k != "password_hash"}}
+    return {"token": token, "agent": _agent_response(agent)}
 
 # ================================
 # LISTINGS ROUTES
@@ -583,6 +604,58 @@ def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(get_cur
 
     return {"poster_url": poster_url}
 
+@app.post("/api/listings/{listing_id}/post-instagram")
+def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(get_current_agent)):
+    if not _can_use_instagram_beta(agent):
+        raise HTTPException(status_code=403, detail="Instagram posting is not yet available on your account")
+
+    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = result.data[0]
+
+    if not listing.get("poster_url"):
+        raise HTTPException(status_code=400, detail="Generate a poster before posting to Instagram")
+
+    ig_user_id = agent.get("instagram_business_account_id")
+    page_token = agent.get("fb_page_access_token")
+    if not ig_user_id or not page_token:
+        raise HTTPException(status_code=400, detail="Connect Instagram in My Profile first")
+
+    caption = req.caption[:2200]
+
+    def _clear_instagram_connection():
+        get_db().table("agents").update({
+            "fb_user_access_token": None, "fb_page_id": None, "fb_page_access_token": None,
+            "fb_page_name": None, "instagram_business_account_id": None,
+            "instagram_username": None, "instagram_connected_at": None,
+        }).eq("id", agent["id"]).execute()
+
+    r1 = requests.post(f"https://graph.facebook.com/v25.0/{ig_user_id}/media", data={
+        "image_url": listing["poster_url"], "caption": caption, "access_token": page_token,
+    })
+    d1 = r1.json()
+    if "id" not in d1:
+        err = d1.get("error", {})
+        if err.get("code") == 190:
+            _clear_instagram_connection()
+            raise HTTPException(status_code=401, detail="Your Instagram connection has expired. Please reconnect in My Profile.")
+        raise HTTPException(status_code=400, detail=err.get("message", "Failed to create Instagram post"))
+    container_id = d1["id"]
+
+    r2 = requests.post(f"https://graph.facebook.com/v25.0/{ig_user_id}/media_publish", data={
+        "creation_id": container_id, "access_token": page_token,
+    })
+    d2 = r2.json()
+    if "id" not in d2:
+        err = d2.get("error", {})
+        if err.get("code") == 190:
+            _clear_instagram_connection()
+            raise HTTPException(status_code=401, detail="Your Instagram connection has expired. Please reconnect in My Profile.")
+        raise HTTPException(status_code=400, detail=err.get("message", "Failed to publish to Instagram"))
+
+    return {"success": True, "post_id": d2["id"]}
+
 # ================================
 # PROFILE ROUTE
 # ================================
@@ -591,11 +664,11 @@ def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
     get_db().table("agents").update(req.dict()).eq("id", agent["id"]).execute()
     result = get_db().table("agents").select("*").eq("id", agent["id"]).execute()
     agent = result.data[0]
-    return {k: v for k, v in agent.items() if k != "password_hash"}
+    return _agent_response(agent)
 
 @app.get("/api/profile")
 def get_profile(agent=Depends(get_current_agent)):
-    return {k: v for k, v in agent.items() if k != "password_hash"}
+    return _agent_response(agent)
 
 @app.post("/api/profile/photo")
 def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_agent)):
@@ -630,6 +703,90 @@ def get_telegram_connect_link(agent=Depends(get_current_agent)):
     if not bot_username:
         raise HTTPException(status_code=503, detail="Telegram connect is not configured")
     return {"link": f"https://t.me/{bot_username}?start={agent['id']}"}
+
+@app.get("/api/profile/instagram-connect-link")
+def get_instagram_connect_link(agent=Depends(get_current_agent)):
+    if not _can_use_instagram_beta(agent):
+        raise HTTPException(status_code=403, detail="Instagram connect is not yet available on your account")
+    app_id = os.environ.get("FB_APP_ID", "")
+    if not app_id:
+        raise HTTPException(status_code=503, detail="Instagram connect is not configured")
+    scope = "instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement,business_management"
+    link = (
+        "https://www.facebook.com/v25.0/dialog/oauth"
+        f"?client_id={app_id}"
+        f"&redirect_uri={INSTAGRAM_OAUTH_REDIRECT_URI}"
+        f"&state={agent['id']}"
+        f"&scope={scope}"
+        "&response_type=code"
+    )
+    return {"link": link}
+
+@app.post("/api/instagram/oauth-callback")
+def instagram_oauth_callback(req: InstagramOAuthCallbackRequest):
+    if not _is_valid_uuid(req.state):
+        raise HTTPException(status_code=400, detail="Invalid connect request")
+
+    agent_result = get_db().table("agents").select("id, email").eq("id", req.state).execute()
+    if not agent_result.data:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = agent_result.data[0]
+    if not _can_use_instagram_beta(agent):
+        raise HTTPException(status_code=403, detail="Instagram connect is not yet available on your account")
+
+    app_id = os.environ.get("FB_APP_ID", "")
+    app_secret = os.environ.get("FB_APP_SECRET", "")
+
+    r1 = requests.get("https://graph.facebook.com/v25.0/oauth/access_token", params={
+        "client_id": app_id, "client_secret": app_secret,
+        "redirect_uri": INSTAGRAM_OAUTH_REDIRECT_URI, "code": req.code,
+    })
+    d1 = r1.json()
+    if "access_token" not in d1:
+        raise HTTPException(status_code=400, detail=f"Instagram connect failed: {d1.get('error', {}).get('message', 'unknown error')}")
+    short_lived_token = d1["access_token"]
+
+    r2 = requests.get("https://graph.facebook.com/v25.0/oauth/access_token", params={
+        "grant_type": "fb_exchange_token", "client_id": app_id,
+        "client_secret": app_secret, "fb_exchange_token": short_lived_token,
+    })
+    d2 = r2.json()
+    if "access_token" not in d2:
+        raise HTTPException(status_code=400, detail=f"Instagram connect failed: {d2.get('error', {}).get('message', 'unknown error')}")
+    long_lived_user_token = d2["access_token"]
+
+    r3 = requests.get("https://graph.facebook.com/v25.0/me/accounts", params={"access_token": long_lived_user_token})
+    d3 = r3.json()
+    if not d3.get("data"):
+        raise HTTPException(status_code=400, detail="No Facebook Page found for this account. Instagram connect requires a Facebook Page linked to your Instagram professional account.")
+    page = d3["data"][0]
+    page_id, page_name, page_token = page["id"], page.get("name"), page["access_token"]
+
+    r4 = requests.get(f"https://graph.facebook.com/v25.0/{page_id}", params={
+        "fields": "instagram_business_account", "access_token": page_token,
+    })
+    d4 = r4.json()
+    ig_account = d4.get("instagram_business_account")
+    if not ig_account:
+        raise HTTPException(status_code=400, detail="Your Facebook Page isn't linked to an Instagram professional account yet. Link it in the Instagram app under Settings > Account, then try again.")
+    ig_user_id = ig_account["id"]
+
+    r5 = requests.get(f"https://graph.facebook.com/v25.0/{ig_user_id}", params={
+        "fields": "username", "access_token": page_token,
+    })
+    ig_username = r5.json().get("username", "")
+
+    get_db().table("agents").update({
+        "fb_user_access_token": long_lived_user_token,
+        "fb_page_id": page_id,
+        "fb_page_access_token": page_token,
+        "fb_page_name": page_name,
+        "instagram_business_account_id": ig_user_id,
+        "instagram_username": ig_username,
+        "instagram_connected_at": datetime.utcnow().isoformat(),
+    }).eq("id", agent["id"]).execute()
+
+    return {"success": True, "instagram_username": ig_username, "page_name": page_name}
 
 @app.get("/api/health")
 def health():
