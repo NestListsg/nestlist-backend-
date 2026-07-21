@@ -616,7 +616,7 @@ def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_age
             compressed,
             {"content-type": "image/jpeg", "upsert": "true"}
         )
-        photo_url = supabase.storage.from_("listings-images").get_public_url(filename)
+        photo_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
 
         supabase.table("agents").update({"photo_url": photo_url}).eq("id", agent["id"]).execute()
 
