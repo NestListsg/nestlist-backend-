@@ -16,7 +16,7 @@ import httpx
 import uuid
 import re
 from datetime import datetime, timedelta, date
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageEnhance, ImageOps
 import poster_renderer
 
 app = FastAPI()
@@ -429,6 +429,7 @@ async def upload_listing_images(listing_id: str, request: Request, agent=Depends
             img_bytes = base64.b64decode(image_data)
             pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
             pil_img.thumbnail((1920, 1920))
+            pil_img = _auto_enhance_photo(pil_img)
 
             buffer = io.BytesIO()
             pil_img.save(buffer, format="JPEG", quality=80)
@@ -523,6 +524,28 @@ Contact us at nestlist.sg to find out more!
         return {"success": True, "post_id": data["id"]}
     else:
         raise HTTPException(status_code=400, detail=data.get("error", {}).get("message", "Unknown error"))
+
+# ================================
+# IMAGE ENHANCEMENT
+# ================================
+# Tuned for a subtle, phone-camera-style "auto enhance" -- corrects flat/underexposed
+# real estate photos without an oversaturated or artificial look. Kept as named
+# constants so the look can be retuned later without hunting through the function body.
+ENHANCE_COLOR = 1.12
+ENHANCE_CONTRAST = 1.08
+ENHANCE_BRIGHTNESS = 1.04
+ENHANCE_SHARPNESS = 1.15
+
+def _auto_enhance_photo(img: PILImage.Image) -> PILImage.Image:
+    try:
+        enhanced = ImageOps.autocontrast(img, cutoff=1, preserve_tone=True)
+        enhanced = ImageEnhance.Color(enhanced).enhance(ENHANCE_COLOR)
+        enhanced = ImageEnhance.Contrast(enhanced).enhance(ENHANCE_CONTRAST)
+        enhanced = ImageEnhance.Brightness(enhanced).enhance(ENHANCE_BRIGHTNESS)
+        enhanced = ImageEnhance.Sharpness(enhanced).enhance(ENHANCE_SHARPNESS)
+        return enhanced
+    except Exception:
+        return img
 
 def _to_number(value) -> float:
     try:
