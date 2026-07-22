@@ -304,8 +304,11 @@ def register(req: RegisterRequest):
 # LISTINGS ROUTES
 # ================================
 @app.get("/api/listings")
-def get_listings(agent=Depends(get_current_agent)):
-    result = get_db().table("listings").select("*").eq("agent_id", agent["id"]).order("created_at", desc=True).execute()
+def get_listings(status: str = "active", agent=Depends(get_current_agent)):
+    query = get_db().table("listings").select("*").eq("agent_id", agent["id"])
+    if status in ("active", "archived"):
+        query = query.eq("status", status)
+    result = query.order("created_at", desc=True).execute()
     return result.data or []
 
 @app.post("/api/listings/generate")
@@ -1134,6 +1137,33 @@ async def update_enquiry(enquiry_id: str, request: Request, agent=Depends(get_cu
 
 @app.delete("/api/listings/{listing_id}")
 def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").update({"status": "archived"}) \
+        .eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    return {"success": True}
+
+@app.delete("/api/listings/{listing_id}/permanent")
+def delete_listing_permanently(listing_id: str, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").select("id, status").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if result.data[0].get("status") != "archived":
+        raise HTTPException(status_code=400, detail="Archive this listing from My Listings first before removing it permanently.")
+
+    supabase = get_db()
+    bucket = supabase.storage.from_("listings-images")
+    try:
+        files = bucket.list(listing_id)
+        if files:
+            bucket.remove([f"{listing_id}/{f['name']}" for f in files])
+    except Exception:
+        pass
+    try:
+        bucket.remove([f"posters/{listing_id}.jpg"])
+    except Exception:
+        pass
+
     get_db().table("listings").delete().eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return {"success": True}
 
@@ -1157,11 +1187,6 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
         "site_coverage": req.site_coverage,
     }).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return updated.data[0]
-
-@app.delete("/api/listings/{listing_id}")
-def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
-    get_db().table("listings").delete().eq("id", listing_id).eq("agent_id", agent["id"]).execute()
-    return {"success": True}
 
 @app.get("/api/listings/{listing_id}/download-images")
 def download_listing_images(listing_id: str, agent=Depends(get_current_agent)):
