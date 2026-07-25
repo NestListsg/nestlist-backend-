@@ -20,6 +20,7 @@ import hashlib
 from datetime import datetime, timedelta, date
 from PIL import Image as PILImage, ImageEnhance, ImageOps
 import poster_renderer
+import ura_market_pulse
 
 app = FastAPI()
 
@@ -128,9 +129,21 @@ async def create_claude_message(**kwargs):
         client = anthropic.Anthropic(api_key=backup_key)
         return client.messages.create(**kwargs)
 
+async def refresh_market_pulse_loop():
+    while True:
+        try:
+            stats = await ura_market_pulse.refresh_market_pulse()
+            if stats:
+                get_db().table("market_pulse").upsert({"id": 1, **stats}).execute()
+        except Exception as e:
+            await send_telegram_alert_throttled("market_pulse_refresh_failed",
+                f"⚠️ <b>NestList Warning</b>\n\nMarket Pulse auto-refresh from URA failed: {e}\n\nThe panel will keep showing its last known values.")
+        await asyncio.sleep(86400)  # URA recommends refreshing daily
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(monitor_api_key())
+    asyncio.create_task(refresh_market_pulse_loop())
     await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
     await register_telegram_webhook()
 
@@ -1009,7 +1022,8 @@ def get_market_pulse():
         "gcb_avg_psf": "SGD 2,134",
         "gcb_largest": "SGD 148M",
         "nassim_range": "SGD 2,500-4,000 psf",
-        "last_updated": "Jan 2026"
+        "last_updated": "Jan 2026",
+        "source": "manual"
     }
 
 @app.put("/api/market-pulse")
@@ -1018,8 +1032,21 @@ async def update_market_pulse(request: Request, agent=Depends(get_current_agent)
         raise HTTPException(status_code=403, detail="Not authorised")
     body = await request.json()
     body["last_updated"] = date.today().strftime("%b %Y")
+    body["source"] = "manual"
     get_db().table("market_pulse").upsert({"id": 1, **body}).execute()
     return {"success": True}
+
+@app.post("/api/market-pulse/refresh")
+async def trigger_market_pulse_refresh(agent=Depends(get_current_agent)):
+    if agent["email"] != "leesbjane@gmail.com":
+        raise HTTPException(status_code=403, detail="Not authorised")
+    if not os.environ.get("URA_ACCESS_KEY", ""):
+        raise HTTPException(status_code=400, detail="URA_ACCESS_KEY is not set in Railway yet")
+    stats = await ura_market_pulse.refresh_market_pulse()
+    if not stats:
+        raise HTTPException(status_code=502, detail="No qualifying GCB transactions found in the past 12 months, or the URA request failed")
+    get_db().table("market_pulse").upsert({"id": 1, **stats}).execute()
+    return stats
 
 @app.post("/api/facebook/exchange-long-lived-token")
 def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_current_agent)):
