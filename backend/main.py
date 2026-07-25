@@ -15,6 +15,8 @@ import asyncio
 import httpx
 import uuid
 import re
+import secrets
+import hashlib
 from datetime import datetime, timedelta, date
 from PIL import Image as PILImage, ImageEnhance, ImageOps
 import poster_renderer
@@ -34,6 +36,31 @@ async def send_telegram_alert(message: str, chat_id: str = None):
             )
     except Exception:
         pass
+
+async def send_password_reset_email(to_email: str, name: str, reset_link: str) -> bool:
+    api_key = os.environ.get("RESEND_API_KEY", "")
+    if not api_key:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "from": "NestList <noreply@nestlist.sg>",
+                    "to": [to_email],
+                    "subject": "Reset your NestList password",
+                    "html": f"""<p>Hi {name or 'there'},</p>
+                        <p>We received a request to reset your NestList password. Click below to choose a new one:</p>
+                        <p><a href="{reset_link}">{reset_link}</a></p>
+                        <p>This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>
+                        <p>— NestList</p>""",
+                },
+                timeout=10,
+            )
+            return response.status_code == 200
+    except Exception:
+        return False
 
 async def register_telegram_webhook():
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -190,6 +217,14 @@ class InstagramOAuthCallbackRequest(BaseModel):
 class InstagramPostRequest(BaseModel):
     caption: str
 
+class PasswordResetRequest(BaseModel):
+    email: str
+    website: str = ""  # honeypot field, must stay empty
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str
+
 class PublicEnquiryRequest(BaseModel):
     listing_id: str
     client_name: str
@@ -299,6 +334,67 @@ def register(req: RegisterRequest):
     agent = result.data[0]
     token = create_token(str(agent["id"]))
     return {"token": token, "agent": _agent_response(agent)}
+
+@app.post("/api/password-reset/request")
+async def request_password_reset(req: PasswordResetRequest, request: Request):
+    if req.website:
+        return {"success": True}
+
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if _rate_limited(_password_reset_hits, client_ip, limit=5, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Too many reset requests — please try again later")
+
+    generic_response = {"success": True, "message": "If that email is registered with NestList, a reset link has been sent."}
+
+    result = get_db().table("agents").select("id, email, name").eq("email", req.email).execute()
+    if not result.data:
+        return generic_response  # never reveal whether an email is registered
+    agent = result.data[0]
+
+    get_db().table("password_resets").update({"used_at": datetime.utcnow().isoformat()}) \
+        .eq("agent_id", agent["id"]).is_("used_at", "null").execute()
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    get_db().table("password_resets").insert({
+        "agent_id": agent["id"],
+        "token_hash": token_hash,
+        "expires_at": (datetime.utcnow() + timedelta(hours=1)).isoformat(),
+    }).execute()
+
+    reset_link = f"https://nestlist.sg/reset-password?token={raw_token}"
+    sent = await send_password_reset_email(agent["email"], agent.get("name", ""), reset_link)
+    if not sent:
+        await send_telegram_alert_throttled(
+            "password_reset_email_failed",
+            "⚠️ <b>NestList Warning</b>\n\nA password reset email failed to send via Resend. Check RESEND_API_KEY in Railway and Resend's dashboard for delivery issues."
+        )
+    return generic_response
+
+@app.post("/api/password-reset/confirm")
+def confirm_password_reset(req: PasswordResetConfirm):
+    if not req.token or len(req.token) < 20:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired. Please request a new one.")
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    token_hash = hashlib.sha256(req.token.encode()).hexdigest()
+    result = get_db().table("password_resets").select("*").eq("token_hash", token_hash).execute()
+    if not result.data:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired. Please request a new one.")
+    reset_row = result.data[0]
+
+    if reset_row.get("used_at"):
+        raise HTTPException(status_code=400, detail="This reset link has already been used. Please request a new one.")
+
+    expires_at = datetime.fromisoformat(reset_row["expires_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+    if datetime.utcnow() > expires_at:
+        raise HTTPException(status_code=400, detail="This reset link has expired. Please request a new one.")
+
+    get_db().table("agents").update({"password_hash": hash_password(req.new_password)}).eq("id", reset_row["agent_id"]).execute()
+    get_db().table("password_resets").update({"used_at": datetime.utcnow().isoformat()}).eq("id", reset_row["id"]).execute()
+
+    return {"success": True}
 
 # ================================
 # LISTINGS ROUTES
@@ -972,12 +1068,13 @@ def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_curre
 # PUBLIC ROUTES (no auth — buyer-facing)
 # ================================
 _public_enquiry_hits = {}
+_password_reset_hits = {}
 
-def _rate_limited(ip: str, limit: int = 5, window_seconds: int = 3600) -> bool:
+def _rate_limited(store: dict, key: str, limit: int = 5, window_seconds: int = 3600) -> bool:
     now = datetime.utcnow()
-    hits = [t for t in _public_enquiry_hits.get(ip, []) if (now - t).total_seconds() < window_seconds]
+    hits = [t for t in store.get(key, []) if (now - t).total_seconds() < window_seconds]
     hits.append(now)
-    _public_enquiry_hits[ip] = hits
+    store[key] = hits
     return len(hits) > limit
 
 def _is_valid_uuid(value: str) -> bool:
@@ -1017,7 +1114,7 @@ async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
         return {"success": True}
 
     client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
-    if _rate_limited(client_ip):
+    if _rate_limited(_public_enquiry_hits, client_ip):
         raise HTTPException(status_code=429, detail="Too many enquiries — please try again later")
 
     if not _is_valid_uuid(req.listing_id):
