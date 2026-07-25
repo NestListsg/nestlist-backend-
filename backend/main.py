@@ -220,6 +220,10 @@ class ProfileUpdate(BaseModel):
 class ProfilePhotoRequest(BaseModel):
     image_data: str
 
+class EmailChangeRequest(BaseModel):
+    new_email: str
+    current_password: str
+
 class TokenExchangeRequest(BaseModel):
     user_token: str
 
@@ -804,6 +808,22 @@ def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
 @app.get("/api/profile")
 def get_profile(agent=Depends(get_current_agent)):
     return _agent_response(agent)
+
+@app.post("/api/profile/change-email")
+def change_email(req: EmailChangeRequest, agent=Depends(get_current_agent)):
+    if not verify_password(req.current_password, agent["password_hash"]):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    new_email = req.new_email.strip().lower()
+    if "@" not in new_email or "." not in new_email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    if new_email == agent["email"]:
+        raise HTTPException(status_code=400, detail="That's already your current email")
+    existing = get_db().table("agents").select("id").eq("email", new_email).execute()
+    if existing.data:
+        raise HTTPException(status_code=400, detail="That email is already in use")
+    get_db().table("agents").update({"email": new_email}).eq("id", agent["id"]).execute()
+    result = get_db().table("agents").select("*").eq("id", agent["id"]).execute()
+    return _agent_response(result.data[0])
 
 @app.post("/api/profile/photo")
 def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_agent)):
