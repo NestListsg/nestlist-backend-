@@ -1,3 +1,4 @@
+import asyncio
 import os
 import httpx
 from datetime import datetime, date
@@ -28,6 +29,23 @@ NASSIM_ROAD_TOKEN = "nassim road"
 _token_cache = {"token": None, "fetched_on": None}
 
 
+async def _get_json_with_retry(client, url, *, attempts=3, backoff=2, **kwargs):
+    """URA's API intermittently returns an empty 200 body instead of JSON
+    (observed in production, not tied to a specific request shape) -- retry
+    a few times with a short backoff before giving up."""
+    last_error = None
+    for attempt in range(attempts):
+        resp = await client.get(url, **kwargs)
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except ValueError as e:
+            last_error = e
+            if attempt < attempts - 1:
+                await asyncio.sleep(backoff * (attempt + 1))
+    raise RuntimeError(f"URA API returned a non-JSON response after {attempts} attempts: {last_error}")
+
+
 async def get_token(access_key: str) -> str:
     """URA tokens are valid for the calendar day they were issued. Cache and
     only refetch once the date rolls over."""
@@ -36,9 +54,7 @@ async def get_token(access_key: str) -> str:
         return _token_cache["token"]
 
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(TOKEN_URL, headers={"AccessKey": access_key})
-        resp.raise_for_status()
-        data = resp.json()
+        data = await _get_json_with_retry(client, TOKEN_URL, headers={"AccessKey": access_key})
         if data.get("Status") != "Success":
             raise RuntimeError(f"URA token request failed: {data.get('Message')}")
         token = data["Result"]
@@ -54,13 +70,11 @@ async def fetch_all_transactions(access_key: str, token: str) -> list:
     all_projects = []
     async with httpx.AsyncClient(timeout=60) as client:
         for batch in (1, 2, 3, 4):
-            resp = await client.get(
-                TRANSACTION_URL,
+            data = await _get_json_with_retry(
+                client, TRANSACTION_URL,
                 params={"service": "PMI_Resi_Transaction", "batch": batch},
                 headers=headers,
             )
-            resp.raise_for_status()
-            data = resp.json()
             if data.get("Status") == "Success":
                 all_projects.extend(data.get("Result", []))
     return all_projects
