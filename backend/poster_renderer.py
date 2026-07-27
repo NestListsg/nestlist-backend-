@@ -135,6 +135,68 @@ def _right_text(base, draw, right_x, y, text, font, fill, blur=6, offset=(0, 2),
         draw.text((x, y), text, font=font, fill=fill)
 
 
+def _circle_photo(base, agent_photo, cx, cy, diameter, border_color=GOLD, border_width=3):
+    """Full-opacity circular-cropped agent headshot with a thin border ring, centered
+    at (cx, cy). Sits inside the existing text zone rather than blended onto the
+    property photo -- overlaying it on the photo is what made an earlier attempt read
+    as an accidental floating face instead of a designed element."""
+    if not agent_photo:
+        return
+    radius = diameter / 2
+    photo = ImageOps.fit(agent_photo.convert("RGB"), (diameter, diameter), centering=(0.5, 0.3)).convert("RGBA")
+    mask = Image.new("L", (diameter, diameter), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, diameter, diameter), fill=255)
+    photo.putalpha(mask)
+    base.alpha_composite(photo, dest=(round(cx - radius), round(cy - radius)))
+    ImageDraw.Draw(base).ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=border_color, width=border_width)
+
+
+def _photo_beside_text(base, draw, cx, y, text, font, fill, agent_photo, diameter=56, gap=18, shadow=True, blur=6, offset=(0, 2)):
+    """Centered row: circular agent photo + text, the pair centered together at cx.
+    Falls back to plain centered text when there's no agent photo."""
+    if not agent_photo:
+        _centered_text(base, draw, cx, y, text, font, fill, blur=blur, offset=offset, shadow=shadow)
+        return
+    text_w = _text_width(draw, text, font)
+    bbox = draw.textbbox((0, 0), text, font=font) if text else (0, 0, 0, 0)
+    text_h = bbox[3] - bbox[1]
+    x0 = cx - (diameter + gap + text_w) / 2
+    _circle_photo(base, agent_photo, x0 + diameter / 2, y + text_h / 2, diameter)
+    text_x = x0 + diameter + gap
+    if shadow:
+        _text_with_shadow(base, draw, (text_x, y), text, font, fill, blur=blur, offset=offset)
+    else:
+        draw.text((text_x, y), text, font=font, fill=fill)
+
+
+def _left_photo_text_row(base, draw, x, y, text, font, fill, agent_photo, diameter=56, gap=18, shadow=True, blur=6, offset=(0, 2)):
+    """Left-aligned row: circular agent photo, then text starting after it."""
+    text_x = x
+    if agent_photo:
+        bbox = draw.textbbox((0, 0), text, font=font) if text else (0, 0, 0, 0)
+        text_h = bbox[3] - bbox[1]
+        _circle_photo(base, agent_photo, x + diameter / 2, y + text_h / 2, diameter)
+        text_x = x + diameter + gap
+    if shadow:
+        _text_with_shadow(base, draw, (text_x, y), text, font, fill, blur=blur, offset=offset)
+    else:
+        draw.text((text_x, y), text, font=font, fill=fill)
+
+
+def _right_photo_text_row(base, draw, right_x, y, text, font, fill, agent_photo, diameter=48, gap=16, shadow=True, blur=6, offset=(0, 2)):
+    """Right-aligned row: text ending at right_x, circular agent photo to its left."""
+    text_w = _text_width(draw, text, font)
+    text_x = right_x - text_w
+    if agent_photo:
+        bbox = draw.textbbox((0, 0), text, font=font) if text else (0, 0, 0, 0)
+        text_h = bbox[3] - bbox[1]
+        _circle_photo(base, agent_photo, text_x - gap - diameter / 2, y + text_h / 2, diameter)
+    if shadow:
+        _text_with_shadow(base, draw, (text_x, y), text, font, fill, blur=blur, offset=offset)
+    else:
+        draw.text((text_x, y), text, font=font, fill=fill)
+
+
 def _double_gold_frame(base, margin=40, gap=10, color=GOLD, width=2):
     draw = ImageDraw.Draw(base)
     draw.rectangle((margin, margin, base.width - margin, base.height - margin), outline=color, width=width)
@@ -261,7 +323,7 @@ def _render_gallery_frame(property_type, district, price_text, stats, agent_name
     _centered_text(base, draw, cx, y, _stats_line(stats), GALLERY_STATS_FONT, MUTED, shadow=False)
     y += 60
     contact = f"{agent_name.upper()}   ·   {agent_contact_line}" if agent_contact_line else agent_name.upper()
-    _centered_text(base, draw, cx, y, contact, GALLERY_CONTACT_FONT, INK, shadow=False)
+    _photo_beside_text(base, draw, cx, y, contact, GALLERY_CONTACT_FONT, INK, agent_photo, diameter=52, gap=16, shadow=False)
 
     return base.convert("RGB")
 
@@ -277,7 +339,7 @@ def _render_bold_type(property_type, district, price_text, stats, agent_name, ag
     _solid_band(base, (0, 0, W, 76), (12, 14, 12), 165)
     draw.text((44, 24), district.upper(), font=EYEBROW_FONT_SM, fill=WHITE)
     contact = f"{agent_name.upper()}   ·   {agent_contact_line}" if agent_contact_line else agent_name.upper()
-    _right_text(base, draw, W - 44, 24, contact, EYEBROW_FONT_SM, WHITE, shadow=False)
+    _right_photo_text_row(base, draw, W - 44, 24, contact, EYEBROW_FONT_SM, WHITE, agent_photo, diameter=36, gap=10, shadow=False)
 
     _vertical_gradient_scrim(base, H - 460, H, 0, 210)
 
@@ -317,7 +379,7 @@ def _render_vignette_frame(property_type, district, price_text, stats, agent_nam
     _centered_text(base, draw, cx, y, _stats_line(stats), STATS_FONT, WHITE, blur=5)
     y += 66
     contact = f"{agent_name.upper()}   ·   {agent_contact_line}" if agent_contact_line else agent_name.upper()
-    _centered_text(base, draw, cx, y, contact, EYEBROW_FONT_SM, WHITE, blur=4)
+    _photo_beside_text(base, draw, cx, y, contact, EYEBROW_FONT_SM, WHITE, agent_photo, diameter=44, gap=14, blur=4)
 
     _double_gold_frame(base, margin=40, gap=10)
 
@@ -349,7 +411,7 @@ def _render_postcard(property_type, district, price_text, stats, agent_name, age
     draw.text((x, y), _stats_line(stats), font=GALLERY_STATS_FONT, fill=MUTED)
     y += 50
     contact = f"{agent_name}   ·   {agent_contact_line}" if agent_contact_line else agent_name
-    draw.text((x, y), contact, font=GALLERY_CONTACT_FONT, fill=INK)
+    _left_photo_text_row(base, draw, x, y, contact, GALLERY_CONTACT_FONT, INK, agent_photo, diameter=56, gap=16, shadow=False)
 
     return base.convert("RGB")
 
@@ -378,7 +440,7 @@ def _render_gold_frame(property_type, district, price_text, stats, agent_name, a
     draw.text((x, y), _stats_line(stats), font=STATS_FONT, fill=WHITE)
     y += 60
     contact = f"{agent_name}   ·   {agent_contact_line}" if agent_contact_line else agent_name
-    draw.text((x, y), contact, font=NAME_FONT, fill=PALE)
+    _left_photo_text_row(base, draw, x, y, contact, NAME_FONT, PALE, agent_photo, diameter=64, gap=18, shadow=False)
 
     _double_gold_frame(base, margin=36, gap=8)
 
@@ -408,7 +470,7 @@ def _render_top_banner_minimal(property_type, district, price_text, stats, agent
     _text_with_shadow(base, draw, (x, y), _stats_line(stats), STATS_FONT, WHITE, blur=5)
     y += 60
     contact = f"{agent_name}   ·   {agent_contact_line}" if agent_contact_line else agent_name
-    _text_with_shadow(base, draw, (x, y), contact, NAME_FONT, WHITE, blur=4)
+    _left_photo_text_row(base, draw, x, y, contact, NAME_FONT, WHITE, agent_photo, diameter=64, gap=18, blur=4)
 
     return base.convert("RGB")
 
@@ -434,7 +496,7 @@ def _render_numeral_focus(property_type, district, price_text, stats, agent_name
     _centered_text(base, draw, cx, y, _stats_line(stats), STATS_FONT, WHITE, blur=5)
     y += 60
     contact = f"{agent_name.upper()}   ·   {agent_contact_line}" if agent_contact_line else agent_name.upper()
-    _centered_text(base, draw, cx, y, contact, EYEBROW_FONT_SM, WHITE, blur=4)
+    _photo_beside_text(base, draw, cx, y, contact, EYEBROW_FONT_SM, WHITE, agent_photo, diameter=44, gap=14, blur=4)
 
     return base.convert("RGB")
 
@@ -473,7 +535,7 @@ def _render_corner_badge(property_type, district, price_text, stats, agent_name,
 
     y += 66
     contact = f"{agent_name}   /   {agent_contact_line}" if agent_contact_line else agent_name
-    _right_text(base, draw, W - 56, y, contact, EYEBROW_FONT_SM, WHITE, shadow=False)
+    _right_photo_text_row(base, draw, W - 56, y, contact, EYEBROW_FONT_SM, WHITE, agent_photo, diameter=44, gap=14, shadow=False)
 
     return base.convert("RGB")
 
@@ -521,7 +583,7 @@ def _render_asymmetric_column(property_type, district, price_text, stats, agent_
 
     by = H - 130
     draw.line((tx, by - 24, tx + max_w, by - 24), fill=(226, 220, 204, 255), width=1)
-    draw.text((tx, by), agent_name.upper(), font=EYEBROW_FONT_SM, fill=INK)
+    _left_photo_text_row(base, draw, tx, by, agent_name.upper(), EYEBROW_FONT_SM, INK, agent_photo, diameter=56, gap=16, shadow=False)
     if agent_contact_line:
         draw.text((tx, by + 30), agent_contact_line, font=EYEBROW_FONT_SM, fill=(184, 145, 46, 255))
 
