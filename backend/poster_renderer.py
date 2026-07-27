@@ -135,16 +135,6 @@ def _right_text(base, draw, right_x, y, text, font, fill, blur=6, offset=(0, 2),
         draw.text((x, y), text, font=font, fill=fill)
 
 
-def _faint_square(base, photo, x, y, size, opacity=95):
-    """Small square agent-photo insert, blended at low opacity so it reads as a
-    subtle mark rather than competing with the property photo or the headline text."""
-    if not photo:
-        return
-    sq = ImageOps.fit(photo.convert("RGB"), (size, size), centering=(0.5, 0.28)).convert("RGBA")
-    sq.putalpha(opacity)
-    base.alpha_composite(sq, dest=(int(x), int(y)))
-
-
 def _double_gold_frame(base, margin=40, gap=10, color=GOLD, width=2):
     draw = ImageDraw.Draw(base)
     draw.rectangle((margin, margin, base.width - margin, base.height - margin), outline=color, width=width)
@@ -273,8 +263,6 @@ def _render_gallery_frame(property_type, district, price_text, stats, agent_name
     contact = f"{agent_name.upper()}   ·   {agent_contact_line}" if agent_contact_line else agent_name.upper()
     _centered_text(base, draw, cx, y, contact, GALLERY_CONTACT_FONT, INK, shadow=False)
 
-    _faint_square(base, agent_photo, W - margin_x - 90 - 24, margin_top + photo_h - 90 - 24, 90)
-
     return base.convert("RGB")
 
 
@@ -305,8 +293,6 @@ def _render_bold_type(property_type, district, price_text, stats, agent_name, ag
     y += 60
     _text_with_shadow(base, draw, (x, y), _stats_line(stats), STATS_FONT, WHITE, blur=5)
 
-    _faint_square(base, agent_photo, W - 110 - 40, 76 + 30, 110)
-
     return base.convert("RGB")
 
 
@@ -332,11 +318,6 @@ def _render_vignette_frame(property_type, district, price_text, stats, agent_nam
     y += 66
     contact = f"{agent_name.upper()}   ·   {agent_contact_line}" if agent_contact_line else agent_name.upper()
     _centered_text(base, draw, cx, y, contact, EYEBROW_FONT_SM, WHITE, blur=4)
-
-    # Centered in the open middle of the frame -- keeps the symmetric composition
-    # intact instead of pulling the eye to one side.
-    square_size = 140
-    _faint_square(base, agent_photo, cx - square_size / 2, 630, square_size)
 
     _double_gold_frame(base, margin=40, gap=10)
 
@@ -370,8 +351,6 @@ def _render_postcard(property_type, district, price_text, stats, agent_name, age
     contact = f"{agent_name}   ·   {agent_contact_line}" if agent_contact_line else agent_name
     draw.text((x, y), contact, font=GALLERY_CONTACT_FONT, fill=INK)
 
-    _faint_square(base, agent_photo, W - margin_x - 90 - 20, margin_top + photo_h - 90 - 20, 90)
-
     return base.convert("RGB")
 
 
@@ -400,11 +379,6 @@ def _render_gold_frame(property_type, district, price_text, stats, agent_name, a
     y += 60
     contact = f"{agent_name}   ·   {agent_contact_line}" if agent_contact_line else agent_name
     draw.text((x, y), contact, font=NAME_FONT, fill=PALE)
-
-    # Right side of the frame is otherwise empty since everything else is a single
-    # left-aligned column -- balances the composition without touching any text.
-    square_size = 170
-    _faint_square(base, agent_photo, W - 70 - square_size, H - 256, square_size)
 
     _double_gold_frame(base, margin=36, gap=8)
 
@@ -436,8 +410,6 @@ def _render_top_banner_minimal(property_type, district, price_text, stats, agent
     contact = f"{agent_name}   ·   {agent_contact_line}" if agent_contact_line else agent_name
     _text_with_shadow(base, draw, (x, y), contact, NAME_FONT, WHITE, blur=4)
 
-    _faint_square(base, agent_photo, W - 150 - 56, H - 300, 150)
-
     return base.convert("RGB")
 
 
@@ -464,11 +436,6 @@ def _render_numeral_focus(property_type, district, price_text, stats, agent_name
     contact = f"{agent_name.upper()}   ·   {agent_contact_line}" if agent_contact_line else agent_name.upper()
     _centered_text(base, draw, cx, y, contact, EYEBROW_FONT_SM, WHITE, blur=4)
 
-    # Centered in the clear zone between the top band and the price -- matches
-    # Vignette Frame's approach of keeping the symmetric layout intact.
-    square_size = 140
-    _faint_square(base, agent_photo, cx - square_size / 2, 550, square_size)
-
     return base.convert("RGB")
 
 
@@ -488,10 +455,6 @@ def _render_corner_badge(property_type, district, price_text, stats, agent_name,
         bx0, by0 = bx1 - badge_w, by1
         _solid_band(base, (bx0, by0, bx1, by0 + badge_h), (10, 10, 8), 190)
         draw.text((bx0 + pad_x, by0 + pad_y - 4), district.upper(), font=BADGE_FONT, fill=GOLD)
-
-    # Top-left, mirroring the district badge on the top-right -- the one corner
-    # that stays clear regardless of how long the bottom bar's stats line runs.
-    _faint_square(base, agent_photo, 50, 50, 100)
 
     # Three stacked rows rather than a strict left/right grid -- the stats line's real
     # width varies a lot with listing data, so row 1 (title + price) is the only row
@@ -530,12 +493,6 @@ def _render_asymmetric_column(property_type, district, price_text, stats, agent_
     if property_photo:
         photo = _fit(property_photo, photo_w, H)
         base.paste(photo, (0, 0))
-
-    # Bottom-right corner of the photo -- keeps this off the text column entirely,
-    # so it never risks colliding with the stats block (whose height varies with
-    # how many stats are present / how long their values are).
-    square_size = 110
-    _faint_square(base, agent_photo, photo_w - square_size - 24, H - square_size - 24, square_size)
 
     pad = 46
     tx = col_x + pad
