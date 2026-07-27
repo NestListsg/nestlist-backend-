@@ -7,6 +7,14 @@ TOKEN_URL = "https://eservice.ura.gov.sg/uraDataService/insertNewToken/v1"
 TRANSACTION_URL = "https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1"
 SQM_TO_SQFT = 10.7639
 
+# URA's edge WAF serves a JS challenge page (not JSON) to non-browser User-Agents
+# like httpx's default -- this isn't flakiness, every httpx request was being
+# blocked. A browser-like UA gets a normal JSON response every time.
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
+
 # The 39 URA-gazetted Good Class Bungalow Areas. Compound entries ("First
 # Avenue / Third Avenue") are split into individual street-name tokens so
 # each can be matched independently against a transaction's "street" field.
@@ -54,7 +62,9 @@ async def get_token(access_key: str) -> str:
         return _token_cache["token"]
 
     async with httpx.AsyncClient(timeout=30) as client:
-        data = await _get_json_with_retry(client, TOKEN_URL, headers={"AccessKey": access_key})
+        data = await _get_json_with_retry(
+            client, TOKEN_URL, headers={**BROWSER_HEADERS, "AccessKey": access_key}
+        )
         if data.get("Status") != "Success":
             raise RuntimeError(f"URA token request failed: {data.get('Message')}")
         token = data["Result"]
@@ -66,7 +76,7 @@ async def get_token(access_key: str) -> str:
 async def fetch_all_transactions(access_key: str, token: str) -> list:
     """Fetch all 4 batches of PMI_Resi_Transaction (split by postal district
     ranges) and return the merged list of project entries."""
-    headers = {"AccessKey": access_key, "Token": token}
+    headers = {**BROWSER_HEADERS, "AccessKey": access_key, "Token": token}
     all_projects = []
     async with httpx.AsyncClient(timeout=60) as client:
         for batch in (1, 2, 3, 4):
