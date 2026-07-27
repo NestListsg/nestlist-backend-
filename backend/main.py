@@ -672,17 +672,18 @@ def _to_number(value) -> float:
 # ================================
 # POSTER GENERATION
 # ================================
+POSTER_THUMBNAIL_BASE = "https://www.nestlist.sg/poster-thumbnails"
 POSTER_TEMPLATES = [
-    {"id": "editorial", "name": "Editorial", "thumbnail_url": ""},
-    {"id": "gallery-frame", "name": "Gallery Frame", "thumbnail_url": ""},
-    {"id": "bold-type", "name": "Bold Type", "thumbnail_url": ""},
-    {"id": "vignette-frame", "name": "Vignette Frame", "thumbnail_url": ""},
-    {"id": "postcard", "name": "Postcard", "thumbnail_url": ""},
-    {"id": "gold-frame", "name": "Gold Frame", "thumbnail_url": ""},
-    {"id": "top-banner-minimal", "name": "Top Banner Minimal", "thumbnail_url": ""},
-    {"id": "numeral-focus", "name": "Numeral Focus", "thumbnail_url": ""},
-    {"id": "corner-badge", "name": "Corner Badge", "thumbnail_url": ""},
-    {"id": "asymmetric-column", "name": "Asymmetric Column", "thumbnail_url": ""},
+    {"id": "editorial", "name": "Editorial", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/editorial.jpg"},
+    {"id": "gallery-frame", "name": "Gallery Frame", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/gallery-frame.jpg"},
+    {"id": "bold-type", "name": "Bold Type", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/bold-type.jpg"},
+    {"id": "vignette-frame", "name": "Vignette Frame", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/vignette-frame.jpg"},
+    {"id": "postcard", "name": "Postcard", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/postcard.jpg"},
+    {"id": "gold-frame", "name": "Gold Frame", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/gold-frame.jpg"},
+    {"id": "top-banner-minimal", "name": "Top Banner Minimal", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/top-banner-minimal.jpg"},
+    {"id": "numeral-focus", "name": "Numeral Focus", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/numeral-focus.jpg"},
+    {"id": "corner-badge", "name": "Corner Badge", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/corner-badge.jpg"},
+    {"id": "asymmetric-column", "name": "Asymmetric Column", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/asymmetric-column.jpg"},
 ]
 
 @app.get("/api/poster-templates")
