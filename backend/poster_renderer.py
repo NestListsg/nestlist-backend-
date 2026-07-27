@@ -393,7 +393,7 @@ def _render_postcard(property_type, district, price_text, stats, agent_name, age
     base = Image.new("RGBA", (W, H), CREAM_BG)
     draw = ImageDraw.Draw(base)
 
-    margin_x, margin_top, photo_h = 60, 60, 900
+    margin_x, margin_top, photo_h = 60, 60, 1080
     if property_photo:
         photo = _fit(property_photo, W - margin_x * 2, photo_h)
         base.paste(photo, (margin_x, margin_top))
