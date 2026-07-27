@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import httpx
 from datetime import datetime, date
@@ -40,13 +41,15 @@ _token_cache = {"token": None, "fetched_on": None}
 async def _get_json_with_retry(client, url, *, attempts=3, backoff=2, **kwargs):
     """URA's API intermittently returns an empty 200 body instead of JSON
     (observed in production, not tied to a specific request shape) -- retry
-    a few times with a short backoff before giving up."""
+    a few times with a short backoff before giving up. Also decodes leniently:
+    some batches contain a stray invalid UTF-8 byte inside an unrelated field
+    (e.g. a mangled project name) that would otherwise fail the whole batch."""
     last_error = None
     for attempt in range(attempts):
         resp = await client.get(url, **kwargs)
         resp.raise_for_status()
         try:
-            return resp.json()
+            return json.loads(resp.content.decode("utf-8", errors="replace"))
         except ValueError as e:
             last_error = e
             if attempt < attempts - 1:
