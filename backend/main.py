@@ -691,11 +691,17 @@ def get_poster_templates(agent=Depends(get_current_agent)):
     return [{"id": t["id"], "name": t["name"], "thumbnail_url": t["thumbnail_url"]} for t in POSTER_TEMPLATES]
 
 @app.post("/api/listings/{listing_id}/generate-poster")
-def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(get_current_agent)):
+def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = None, agent=Depends(get_current_agent)):
     result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
+
+    if template_id and template_id not in {t["id"] for t in POSTER_TEMPLATES}:
+        raise HTTPException(status_code=400, detail="Unknown poster template")
+    # Explicit choice wins and is remembered on the listing; otherwise fall back to
+    # whatever this listing last used, then the agent's profile default.
+    chosen_template_id = template_id or listing.get("poster_template_id") or agent.get("poster_template_id") or "editorial"
 
     images = listing.get("images") or []
     if not images:
@@ -732,7 +738,7 @@ def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(get_cur
             agent_contact_line=agent.get("contact", ""),
             property_photo_url=images[photo_index],
             agent_photo_url=agent.get("photo_url"),
-            template_id=agent.get("poster_template_id") or "editorial",
+            template_id=chosen_template_id,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Poster rendering failed: {e}")
@@ -750,9 +756,12 @@ def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(get_cur
     )
     poster_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
 
-    get_db().table("listings").update({"poster_url": poster_url}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    update_payload = {"poster_url": poster_url}
+    if template_id:
+        update_payload["poster_template_id"] = template_id
+    get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
 
-    return {"poster_url": poster_url}
+    return {"poster_url": poster_url, "poster_template_id": chosen_template_id}
 
 @app.post("/api/listings/{listing_id}/post-instagram")
 def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(get_current_agent)):
