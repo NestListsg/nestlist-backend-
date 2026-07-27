@@ -674,6 +674,15 @@ def _to_number(value) -> float:
 # ================================
 POSTER_TEMPLATES = [
     {"id": "editorial", "name": "Editorial", "thumbnail_url": ""},
+    {"id": "gallery-frame", "name": "Gallery Frame", "thumbnail_url": ""},
+    {"id": "bold-type", "name": "Bold Type", "thumbnail_url": ""},
+    {"id": "vignette-frame", "name": "Vignette Frame", "thumbnail_url": ""},
+    {"id": "postcard", "name": "Postcard", "thumbnail_url": ""},
+    {"id": "gold-frame", "name": "Gold Frame", "thumbnail_url": ""},
+    {"id": "top-banner-minimal", "name": "Top Banner Minimal", "thumbnail_url": ""},
+    {"id": "numeral-focus", "name": "Numeral Focus", "thumbnail_url": ""},
+    {"id": "corner-badge", "name": "Corner Badge", "thumbnail_url": ""},
+    {"id": "asymmetric-column", "name": "Asymmetric Column", "thumbnail_url": ""},
 ]
 
 @app.get("/api/poster-templates")
@@ -722,6 +731,7 @@ def generate_poster(listing_id: str, photo_index: int = 0, agent=Depends(get_cur
             agent_contact_line=agent.get("contact", ""),
             property_photo_url=images[photo_index],
             agent_photo_url=agent.get("photo_url"),
+            template_id=agent.get("poster_template_id") or "editorial",
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Poster rendering failed: {e}")
