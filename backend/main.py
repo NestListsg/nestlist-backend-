@@ -271,6 +271,13 @@ class InstagramOAuthCallbackRequest(BaseModel):
 class InstagramPostRequest(BaseModel):
     caption: str
 
+class FacebookOAuthCallbackRequest(BaseModel):
+    code: str
+    state: str
+
+class FacebookPostRequest(BaseModel):
+    caption: str
+
 class PasswordResetRequest(BaseModel):
     email: str
     website: str = ""  # honeypot field, must stay empty
@@ -350,9 +357,24 @@ INSTAGRAM_OAUTH_REDIRECT_URI = "https://nestlist.sg/auth/instagram/callback"
 def _can_use_instagram_beta(agent) -> bool:
     return agent.get("email") in INSTAGRAM_BETA_ALLOWLIST
 
+# ================================
+# FACEBOOK AUTO-POSTING (hidden beta, same allowlist gate as Instagram until Meta App Review
+# approves pages_manage_posts at Advanced Access). A genuinely separate connect flow from
+# Instagram's -- posting to a Page needs the pages_manage_posts scope, which Instagram's
+# connect flow never requests, so an existing Instagram connection alone isn't enough.
+# Both flows write the same fb_* columns on the agent record since they're really the same
+# underlying "connect your Facebook Page" action, just entered from two different buttons.
+# ================================
+FACEBOOK_BETA_ALLOWLIST = {"leesbjane@gmail.com"}
+FACEBOOK_OAUTH_REDIRECT_URI = "https://nestlist.sg/auth/facebook/callback"
+
+def _can_use_facebook_beta(agent) -> bool:
+    return agent.get("email") in FACEBOOK_BETA_ALLOWLIST
+
 def _agent_response(agent) -> dict:
     out = {k: v for k, v in agent.items() if k != "password_hash"}
     out["can_use_instagram_beta"] = _can_use_instagram_beta(agent)
+    out["can_use_facebook_beta"] = _can_use_facebook_beta(agent)
     return out
 
 # ================================
@@ -619,64 +641,45 @@ def delete_listing_image(listing_id: str, image_index: int, agent=Depends(get_cu
     return {"images": images}
 
 @app.post("/api/listings/{listing_id}/post-facebook")
-def post_to_facebook(listing_id: str, agent=Depends(get_current_agent)):
+def post_to_facebook(listing_id: str, req: FacebookPostRequest, agent=Depends(get_current_agent)):
+    if not _can_use_facebook_beta(agent):
+        raise HTTPException(status_code=403, detail="Facebook posting is not yet available on your account")
+
     result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
 
-    fb_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
-    fb_page_id = os.environ.get("FB_PAGE_ID", "")
+    if not listing.get("poster_url"):
+        raise HTTPException(status_code=400, detail="Generate a poster before posting to Facebook")
 
-    post_message = f"""NEW LISTING | {listing['property_type']}
-{listing['location']}
-SGD {listing['price']}
+    fb_page_id = agent.get("fb_page_id")
+    fb_token = agent.get("fb_page_access_token")
+    if not fb_page_id or not fb_token:
+        raise HTTPException(status_code=400, detail="Connect Facebook in My Profile first")
 
-{listing['content'][:800]}...
+    caption = req.caption[:2000]
 
-Contact us at nestlist.sg to find out more!
+    def _clear_facebook_connection():
+        get_db().table("agents").update({
+            "fb_user_access_token": None, "fb_page_id": None, "fb_page_access_token": None,
+            "fb_page_name": None, "instagram_business_account_id": None,
+            "instagram_username": None, "instagram_connected_at": None,
+        }).eq("id", agent["id"]).execute()
 
-#NestList #NestListPrestige #Singapore #SingaporeProperty #GCB #LandedProperty #PropertySG #RealEstate"""
-
-    image_urls = listing.get("images") or []
-
-    if image_urls:
-        media_ids = []
-        for url in image_urls[:5]:
-            photo_response = requests.post(
-                f"https://graph.facebook.com/v25.0/{fb_page_id}/photos",
-                data={
-                    "url": url,
-                    "published": "false",
-                    "access_token": fb_token
-                }
-            )
-            photo_data = photo_response.json()
-            if "id" in photo_data:
-                media_ids.append({"media_fbid": photo_data["id"]})
-
-        post_data = {
-            "message": post_message,
-            "access_token": fb_token
-        }
-        for i, media in enumerate(media_ids):
-            post_data[f"attached_media[{i}]"] = json.dumps(media)
-
-        response = requests.post(
-            f"https://graph.facebook.com/v25.0/{fb_page_id}/feed",
-            data=post_data
-        )
-    else:
-        response = requests.post(
-            f"https://graph.facebook.com/v25.0/{fb_page_id}/feed",
-            data={"message": post_message, "access_token": fb_token}
-        )
-
+    response = requests.post(
+        f"https://graph.facebook.com/v25.0/{fb_page_id}/photos",
+        data={"url": listing["poster_url"], "caption": caption, "access_token": fb_token}
+    )
     data = response.json()
     if "id" in data:
         return {"success": True, "post_id": data["id"]}
-    else:
-        raise HTTPException(status_code=400, detail=data.get("error", {}).get("message", "Unknown error"))
+
+    err = data.get("error", {})
+    if err.get("code") == 190:
+        _clear_facebook_connection()
+        raise HTTPException(status_code=401, detail="Your Facebook connection has expired. Please reconnect in My Profile.")
+    raise HTTPException(status_code=400, detail=err.get("message", "Failed to post to Facebook"))
 
 # ================================
 # IMAGE ENHANCEMENT
@@ -1001,6 +1004,94 @@ def instagram_oauth_callback(req: InstagramOAuthCallbackRequest):
     }).eq("id", agent["id"]).execute()
 
     return {"success": True, "instagram_username": ig_username, "page_name": page_name}
+
+@app.get("/api/profile/facebook-connect-link")
+def get_facebook_connect_link(agent=Depends(get_current_agent)):
+    if not _can_use_facebook_beta(agent):
+        raise HTTPException(status_code=403, detail="Facebook connect is not yet available on your account")
+    app_id = os.environ.get("FB_APP_ID", "")
+    if not app_id:
+        raise HTTPException(status_code=503, detail="Facebook connect is not configured")
+    # instagram_basic/instagram_content_publish are included as a bonus -- if the connected
+    # Page also has a linked Instagram professional account, this one connect action enables
+    # Instagram posting too, same as connecting Instagram directly would.
+    scope = "pages_show_list,pages_read_engagement,pages_manage_posts,business_management,instagram_basic,instagram_content_publish"
+    link = (
+        "https://www.facebook.com/v25.0/dialog/oauth"
+        f"?client_id={app_id}"
+        f"&redirect_uri={FACEBOOK_OAUTH_REDIRECT_URI}"
+        f"&state={agent['id']}"
+        f"&scope={scope}"
+        "&response_type=code"
+    )
+    return {"link": link}
+
+@app.post("/api/facebook/oauth-callback")
+def facebook_oauth_callback(req: FacebookOAuthCallbackRequest):
+    if not _is_valid_uuid(req.state):
+        raise HTTPException(status_code=400, detail="Invalid connect request")
+
+    agent_result = get_db().table("agents").select("id, email").eq("id", req.state).execute()
+    if not agent_result.data:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = agent_result.data[0]
+    if not _can_use_facebook_beta(agent):
+        raise HTTPException(status_code=403, detail="Facebook connect is not yet available on your account")
+
+    app_id = os.environ.get("FB_APP_ID", "")
+    app_secret = os.environ.get("FB_APP_SECRET", "")
+
+    r1 = requests.get("https://graph.facebook.com/v25.0/oauth/access_token", params={
+        "client_id": app_id, "client_secret": app_secret,
+        "redirect_uri": FACEBOOK_OAUTH_REDIRECT_URI, "code": req.code,
+    })
+    d1 = r1.json()
+    if "access_token" not in d1:
+        raise HTTPException(status_code=400, detail=f"Facebook connect failed: {d1.get('error', {}).get('message', 'unknown error')}")
+    short_lived_token = d1["access_token"]
+
+    r2 = requests.get("https://graph.facebook.com/v25.0/oauth/access_token", params={
+        "grant_type": "fb_exchange_token", "client_id": app_id,
+        "client_secret": app_secret, "fb_exchange_token": short_lived_token,
+    })
+    d2 = r2.json()
+    if "access_token" not in d2:
+        raise HTTPException(status_code=400, detail=f"Facebook connect failed: {d2.get('error', {}).get('message', 'unknown error')}")
+    long_lived_user_token = d2["access_token"]
+
+    r3 = requests.get("https://graph.facebook.com/v25.0/me/accounts", params={"access_token": long_lived_user_token})
+    d3 = r3.json()
+    if not d3.get("data"):
+        raise HTTPException(status_code=400, detail="No Facebook Page found for this account. Facebook posting requires a Facebook Page you manage.")
+    page = d3["data"][0]
+    page_id, page_name, page_token = page["id"], page.get("name"), page["access_token"]
+
+    update_payload = {
+        "fb_user_access_token": long_lived_user_token,
+        "fb_page_id": page_id,
+        "fb_page_access_token": page_token,
+        "fb_page_name": page_name,
+    }
+
+    # Bonus: if this Page also has a linked Instagram professional account, pick it up too --
+    # it's the same underlying connection, no reason to make the agent connect Instagram
+    # separately if this already covers it.
+    r4 = requests.get(f"https://graph.facebook.com/v25.0/{page_id}", params={
+        "fields": "instagram_business_account", "access_token": page_token,
+    })
+    ig_account = r4.json().get("instagram_business_account")
+    if ig_account:
+        ig_user_id = ig_account["id"]
+        r5 = requests.get(f"https://graph.facebook.com/v25.0/{ig_user_id}", params={
+            "fields": "username", "access_token": page_token,
+        })
+        update_payload["instagram_business_account_id"] = ig_user_id
+        update_payload["instagram_username"] = r5.json().get("username", "")
+        update_payload["instagram_connected_at"] = datetime.utcnow().isoformat()
+
+    get_db().table("agents").update(update_payload).eq("id", agent["id"]).execute()
+
+    return {"success": True, "page_name": page_name}
 
 @app.get("/api/health")
 def health():
