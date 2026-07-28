@@ -38,6 +38,41 @@ async def send_telegram_alert(message: str, chat_id: str = None):
     except Exception:
         pass
 
+async def send_whatsapp_alert(phone_number: str, message: str):
+    """Sends a new-lead notification via Meta's WhatsApp Cloud API. This needs
+    NestList's own WhatsApp Business number plus an approved message template --
+    until that Meta Business setup is done, this silently no-ops (same
+    degrade-gracefully pattern as URA_ACCESS_KEY / RESEND_API_KEY not being set)."""
+    access_token = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
+    phone_number_id = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
+    template_name = os.environ.get("WHATSAPP_LEAD_TEMPLATE_NAME", "new_lead_alert")
+    digits = re.sub(r"\D", "", phone_number or "")
+    if len(digits) == 8:
+        digits = "65" + digits
+    if not access_token or not phone_number_id or not digits:
+        return
+    plain_message = re.sub(r"<[^>]+>", "", message)
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://graph.facebook.com/v21.0/{phone_number_id}/messages",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={
+                    "messaging_product": "whatsapp",
+                    "to": digits,
+                    "type": "template",
+                    "template": {
+                        "name": template_name,
+                        "language": {"code": "en"},
+                        "components": [{"type": "body", "parameters": [{"type": "text", "text": plain_message[:1024]}]}],
+                    },
+                },
+                timeout=10,
+            )
+    except Exception:
+        pass
+
+
 async def send_password_reset_email(to_email: str, name: str, reset_link: str) -> bool:
     api_key = os.environ.get("RESEND_API_KEY", "")
     if not api_key:
@@ -216,6 +251,8 @@ class ProfileUpdate(BaseModel):
     contact: str = ""
     poster_color: str = "#1a1a5c"
     poster_template_id: str = "editorial"
+    notification_channel: str = "telegram"
+    whatsapp_number: str = ""
 
 class ProfilePhotoRequest(BaseModel):
     image_data: str
@@ -820,6 +857,8 @@ def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(
 # ================================
 @app.put("/api/profile")
 def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
+    if req.notification_channel not in ("telegram", "whatsapp", "both"):
+        raise HTTPException(status_code=400, detail="Invalid notification channel")
     get_db().table("agents").update(req.dict()).eq("id", agent["id"]).execute()
     result = get_db().table("agents").select("*").eq("id", agent["id"]).execute()
     agent = result.data[0]
@@ -1249,21 +1288,29 @@ Return only valid JSON, nothing else."""
         "ai_summary": ai_summary,
     }).execute()
 
-    agent_chat_result = get_db().table("agents").select("telegram_chat_id").eq("id", listing["agent_id"]).execute()
-    agent_chat_id = agent_chat_result.data[0].get("telegram_chat_id") if agent_chat_result.data else None
+    agent_notif_result = get_db().table("agents").select(
+        "telegram_chat_id, notification_channel, whatsapp_number"
+    ).eq("id", listing["agent_id"]).execute()
+    agent_notif = agent_notif_result.data[0] if agent_notif_result.data else {}
+    agent_chat_id = agent_notif.get("telegram_chat_id")
+    notification_channel = agent_notif.get("notification_channel") or "telegram"
+    agent_whatsapp_number = agent_notif.get("whatsapp_number") or ""
 
     score_emoji = {"Hot": "🔥", "Warm": "🌤️", "Cold": "❄️"}.get(lead_score, "")
     whatsapp_link = _whatsapp_link_for(req.phone)
     phone_line = f'Phone: <a href="{whatsapp_link}">{req.phone}</a> 💬' if whatsapp_link else "Phone: not provided"
-    await send_telegram_alert(
+    alert_message = (
         f"{score_emoji} <b>New Lead: {lead_score}</b>\n\n"
         f"<b>{req.client_name}</b>\n"
         f"Listing: {listing['property_type']} — {listing['location']}\n"
         f"{phone_line}\n"
         f"Email: {req.email or 'not provided'}\n"
-        f"Summary: {ai_summary or message[:200]}",
-        chat_id=agent_chat_id
+        f"Summary: {ai_summary or message[:200]}"
     )
+    if notification_channel in ("telegram", "both"):
+        await send_telegram_alert(alert_message, chat_id=agent_chat_id)
+    if notification_channel in ("whatsapp", "both") and agent_whatsapp_number:
+        await send_whatsapp_alert(agent_whatsapp_number, alert_message)
 
     return {"success": True, "id": saved.data[0]["id"]}
 
