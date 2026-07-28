@@ -1151,6 +1151,19 @@ def _is_valid_uuid(value: str) -> bool:
     except (ValueError, AttributeError, TypeError):
         return False
 
+
+def _whatsapp_link_for(phone: str) -> str:
+    """Buyer-to-agent contact is always direct -- a wa.me link opens the agent's own
+    WhatsApp app, no NestList number or API involved. Singapore mobile numbers are
+    8 digits; wa.me needs the country code, so add 65 when it looks like a bare
+    local number."""
+    digits = re.sub(r"\D", "", phone or "")
+    if not digits:
+        return ""
+    if len(digits) == 8:
+        digits = "65" + digits
+    return f"https://wa.me/{digits}"
+
 @app.get("/api/public/listings/{listing_id}")
 def get_public_listing(listing_id: str):
     if not _is_valid_uuid(listing_id):
@@ -1240,11 +1253,13 @@ Return only valid JSON, nothing else."""
     agent_chat_id = agent_chat_result.data[0].get("telegram_chat_id") if agent_chat_result.data else None
 
     score_emoji = {"Hot": "🔥", "Warm": "🌤️", "Cold": "❄️"}.get(lead_score, "")
+    whatsapp_link = _whatsapp_link_for(req.phone)
+    phone_line = f'Phone: <a href="{whatsapp_link}">{req.phone}</a> 💬' if whatsapp_link else "Phone: not provided"
     await send_telegram_alert(
         f"{score_emoji} <b>New Lead: {lead_score}</b>\n\n"
         f"<b>{req.client_name}</b>\n"
         f"Listing: {listing['property_type']} — {listing['location']}\n"
-        f"Phone: {req.phone or 'not provided'}\n"
+        f"{phone_line}\n"
         f"Email: {req.email or 'not provided'}\n"
         f"Summary: {ai_summary or message[:200]}",
         chat_id=agent_chat_id
