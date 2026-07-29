@@ -17,6 +17,7 @@ import uuid
 import re
 import secrets
 import hashlib
+import time
 from datetime import datetime, timedelta, date
 from PIL import Image as PILImage, ImageEnhance, ImageOps
 import poster_renderer
@@ -803,6 +804,23 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
 
     return {"poster_url": poster_url, "poster_template_id": chosen_template_id}
 
+def _wait_for_ig_container_ready(container_id: str, page_token: str, max_attempts: int = 10, delay_seconds: float = 1.5) -> bool:
+    # Instagram fetches/processes the image asynchronously after the container is
+    # created — publishing before that finishes fails with "Media ID is not
+    # available", so poll status_code until it reports FINISHED.
+    for _ in range(max_attempts):
+        status_res = requests.get(
+            f"https://graph.facebook.com/v25.0/{container_id}",
+            params={"fields": "status_code", "access_token": page_token},
+        )
+        status_code = status_res.json().get("status_code")
+        if status_code == "FINISHED":
+            return True
+        if status_code == "ERROR":
+            return False
+        time.sleep(delay_seconds)
+    return False
+
 @app.post("/api/listings/{listing_id}/post-instagram")
 def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(get_current_agent)):
     if not _can_use_instagram_beta(agent):
@@ -841,6 +859,9 @@ def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(
             raise HTTPException(status_code=401, detail="Your Instagram connection has expired. Please reconnect in My Profile.")
         raise HTTPException(status_code=400, detail=err.get("message", "Failed to create Instagram post"))
     container_id = d1["id"]
+
+    if not _wait_for_ig_container_ready(container_id, page_token):
+        raise HTTPException(status_code=400, detail="Instagram took too long to process the image. Please try again in a moment.")
 
     r2 = requests.post(f"https://graph.facebook.com/v25.0/{ig_user_id}/media_publish", data={
         "creation_id": container_id, "access_token": page_token,
