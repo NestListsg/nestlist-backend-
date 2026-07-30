@@ -296,6 +296,38 @@ class PublicEnquiryRequest(BaseModel):
     message: str = ""
     website: str = ""  # honeypot field, must stay empty
 
+class BuyerRequest(BaseModel):
+    name: str
+    phone: str = ""
+    email: str = ""
+    temperature: str = "WARM"
+    status: str = "new"
+    contact_date: str = ""
+    contact_via: str = ""
+    budget_min: float = 0
+    budget_max: float = 0
+    timeline: str = ""
+    districts: str = ""
+    property_types: str = ""
+    land_min: float = 0
+    tenure_pref: str = ""
+    buying_for: str = ""
+    sold_house: str = ""
+    financing: str = ""
+    must_haves: str = ""
+    deal_breakers: str = ""
+    notes: str = ""
+
+class BuyerPropertyRequest(BaseModel):
+    listing_id: str = ""
+    address: str = ""
+    price: float = 0
+    kind: str
+    date: str = ""
+    agent_name: str = ""
+    interest: str = ""
+    feedback: str = ""
+
 # ================================
 # AUTH HELPERS
 # ================================
@@ -1589,3 +1621,89 @@ def download_listing_images(listing_id: str, agent=Depends(get_current_agent)):
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=listing-photos-{listing_id[:8]}.zip"}
     )
+
+# ================================
+# BUYER MANAGEMENT
+# ================================
+_TEMP_ORDER = {"HOT": 0, "WARM": 1, "COLD": 2}
+
+def _none_if_empty(value):
+    return value if value not in ("", None) else None
+
+@app.get("/api/buyers")
+def get_buyers(agent=Depends(get_current_agent)):
+    result = get_db().table("buyers").select("*").eq("agent_id", agent["id"]).order("created_at", desc=True).execute()
+    buyers = result.data or []
+    buyers.sort(key=lambda b: _TEMP_ORDER.get(b.get("temperature"), 99))
+    return buyers
+
+@app.post("/api/buyers")
+def create_buyer(req: BuyerRequest, agent=Depends(get_current_agent)):
+    payload = req.dict()
+    payload["agent_id"] = agent["id"]
+    payload["contact_date"] = _none_if_empty(payload["contact_date"])
+    result = get_db().table("buyers").insert(payload).execute()
+    return result.data[0]
+
+@app.get("/api/buyers/{buyer_id}")
+def get_buyer(buyer_id: str, agent=Depends(get_current_agent)):
+    result = get_db().table("buyers").select("*").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Buyer not found")
+    buyer = result.data[0]
+    props_result = get_db().table("buyer_properties").select("*").eq("buyer_id", buyer_id).order("date", desc=True).execute()
+    buyer["properties"] = props_result.data or []
+    return buyer
+
+@app.patch("/api/buyers/{buyer_id}")
+def update_buyer(buyer_id: str, req: BuyerRequest, agent=Depends(get_current_agent)):
+    existing = get_db().table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Buyer not found")
+    payload = req.dict()
+    payload["contact_date"] = _none_if_empty(payload["contact_date"])
+    payload["updated_at"] = datetime.utcnow().isoformat()
+    result = get_db().table("buyers").update(payload).eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    return result.data[0]
+
+@app.delete("/api/buyers/{buyer_id}")
+def delete_buyer(buyer_id: str, agent=Depends(get_current_agent)):
+    result = get_db().table("buyers").delete().eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Buyer not found")
+    return {"success": True}
+
+@app.post("/api/buyers/{buyer_id}/properties")
+def add_buyer_property(buyer_id: str, req: BuyerPropertyRequest, agent=Depends(get_current_agent)):
+    buyer_check = get_db().table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    if not buyer_check.data:
+        raise HTTPException(status_code=404, detail="Buyer not found")
+    payload = req.dict()
+    payload["buyer_id"] = buyer_id
+    payload["listing_id"] = _none_if_empty(payload["listing_id"])
+    payload["date"] = _none_if_empty(payload["date"])
+    result = get_db().table("buyer_properties").insert(payload).execute()
+    return result.data[0]
+
+@app.patch("/api/buyers/{buyer_id}/properties/{property_id}")
+def update_buyer_property(buyer_id: str, property_id: str, req: BuyerPropertyRequest, agent=Depends(get_current_agent)):
+    buyer_check = get_db().table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    if not buyer_check.data:
+        raise HTTPException(status_code=404, detail="Buyer not found")
+    payload = req.dict()
+    payload["listing_id"] = _none_if_empty(payload["listing_id"])
+    payload["date"] = _none_if_empty(payload["date"])
+    result = get_db().table("buyer_properties").update(payload).eq("id", property_id).eq("buyer_id", buyer_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Property entry not found")
+    return result.data[0]
+
+@app.delete("/api/buyers/{buyer_id}/properties/{property_id}")
+def delete_buyer_property(buyer_id: str, property_id: str, agent=Depends(get_current_agent)):
+    buyer_check = get_db().table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    if not buyer_check.data:
+        raise HTTPException(status_code=404, detail="Buyer not found")
+    result = get_db().table("buyer_properties").delete().eq("id", property_id).eq("buyer_id", buyer_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Property entry not found")
+    return {"success": True}
