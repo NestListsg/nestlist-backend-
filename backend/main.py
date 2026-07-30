@@ -1635,6 +1635,20 @@ def get_buyers(agent=Depends(get_current_agent)):
     result = get_db().table("buyers").select("*").eq("agent_id", agent["id"]).order("created_at", desc=True).execute()
     buyers = result.data or []
     buyers.sort(key=lambda b: _TEMP_ORDER.get(b.get("temperature"), 99))
+
+    buyer_ids = [b["id"] for b in buyers]
+    if buyer_ids:
+        props = get_db().table("buyer_properties").select("buyer_id, kind").in_("buyer_id", buyer_ids).execute().data or []
+        counts = {}
+        for p in props:
+            bucket = counts.setdefault(p["buyer_id"], {"viewed_me": 0, "recommended": 0})
+            if p["kind"] in bucket:
+                bucket[p["kind"]] += 1
+        for b in buyers:
+            c = counts.get(b["id"], {"viewed_me": 0, "recommended": 0})
+            b["viewed_count"] = c["viewed_me"]
+            b["recommended_count"] = c["recommended"]
+
     return buyers
 
 @app.post("/api/buyers")
