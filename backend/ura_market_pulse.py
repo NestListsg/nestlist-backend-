@@ -178,6 +178,114 @@ def compute_market_pulse_stats(projects: list) -> dict:
     }
 
 
+# Maps NestList's own property_type labels to URA's PMI_Resi_Transaction
+# "propertyType" values, loosely (substring match), since the exact URA
+# vocabulary isn't publicly documented in detail and this only needs to
+# narrow comparables, not exactly reproduce URA's internal taxonomy.
+_PROPERTY_TYPE_MAP = [
+    ("good class bungalow", "Detached"),
+    ("detached/bungalow", "Detached"),
+    ("detached", "Detached"),
+    ("semi-detached", "Semi-Detached"),
+    ("inter-terrace", "Terrace"),
+    ("corner terrace", "Terrace"),
+    ("terrace", "Terrace"),
+]
+
+def _map_property_type(nestlist_type: str) -> str:
+    key = (nestlist_type or "").strip().lower()
+    for prefix, ura_type in _PROPERTY_TYPE_MAP:
+        if prefix in key:
+            return ura_type
+    return ""
+
+def _matches_street_keyword(street: str, keyword: str) -> bool:
+    if not keyword:
+        return False
+    return keyword.strip().lower() in (street or "").lower()
+
+def extract_comparable_transactions(projects: list, street_keyword: str, property_type: str = "", window_months: int = 24) -> list:
+    """Landed-property transactions near a given street/area, within a
+    trailing window -- the raw comparables list a CMA is built from."""
+    now = datetime.utcnow()
+    ura_type = _map_property_type(property_type)
+
+    def within_window(year, month):
+        months_ago = (now.year - year) * 12 + (now.month - month)
+        return 0 <= months_ago < window_months
+
+    records = []
+    for project in projects:
+        street = project.get("street", "")
+        if not _matches_street_keyword(street, street_keyword):
+            continue
+        for txn in project.get("transaction", []):
+            if txn.get("typeOfArea") != "Land":
+                continue
+            if ura_type and txn.get("propertyType") != ura_type:
+                continue
+            parsed = _parse_contract_date(txn.get("contractDate", ""))
+            if not parsed or not within_window(*parsed):
+                continue
+            try:
+                price = float(txn.get("price", 0))
+                area_sqm = float(txn.get("area", 0))
+            except (TypeError, ValueError):
+                continue
+            if price <= 0 or area_sqm <= 0:
+                continue
+            area_sqft = area_sqm * SQM_TO_SQFT
+            records.append({
+                "street": street,
+                "price": price,
+                "area_sqft": round(area_sqft),
+                "psf": round(price / area_sqft),
+                "property_type": txn.get("propertyType", ""),
+                "contract_date": f"{parsed[1]:02d}/{parsed[0]}",
+            })
+    records.sort(key=lambda r: r["contract_date"], reverse=True)
+    return records
+
+def compute_cma_stats(records: list, subject_land_size_sqft: float = 0) -> dict:
+    if not records:
+        return {
+            "comparable_count": 0, "avg_psf": 0, "min_psf": 0, "max_psf": 0,
+            "estimated_value_low": 0, "estimated_value_high": 0, "comparables": [],
+        }
+    psf_values = [r["psf"] for r in records]
+    avg_psf = sum(psf_values) / len(psf_values)
+    min_psf = min(psf_values)
+    max_psf = max(psf_values)
+
+    estimated_low = estimated_high = 0
+    if subject_land_size_sqft > 0:
+        estimated_low = round(subject_land_size_sqft * min_psf)
+        estimated_high = round(subject_land_size_sqft * max_psf)
+
+    return {
+        "comparable_count": len(records),
+        "avg_psf": round(avg_psf),
+        "min_psf": round(min_psf),
+        "max_psf": round(max_psf),
+        "estimated_value_low": estimated_low,
+        "estimated_value_high": estimated_high,
+        "comparables": records[:20],
+    }
+
+async def generate_cma(street_keyword: str, property_type: str = "", land_size_sqft: float = 0, window_months: int = 24) -> dict:
+    access_key = os.environ.get("URA_ACCESS_KEY", "")
+    if not access_key:
+        raise RuntimeError("URA_ACCESS_KEY not configured")
+    token = await get_token(access_key)
+    projects = await fetch_all_transactions(access_key, token)
+    records = extract_comparable_transactions(projects, street_keyword, property_type, window_months)
+    stats = compute_cma_stats(records, land_size_sqft)
+    stats["street_keyword"] = street_keyword
+    stats["property_type"] = property_type
+    stats["window_months"] = window_months
+    stats["generated_at"] = date.today().isoformat()
+    return stats
+
 async def refresh_market_pulse() -> dict:
     """Full refresh cycle: token -> fetch -> filter -> compute. Returns the
     stats dict to upsert, or None if URA_ACCESS_KEY isn't set or no

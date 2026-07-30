@@ -288,6 +288,12 @@ class PasswordResetConfirm(BaseModel):
     token: str
     new_password: str
 
+class CMARequest(BaseModel):
+    street: str
+    property_type: str = ""
+    land_size: float = 0
+    window_months: int = 24
+
 class PublicEnquiryRequest(BaseModel):
     listing_id: str
     client_name: str
@@ -1301,6 +1307,20 @@ async def trigger_market_pulse_refresh(agent=Depends(get_current_agent)):
         raise HTTPException(status_code=502, detail="No qualifying GCB transactions found in the past 12 months, or the URA request failed")
     get_db().table("market_pulse").upsert({"id": 1, **stats}).execute()
     return stats
+
+@app.post("/api/cma/generate")
+async def generate_cma_report(req: CMARequest, agent=Depends(get_current_agent)):
+    if not req.street:
+        raise HTTPException(status_code=400, detail="Street or area name is required")
+    if not os.environ.get("URA_ACCESS_KEY", ""):
+        raise HTTPException(status_code=503, detail="URA market data isn't configured yet -- contact NestList support")
+    try:
+        result = await ura_market_pulse.generate_cma(req.street, req.property_type, req.land_size, req.window_months)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=502, detail="Couldn't reach URA's data service right now -- please try again shortly")
+    return result
 
 @app.post("/api/facebook/exchange-long-lived-token")
 def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_current_agent)):
