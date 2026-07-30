@@ -1169,7 +1169,7 @@ async def extract_listing_image(request: Request):
             "type": "text",
             "text": """Extract property listing details from these images and return ONLY a JSON object with these exact fields:
 {
-  "property_type": "one of: Good Class Bungalow (GCB), Landed Bungalow, Semi-Detached, Terrace House, Penthouse, Ultra Luxury Investment Property, HDB Flat, Condominium",
+  "property_type": "one of: Good Class Bungalow (GCB), Detached/Bungalow, Semi-Detached, Inter-Terrace, Corner Terrace, Penthouse",
   "location": "full address or area",
   "land_size": number in sqft or 0,
   "built_up": number in sqft or 0,
