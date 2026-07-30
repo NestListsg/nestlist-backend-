@@ -570,7 +570,7 @@ Write a premium property listing for:
 - Built-up: {req.built_up:,} sqft
 - Bedrooms: {req.bedrooms}
 - Bathrooms: {req.bathrooms}
-- Price: SGD {req.price}
+- Price: SGD {_format_price_millions(req.price)}
 - Features: {req.features}
 
 Write:
@@ -733,6 +733,13 @@ def _to_number(value) -> float:
     except (TypeError, ValueError):
         return 0
 
+def _format_price_millions(value) -> str:
+    num = _to_number(value)
+    if num <= 0:
+        return str(value) if value else ""
+    millions = f"{num / 1_000_000:.2f}".rstrip("0").rstrip(".")
+    return f"{millions}M"
+
 # ================================
 # POSTER GENERATION
 # ================================
@@ -796,7 +803,7 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
         poster_image = poster_renderer.render_poster(
             property_type=property_type_text,
             district=district_text,
-            price_text=f"SGD {listing['price']}",
+            price_text=f"SGD {_format_price_millions(listing['price'])}",
             stats=stats,
             agent_name=agent["name"],
             agent_contact_line=agent.get("contact", ""),
