@@ -1564,6 +1564,14 @@ def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
         raise HTTPException(status_code=404, detail="Listing not found")
     return {"success": True}
 
+@app.post("/api/listings/{listing_id}/restore")
+def restore_listing(listing_id: str, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").update({"status": "active"}) \
+        .eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    return {"success": True}
+
 @app.delete("/api/listings/{listing_id}/permanent")
 def delete_listing_permanently(listing_id: str, agent=Depends(get_current_agent)):
     result = get_db().table("listings").select("id, status").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
