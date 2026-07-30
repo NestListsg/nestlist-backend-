@@ -1721,3 +1721,96 @@ def delete_buyer_property(buyer_id: str, property_id: str, agent=Depends(get_cur
     if not result.data:
         raise HTTPException(status_code=404, detail="Property entry not found")
     return {"success": True}
+
+# ================================
+# BUYER-LISTING MATCHING
+# ================================
+def _extract_district_token(location: str) -> str:
+    match = re.search(r"district\s*(\d+)", str(location or ""), re.IGNORECASE)
+    return f"D{match.group(1)}" if match else ""
+
+def _compute_buyer_listing_match(buyer: dict, listing: dict) -> dict:
+    """A match requires every preference the buyer actually set to be satisfied --
+    an unset preference (empty district list, no budget, etc.) is treated as "no
+    opinion" rather than a wildcard pass, so a buyer with zero preferences filled
+    in produces zero matches instead of matching everything."""
+    reasons = []
+    criteria_checked = False
+
+    buyer_types = [t for t in (buyer.get("property_types") or "").split(",") if t]
+    if buyer_types:
+        criteria_checked = True
+        if listing.get("property_type") in buyer_types:
+            reasons.append(f"Wants {listing.get('property_type')}")
+        else:
+            return {"is_match": False, "reasons": []}
+
+    buyer_districts = [d for d in (buyer.get("districts") or "").split(",") if d]
+    if buyer_districts:
+        criteria_checked = True
+        listing_district = _extract_district_token(listing.get("location"))
+        if listing_district and listing_district in buyer_districts:
+            reasons.append(f"In preferred area ({listing_district})")
+        else:
+            return {"is_match": False, "reasons": []}
+
+    price = _to_number(listing.get("price"))
+    budget_min = _to_number(buyer.get("budget_min"))
+    budget_max = _to_number(buyer.get("budget_max"))
+    if (budget_min or budget_max) and price:
+        criteria_checked = True
+        lo = budget_min or 0
+        hi = budget_max or float("inf")
+        stretch_hi = hi * 1.1 if hi != float("inf") else hi
+        if lo <= price <= hi:
+            reasons.append("Within budget")
+        elif price <= stretch_hi:
+            reasons.append("Within 10% of max budget")
+        else:
+            return {"is_match": False, "reasons": []}
+
+    land_min = _to_number(buyer.get("land_min"))
+    land_size = _to_number(listing.get("land_size"))
+    if land_min and land_size:
+        criteria_checked = True
+        if land_size >= land_min:
+            reasons.append(f"Meets min land size ({int(land_size):,} sqft)")
+        else:
+            return {"is_match": False, "reasons": []}
+
+    return {"is_match": criteria_checked and len(reasons) > 0, "reasons": reasons}
+
+@app.get("/api/listings/{listing_id}/matches")
+def get_listing_matches(listing_id: str, agent=Depends(get_current_agent)):
+    listing_result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not listing_result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = listing_result.data[0]
+    buyers = get_db().table("buyers").select("*").eq("agent_id", agent["id"]).execute().data or []
+    matches = []
+    for buyer in buyers:
+        result = _compute_buyer_listing_match(buyer, listing)
+        if result["is_match"]:
+            matches.append({
+                "buyer_id": buyer["id"], "name": buyer["name"], "phone": buyer.get("phone", ""),
+                "temperature": buyer.get("temperature"), "reasons": result["reasons"]
+            })
+    matches.sort(key=lambda m: {"HOT": 0, "WARM": 1, "COLD": 2}.get(m["temperature"], 9))
+    return matches
+
+@app.get("/api/buyers/{buyer_id}/matches")
+def get_buyer_matches(buyer_id: str, agent=Depends(get_current_agent)):
+    buyer_result = get_db().table("buyers").select("*").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    if not buyer_result.data:
+        raise HTTPException(status_code=404, detail="Buyer not found")
+    buyer = buyer_result.data[0]
+    listings = get_db().table("listings").select("*").eq("agent_id", agent["id"]).eq("status", "active").execute().data or []
+    matches = []
+    for listing in listings:
+        result = _compute_buyer_listing_match(buyer, listing)
+        if result["is_match"]:
+            matches.append({
+                "listing_id": listing["id"], "location": listing["location"], "price": listing["price"],
+                "property_type": listing["property_type"], "reasons": result["reasons"]
+            })
+    return matches
