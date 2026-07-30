@@ -535,10 +535,13 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
 
     is_terrace = req.property_type.lower() in ("inter-terrace", "corner terrace")
     if is_terrace:
-        # URA sets different minimum land size/frontage for inter- vs corner-terrace units —
-        # since both figures are already captured on every listing, a mismatch is a strong
-        # signal the property type was misclassified (e.g. via Smart Fill) and should be
-        # double-checked before publishing, rather than trusting it silently.
+        # URA's minimum land size/frontage differs for inter- vs corner-terrace (150sqm/6m vs
+        # 200sqm/8m), so a mismatch there is a useful signal to double-check. Note this can only
+        # catch an Inter-Terrace mislabeled as too small/large for its own minimum — it CANNOT
+        # distinguish Corner-Terrace from Semi-Detached, since URA sets an identical 200sqm/8m
+        # minimum for both. That distinction is structural (a terrace house is one unit in a row
+        # of 3+, semi-detached is a pair of exactly 2) and isn't derivable from size alone, so the
+        # wording below deliberately doesn't claim more certainty than the numbers actually give.
         land_size_sqm = req.land_size / 10.7639 if req.land_size else 0
         is_corner = "corner" in req.property_type.lower()
         if is_corner:
@@ -548,7 +551,7 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
                 warnings.append(f"Frontage {req.plot_width}m is below URA's Corner Terrace minimum of 8m — please verify this is actually a Corner Terrace.")
         else:
             if req.land_size > 0 and land_size_sqm >= 200 and req.plot_width >= 8:
-                warnings.append(f"Land size ({land_size_sqm:.0f} sqm) and frontage ({req.plot_width}m) both meet URA's Corner Terrace minimums (200 sqm / 8m) — this may actually be a Corner Terrace, not Inter-Terrace. Please verify before publishing.")
+                warnings.append(f"Land size ({land_size_sqm:.0f} sqm) and frontage ({req.plot_width}m) meet or exceed URA's minimum for Corner Terrace/Semi-Detached (200 sqm / 8m), which is unusually large for Inter-Terrace. Please double-check the exact property type — it may be a Corner Terrace or Semi-Detached instead.")
             elif req.land_size > 0 and land_size_sqm < 150:
                 warnings.append(f"Land size {req.land_size:,} sqft ({land_size_sqm:.0f} sqm) is below URA's Inter-Terrace minimum of 150 sqm.")
 
@@ -1202,7 +1205,7 @@ async def extract_listing_image(request: Request):
   "site_coverage": number as percentage or 0
 }
 Do not guess or estimate any value that is not clearly shown or stated in the images. If a field cannot be determined from the images, use "" for text fields and 0 for number fields.
-For property_type specifically: if any image contains an explicit official/source "Property Type" field or code, use that over your own inference from the general description — e.g. "CT" means Corner Terrace, "IT" or "ITR" means Inter-Terrace, "SD" means Semi-Detached, "DB" means Detached/Bungalow, "GCB" means Good Class Bungalow (GCB), "PH" means Penthouse. Inter-Terrace and Corner Terrace are frequently confused — an explicit source field always wins over inferring from land size or description text.
+For property_type specifically: if any image contains an explicit official/source "Property Type" field or code, use that over your own inference from the general description — e.g. "CT" means Corner Terrace, "IT" or "ITR" means Inter-Terrace, "SD" means Semi-Detached, "DB" means Detached/Bungalow, "GCB" means Good Class Bungalow (GCB), "PH" means Penthouse. Inter-Terrace and Corner Terrace are frequently confused — an explicit source field always wins over inferring from land size or description text. If no image states or clearly implies a specific property type at all (no field, code, or explicit description), return "" for property_type rather than guessing from land size, price, or general impression — Corner Terrace, Inter-Terrace, and Semi-Detached can have very similar land sizes and are not reliably distinguishable from size alone, so leaving this blank for the agent to confirm is strongly preferred over a wrong guess.
 Return only valid JSON, nothing else."""
         })
 
