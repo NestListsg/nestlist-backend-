@@ -88,8 +88,9 @@ async def send_password_reset_email(to_email: str, name: str, reset_link: str) -
                     "to": [to_email],
                     "subject": "Reset your NestList password",
                     "html": f"""<p>Hi {name or 'there'},</p>
-                        <p>We received a request to reset your NestList password. Click below to choose a new one:</p>
-                        <p><a href="{reset_link}">{reset_link}</a></p>
+                        <p>We received a request to reset your NestList password. Tap the button below to choose a new one:</p>
+                        <p><a href="{reset_link}" style="display:inline-block;background:#D4AF37;color:#0E2820;font-weight:bold;text-decoration:none;padding:14px 28px;border-radius:4px;margin:8px 0;">Reset My Password</a></p>
+                        <p style="font-size:13px;color:#666;">If the button above doesn't work, copy this link and paste it into your browser:<br>{reset_link}</p>
                         <p>This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>
                         <p>— NestList</p>""",
                 },
