@@ -334,6 +334,20 @@ class BuyerPropertyRequest(BaseModel):
     interest: str = ""
     feedback: str = ""
 
+class SellerLeadRequest(BaseModel):
+    seller_name: str
+    seller_phone: str = ""
+    seller_email: str = ""
+    location: str = ""
+    property_type: str = ""
+    price: str = ""  # asking price expectation, same field a real listing uses
+    land_size: int = 0
+    motivation: str = ""
+    timeline: str = ""
+    mandate_type: str = ""
+    temperature: str = "WARM"
+    seller_notes: str = ""
+
 # ================================
 # AUTH HELPERS
 # ================================
@@ -520,6 +534,12 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
     query = get_db().table("listings").select("*").eq("agent_id", agent["id"])
     if status in ("active", "archived"):
         query = query.eq("status", status)
+    else:
+        # Any other value (e.g. "all", used by My Listings) means "everything
+        # relevant to My Listings" -- seller leads live in this same table but
+        # belong to the Sellers page, not My Listings, so they're excluded here
+        # regardless of what value was passed.
+        query = query.neq("status", "lead")
     result = query.order("created_at", desc=True).execute()
     return result.data or []
 
@@ -1602,6 +1622,12 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
     if not existing.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     updated = get_db().table("listings").update({
+        # Saving here always promotes the row to "active" -- this is the same
+        # endpoint used both for editing an existing active listing (already
+        # active, so this is a no-op) and for finishing a seller lead's
+        # "Convert to Listing" flow (status was "lead", now graduates to
+        # "active" the moment the agent fills in the rest and saves).
+        "status": "active",
         "property_type": req.property_type,
         "location": req.location,
         "land_size": req.land_size,
@@ -1842,3 +1868,77 @@ def get_buyer_matches(buyer_id: str, agent=Depends(get_current_agent)):
                 "property_type": listing["property_type"], "reasons": result["reasons"]
             })
     return matches
+
+# ================================
+# SELLERS
+# A seller lead lives in the same `listings` table as real listings (status
+# "lead" instead of "active"/"archived"), since a seller lead IS a nascent
+# listing -- the same property record just grows more complete over time.
+# "Convert to Listing" is just editing it through the normal New Listing
+# form, which promotes it to "active" on save (see update_listing above).
+# ================================
+def _seller_lead_payload(req: SellerLeadRequest, agent_id: str) -> dict:
+    return {
+        "agent_id": agent_id,
+        "status": "lead",
+        "seller_name": req.seller_name,
+        "seller_phone": req.seller_phone,
+        "seller_email": req.seller_email,
+        "location": req.location,
+        "property_type": req.property_type,
+        "price": req.price,
+        "land_size": req.land_size,
+        "motivation": req.motivation,
+        "timeline": req.timeline,
+        "mandate_type": req.mandate_type,
+        "temperature": req.temperature,
+        "seller_notes": req.seller_notes,
+        # Fields the full listings schema expects but a seller lead usually
+        # doesn't have yet -- explicit safe defaults rather than nulls.
+        "bedrooms": "",
+        "bathrooms": "",
+        "features": "",
+        "content": "",
+        "built_up": 0,
+        "plot_width": 0,
+        "plot_depth": 0,
+        "storeys": 0,
+        "site_coverage": 0,
+    }
+
+@app.get("/api/sellers")
+def get_sellers(agent=Depends(get_current_agent)):
+    result = get_db().table("listings").select("*").eq("agent_id", agent["id"]).eq("status", "lead").order("created_at", desc=True).execute()
+    sellers = result.data or []
+    sellers.sort(key=lambda s: {"HOT": 0, "WARM": 1, "COLD": 2}.get(s.get("temperature"), 9))
+    return sellers
+
+@app.post("/api/sellers")
+def create_seller(req: SellerLeadRequest, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").insert(_seller_lead_payload(req, agent["id"])).execute()
+    return result.data[0]
+
+@app.get("/api/sellers/{seller_id}")
+def get_seller(seller_id: str, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").select("*").eq("id", seller_id).eq("agent_id", agent["id"]).eq("status", "lead").execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Seller not found")
+    return result.data[0]
+
+@app.patch("/api/sellers/{seller_id}")
+def update_seller(seller_id: str, req: SellerLeadRequest, agent=Depends(get_current_agent)):
+    existing = get_db().table("listings").select("id").eq("id", seller_id).eq("agent_id", agent["id"]).eq("status", "lead").execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Seller not found")
+    payload = _seller_lead_payload(req, agent["id"])
+    payload.pop("agent_id")
+    payload.pop("status")
+    result = get_db().table("listings").update(payload).eq("id", seller_id).eq("agent_id", agent["id"]).execute()
+    return result.data[0]
+
+@app.delete("/api/sellers/{seller_id}")
+def delete_seller(seller_id: str, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").delete().eq("id", seller_id).eq("agent_id", agent["id"]).eq("status", "lead").execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Seller not found")
+    return {"success": True}
