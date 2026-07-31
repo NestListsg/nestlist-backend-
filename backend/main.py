@@ -1915,11 +1915,8 @@ def get_sellers(agent=Depends(get_current_agent)):
 
 @app.post("/api/sellers")
 def create_seller(req: SellerLeadRequest, agent=Depends(get_current_agent)):
-    try:
-        result = get_db().table("listings").insert(_seller_lead_payload(req, agent["id"])).execute()
-        return result.data[0]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DIAGNOSTIC: {type(e).__name__}: {e}")
+    result = get_db().table("listings").insert(_seller_lead_payload(req, agent["id"])).execute()
+    return result.data[0]
 
 @app.get("/api/sellers/{seller_id}")
 def get_seller(seller_id: str, agent=Depends(get_current_agent)):
