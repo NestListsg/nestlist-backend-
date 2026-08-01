@@ -235,6 +235,30 @@ def _zoompan_clip(slide_img, out_path, duration, zoom_in=True):
         os.unlink(src_path)
 
 
+def _xfade_pair(base_path, next_path, out_path, base_duration, transition_seconds, timeout):
+    """Crossfades two clips into one file. Used to build the final video by folding
+    clips together one at a time (2 open input streams per call) instead of handing
+    ffmpeg one filter graph with every clip open at once -- at ~15 photos that single
+    giant graph needs that many concurrent decoders live simultaneously, which is
+    enough to exhaust memory/resources on a small Railway instance and fail outright
+    (confirmed: reliable up to ~6 clips, hard-failed at 15). Folding pairwise keeps
+    peak resource use constant no matter how many photos a listing has."""
+    offset = max(0.0, base_duration - transition_seconds)
+    filter_complex = (
+        f"[0:v]fps={FPS},format=yuv420p[v0];"
+        f"[1:v]fps={FPS},format=yuv420p[v1];"
+        f"[v0][v1]xfade=transition=fade:duration={transition_seconds}:offset={offset:.3f}[vout]"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", base_path, "-i", next_path,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        out_path,
+    ]
+    _run_ffmpeg(cmd, timeout)
+
+
 def render_property_video(image_urls, property_type, district, price_text, stats, agent_name, agent_contact_line):
     """Returns the finished video as bytes (MP4, H.264 + AAC, 1080x1920).
 
@@ -291,49 +315,28 @@ def render_property_video(image_urls, property_type, district, price_text, stats
                 cmd = ["ffmpeg", "-y", "-i", clip_paths[0], "-c", "copy", "-movflags", "+faststart", final_path]
             _run_ffmpeg(cmd, 60)
         else:
-            # Chained xfade: each transition dissolves the tail of the running clip
-            # into the head of the next one, rather than a hard cut. offset is the
-            # point (in the combined stream so far) where each crossfade starts.
-            input_args = []
-            for p in clip_paths:
-                input_args += ["-i", p]
-
-            filter_parts = []
-            for i in range(len(clip_paths)):
-                filter_parts.append(f"[{i}:v]fps={FPS},format=yuv420p[v{i}]")
-
-            running_label = "v0"
-            cum_duration = clip_durations[0]
+            # Fold clips together pairwise (2 open input streams per ffmpeg call) rather
+            # than handing ffmpeg one filter graph with every clip open simultaneously --
+            # see _xfade_pair's docstring for why.
+            running_path = clip_paths[0]
+            running_duration = clip_durations[0]
             for i in range(1, len(clip_paths)):
-                offset = max(0.0, cum_duration - TRANSITION_SECONDS)
-                out_label = f"x{i}" if i < len(clip_paths) - 1 else "vout"
-                filter_parts.append(
-                    f"[{running_label}][v{i}]xfade=transition=fade:duration={TRANSITION_SECONDS}:offset={offset:.3f}[{out_label}]"
-                )
-                running_label = out_label
-                cum_duration = cum_duration + clip_durations[i] - TRANSITION_SECONDS
+                merged_path = os.path.join(workdir, f"merged_{i:02d}.mp4")
+                _xfade_pair(running_path, clip_paths[i], merged_path, running_duration, TRANSITION_SECONDS, 90)
+                running_path = merged_path
+                running_duration = running_duration + clip_durations[i] - TRANSITION_SECONDS
 
-            output_maps = ["-map", "[vout]"]
             if has_audio:
-                audio_input_index = len(clip_paths)
-                input_args += ["-stream_loop", "-1", "-i", AUDIO_PATH]
-                filter_parts.append(_audio_filter(audio_input_index, cum_duration))
-                output_maps += ["-map", "[aout]"]
-                audio_codec_args = ["-c:a", "aac", "-b:a", "128k"]
+                cmd = [
+                    "ffmpeg", "-y", "-i", running_path, "-stream_loop", "-1", "-i", AUDIO_PATH,
+                    "-filter_complex", _audio_filter(1, running_duration),
+                    "-map", "0:v", "-map", "[aout]",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart", final_path,
+                ]
             else:
-                audio_codec_args = []
-
-            filter_complex = ";".join(filter_parts)
-
-            cmd = [
-                "ffmpeg", "-y", *input_args,
-                "-filter_complex", filter_complex,
-                *output_maps,
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", *audio_codec_args,
-                "-movflags", "+faststart",
-                final_path,
-            ]
-            _run_ffmpeg(cmd, 120)
+                cmd = ["ffmpeg", "-y", "-i", running_path, "-c", "copy", "-movflags", "+faststart", final_path]
+            _run_ffmpeg(cmd, 60)
 
         with open(final_path, "rb") as f:
             return f.read()
