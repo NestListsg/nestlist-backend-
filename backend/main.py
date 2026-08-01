@@ -696,6 +696,56 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list) -> 
     supabase.table("listings").update({"images": image_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
     return image_urls
 
+def _process_and_upload_poster_photo(listing_id: str, agent_id: str, image_data: str) -> str:
+    supabase = get_db()
+
+    img_bytes = base64.b64decode(image_data)
+    pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+    pil_img.thumbnail((1920, 1920))
+    pil_img = _auto_enhance_photo(pil_img)
+
+    buffer = io.BytesIO()
+    pil_img.save(buffer, format="JPEG", quality=85)
+    buffer.seek(0)
+    compressed = buffer.read()
+
+    filename = f"{listing_id}/poster_photo_{listing_id[:8]}.jpg"
+    supabase.storage.from_("listings-images").upload(
+        filename,
+        compressed,
+        {"content-type": "image/jpeg", "upsert": "true"}
+    )
+
+    url = supabase.storage.from_("listings-images").get_public_url(filename)
+    supabase.table("listings").update({"poster_photo_url": url}).eq("id", listing_id).eq("agent_id", agent_id).execute()
+    return url
+
+@app.post("/api/listings/{listing_id}/poster-photo")
+async def upload_poster_photo(listing_id: str, request: Request, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").select("id").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    body = await request.json()
+    image_data = body.get("image_data")
+    if not image_data:
+        raise HTTPException(status_code=400, detail="No image provided")
+
+    try:
+        url = await asyncio.to_thread(_process_and_upload_poster_photo, listing_id, agent["id"], image_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"success": True, "poster_photo_url": url}
+
+@app.delete("/api/listings/{listing_id}/poster-photo")
+def remove_poster_photo(listing_id: str, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").select("id").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    get_db().table("listings").update({"poster_photo_url": None}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    return {"success": True}
+
 @app.post("/api/listings/{listing_id}/upload-images")
 async def upload_listing_images(listing_id: str, request: Request, agent=Depends(get_current_agent)):
     try:
@@ -837,10 +887,12 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     chosen_template_id = template_id or listing.get("poster_template_id") or agent.get("poster_template_id") or "editorial"
 
     images = listing.get("images") or []
-    if not images:
+    poster_photo_url = listing.get("poster_photo_url")
+    if not images and not poster_photo_url:
         raise HTTPException(status_code=400, detail="Upload at least one photo before generating a poster")
-    if photo_index < 0 or photo_index >= len(images):
+    if photo_index < 0 or (images and photo_index >= len(images)):
         photo_index = 0
+    chosen_photo_url = poster_photo_url or images[photo_index]
 
     price_num = _to_number(listing.get("price"))
     built_up_num = _to_number(listing.get("built_up"))
@@ -869,7 +921,7 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
             stats=stats,
             agent_name=agent["name"],
             agent_contact_line=agent.get("contact", ""),
-            property_photo_url=images[photo_index],
+            property_photo_url=chosen_photo_url,
             agent_photo_url=agent.get("photo_url"),
             template_id=chosen_template_id,
         )
