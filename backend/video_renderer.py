@@ -92,6 +92,42 @@ def _fit(img, w, h, centering=(0.5, 0.4)):
     return ImageOps.fit(img.convert("RGB"), (w, h), centering=centering)
 
 
+def _fit_with_letterbox(img, w, h, centering=(0.5, 0.4), blur_radius=40, darken=0.55):
+    """Fits a photo into a (w, h) frame without cropping wide/landscape shots.
+
+    Most listing photos are landscape while the video canvas is a tall 9:16 portrait
+    (1080x1920) -- a plain cover-crop would slice off both sides of the photo (a square
+    photo already loses ~44% of its width; a typical 3:2 landscape shot loses ~62%),
+    which can cut a house frontage right out of frame. Instead, when the photo is wider
+    than the target aspect, the full photo is shown letterboxed in the middle, with the
+    empty top/bottom bars filled by a blurred, darkened copy of the same photo -- the
+    same technique Instagram/TikTok use for landscape media in Stories/Reels, so nothing
+    in the original shot is lost.
+
+    Photos already at or near the target aspect (portrait phone shots) skip the
+    letterbox and get a plain cover-fit, since there's nothing meaningful to preserve.
+    """
+    img = img.convert("RGB")
+    src_w, src_h = img.size
+    src_aspect = src_w / src_h
+    target_aspect = w / h
+
+    if src_aspect <= target_aspect * 1.05:
+        return ImageOps.fit(img, (w, h), centering=centering)
+
+    background = ImageOps.fit(img, (w, h), centering=centering)
+    background = background.filter(ImageFilter.GaussianBlur(blur_radius))
+    background = Image.blend(background, Image.new("RGB", (w, h), (0, 0, 0)), darken)
+
+    fg_w = w
+    fg_h = round(w / src_aspect)
+    foreground = img.resize((fg_w, fg_h), Image.LANCZOS)
+
+    canvas = background
+    canvas.paste(foreground, (0, (h - fg_h) // 2))
+    return canvas
+
+
 def _gradient_scrim(base, y0, y1, from_alpha, to_alpha, color=(8, 12, 10)):
     height = y1 - y0
     if height <= 0:
@@ -119,7 +155,7 @@ def _render_photo_slide(photo, eyebrow, title, price_text, stats_line):
     """First slide gets the full text treatment (eyebrow + title + price + stats);
     later slides get no text so the property photos read cleanly without repeating
     the same overlay on every frame."""
-    base = _fit(photo, VW, VH).convert("RGBA")
+    base = _fit_with_letterbox(photo, VW, VH).convert("RGBA")
     draw = ImageDraw.Draw(base)
 
     if eyebrow or title or price_text or stats_line:
@@ -142,7 +178,7 @@ def _render_photo_slide(photo, eyebrow, title, price_text, stats_line):
 
 
 def _render_plain_slide(photo):
-    return _fit(photo, VW, VH).convert("RGB")
+    return _fit_with_letterbox(photo, VW, VH).convert("RGB")
 
 
 def _render_outro_slide(agent_name, agent_contact_line):
