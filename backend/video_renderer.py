@@ -22,6 +22,7 @@ FPS = 25
 SECONDS_PER_PHOTO = 3.5
 OUTRO_SECONDS = 3.5
 MAX_PHOTOS = 6
+TRANSITION_SECONDS = 0.5
 ZOOM_TARGET = 1.15
 
 GOLD = (240, 200, 74, 255)
@@ -191,6 +192,7 @@ def render_property_video(image_urls, property_type, district, price_text, stats
 
     with tempfile.TemporaryDirectory() as workdir:
         clip_paths = []
+        clip_durations = []
 
         for i, photo in enumerate(photos):
             if i == 0:
@@ -200,23 +202,55 @@ def render_property_video(image_urls, property_type, district, price_text, stats
             clip_path = os.path.join(workdir, f"clip_{i:02d}.mp4")
             _zoompan_clip(slide, clip_path, SECONDS_PER_PHOTO, zoom_in=(i % 2 == 0))
             clip_paths.append(clip_path)
+            clip_durations.append(SECONDS_PER_PHOTO)
 
         outro = _render_outro_slide(agent_name, agent_contact_line)
         outro_path = os.path.join(workdir, "clip_outro.mp4")
         _zoompan_clip(outro, outro_path, OUTRO_SECONDS, zoom_in=True)
         clip_paths.append(outro_path)
-
-        list_path = os.path.join(workdir, "list.txt")
-        with open(list_path, "w") as f:
-            for p in clip_paths:
-                f.write(f"file '{p}'\n")
+        clip_durations.append(OUTRO_SECONDS)
 
         final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-             "-c", "copy", "-movflags", "+faststart", final_path],
-            check=True, capture_output=True, timeout=60,
-        )
+
+        if len(clip_paths) == 1:
+            # Nothing to crossfade -- just restamp faststart on the single clip.
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", clip_paths[0], "-c", "copy", "-movflags", "+faststart", final_path],
+                check=True, capture_output=True, timeout=60,
+            )
+        else:
+            # Chained xfade: each transition dissolves the tail of the running clip
+            # into the head of the next one, rather than a hard cut. offset is the
+            # point (in the combined stream so far) where each crossfade starts.
+            input_args = []
+            for p in clip_paths:
+                input_args += ["-i", p]
+
+            filter_parts = []
+            for i in range(len(clip_paths)):
+                filter_parts.append(f"[{i}:v]fps={FPS},format=yuv420p[v{i}]")
+
+            running_label = "v0"
+            cum_duration = clip_durations[0]
+            for i in range(1, len(clip_paths)):
+                offset = max(0.0, cum_duration - TRANSITION_SECONDS)
+                out_label = f"x{i}" if i < len(clip_paths) - 1 else "vout"
+                filter_parts.append(
+                    f"[{running_label}][v{i}]xfade=transition=fade:duration={TRANSITION_SECONDS}:offset={offset:.3f}[{out_label}]"
+                )
+                running_label = out_label
+                cum_duration = cum_duration + clip_durations[i] - TRANSITION_SECONDS
+
+            filter_complex = ";".join(filter_parts)
+
+            cmd = [
+                "ffmpeg", "-y", *input_args,
+                "-filter_complex", filter_complex,
+                "-map", "[vout]",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                final_path,
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=90)
 
         with open(final_path, "rb") as f:
             return f.read()
