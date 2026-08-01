@@ -2,11 +2,13 @@
 slideshow video (1080x1920, suitable for Instagram Reels/Stories, TikTok, LinkedIn).
 
 Each photo becomes a slow-zoom "Ken Burns" clip via ffmpeg's zoompan filter; clips are
-concatenated with a branded outro slide. No background music is bundled -- adding one
-requires a properly licensed track (royalty-free library), which isn't set up yet, so
-shipping silent avoids a copyright takedown risk on the exact platforms this is posted to.
+crossfaded together and concatenated with a branded outro slide, with a soft looping
+background track underneath. The bundled track (audio/soft_piano.mp3, "Piano Soft
+Gentle Morning Keys" by Alex Morgan) is downloaded from Pixabay, whose Content License
+permits commercial use, including in videos posted to social media, without attribution
+-- see https://pixabay.com/service/license-summary/.
 
-Requires the `ffmpeg` binary on PATH (see nixpacks.toml).
+Requires the `ffmpeg` binary on PATH (see railpack.json).
 """
 import io
 import os
@@ -24,6 +26,10 @@ OUTRO_SECONDS = 3.5
 MAX_PHOTOS = 6
 TRANSITION_SECONDS = 1.8
 ZOOM_TARGET = 1.15
+AUDIO_FADE_SECONDS = 1.5
+AUDIO_VOLUME = 0.35
+
+AUDIO_PATH = os.path.join(os.path.dirname(__file__), "audio", "soft_piano.mp3")
 
 GOLD = (240, 200, 74, 255)
 WHITE = (248, 244, 236, 255)
@@ -180,7 +186,7 @@ def _zoompan_clip(slide_img, out_path, duration, zoom_in=True):
 
 
 def render_property_video(image_urls, property_type, district, price_text, stats, agent_name, agent_contact_line):
-    """Returns the finished video as bytes (MP4, H.264, silent, 1080x1920).
+    """Returns the finished video as bytes (MP4, H.264 + AAC, 1080x1920).
 
     stats: list of strings, same shape as poster_renderer's (empty entries dropped).
     """
@@ -211,13 +217,29 @@ def render_property_video(image_urls, property_type, district, price_text, stats
         clip_durations.append(OUTRO_SECONDS)
 
         final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
+        has_audio = os.path.exists(AUDIO_PATH)
+
+        def _audio_filter(input_index, total_duration):
+            fade_out_start = max(0.0, total_duration - AUDIO_FADE_SECONDS)
+            return (
+                f"[{input_index}:a]atrim=0:{total_duration:.3f},asetpts=PTS-STARTPTS,"
+                f"volume={AUDIO_VOLUME},afade=t=in:d={AUDIO_FADE_SECONDS},"
+                f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_SECONDS}[aout]"
+            )
 
         if len(clip_paths) == 1:
-            # Nothing to crossfade -- just restamp faststart on the single clip.
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", clip_paths[0], "-c", "copy", "-movflags", "+faststart", final_path],
-                check=True, capture_output=True, timeout=60,
-            )
+            total_duration = clip_durations[0]
+            if has_audio:
+                cmd = [
+                    "ffmpeg", "-y", "-i", clip_paths[0], "-stream_loop", "-1", "-i", AUDIO_PATH,
+                    "-filter_complex", _audio_filter(1, total_duration),
+                    "-map", "0:v", "-map", "[aout]",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart", final_path,
+                ]
+            else:
+                cmd = ["ffmpeg", "-y", "-i", clip_paths[0], "-c", "copy", "-movflags", "+faststart", final_path]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=60)
         else:
             # Chained xfade: each transition dissolves the tail of the running clip
             # into the head of the next one, rather than a hard cut. offset is the
@@ -241,13 +263,24 @@ def render_property_video(image_urls, property_type, district, price_text, stats
                 running_label = out_label
                 cum_duration = cum_duration + clip_durations[i] - TRANSITION_SECONDS
 
+            output_maps = ["-map", "[vout]"]
+            if has_audio:
+                audio_input_index = len(clip_paths)
+                input_args += ["-stream_loop", "-1", "-i", AUDIO_PATH]
+                filter_parts.append(_audio_filter(audio_input_index, cum_duration))
+                output_maps += ["-map", "[aout]"]
+                audio_codec_args = ["-c:a", "aac", "-b:a", "128k"]
+            else:
+                audio_codec_args = []
+
             filter_complex = ";".join(filter_parts)
 
             cmd = [
                 "ffmpeg", "-y", *input_args,
                 "-filter_complex", filter_complex,
-                "-map", "[vout]",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                *output_maps,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", *audio_codec_args,
+                "-movflags", "+faststart",
                 final_path,
             ]
             subprocess.run(cmd, check=True, capture_output=True, timeout=90)
