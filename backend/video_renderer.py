@@ -208,7 +208,8 @@ def render_property_video(image_urls, property_type, district, price_text, stats
 
         final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
         subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", final_path],
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+             "-c", "copy", "-movflags", "+faststart", final_path],
             check=True, capture_output=True, timeout=60,
         )
 
