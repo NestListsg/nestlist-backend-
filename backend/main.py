@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timedelta, date
 from PIL import Image as PILImage, ImageEnhance, ImageOps
 import poster_renderer
+import video_renderer
 import ura_market_pulse
 
 app = FastAPI()
@@ -894,6 +895,62 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
 
     return {"poster_url": poster_url, "poster_template_id": chosen_template_id}
+
+@app.post("/api/listings/{listing_id}/generate-video")
+def generate_video(listing_id: str, agent=Depends(get_current_agent)):
+    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = result.data[0]
+
+    images = listing.get("images") or []
+    if not images:
+        raise HTTPException(status_code=400, detail="Upload at least one photo before generating a video")
+
+    price_num = _to_number(listing.get("price"))
+    built_up_num = _to_number(listing.get("built_up"))
+    price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
+    bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
+    bathrooms_match = re.search(r"\d+", str(listing.get("bathrooms") or ""))
+    bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
+    bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
+
+    district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
+    property_type_text = (listing.get("property_type") or "").upper()
+    district_text = district_match.group(0).upper() if district_match else ""
+
+    stats = [
+        f"{bedrooms_val} Rooms" if bedrooms_val else "",
+        f"{bathrooms_val} Baths" if bathrooms_val else "",
+        f"{built_up_num:,.0f} sqft" if built_up_num else "",
+        f"SGD {price_psf:,} psf" if price_psf else "",
+    ]
+
+    try:
+        video_bytes = video_renderer.render_property_video(
+            image_urls=images,
+            property_type=property_type_text,
+            district=district_text,
+            price_text=f"SGD {_format_price_millions(listing['price'])}",
+            stats=stats,
+            agent_name=agent["name"],
+            agent_contact_line=agent.get("contact", ""),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Video rendering failed: {e}")
+
+    supabase = get_db()
+    filename = f"videos/{listing_id}.mp4"
+    supabase.storage.from_("listings-images").upload(
+        filename,
+        video_bytes,
+        {"content-type": "video/mp4", "upsert": "true"}
+    )
+    video_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
+
+    get_db().table("listings").update({"video_url": video_url}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+
+    return {"video_url": video_url}
 
 def _wait_for_ig_container_ready(container_id: str, page_token: str, max_attempts: int = 10, delay_seconds: float = 1.5) -> bool:
     # Instagram fetches/processes the image asynchronously after the container is
