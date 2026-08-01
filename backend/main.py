@@ -156,15 +156,15 @@ async def monitor_api_key():
 async def create_claude_message(**kwargs):
     primary_key = os.environ.get("ANTHROPIC_API_KEY", "")
     try:
-        client = anthropic.Anthropic(api_key=primary_key)
-        return client.messages.create(**kwargs)
+        client = anthropic.AsyncAnthropic(api_key=primary_key)
+        return await client.messages.create(**kwargs)
     except anthropic.AuthenticationError:
         backup_key = os.environ.get("ANTHROPIC_API_KEY_BACKUP", "")
         if not backup_key:
             raise
         await send_telegram_alert("⚠️ <b>NestList Alert</b>\n\nPrimary Anthropic API key failed — automatically switched to the backup key, agents are unaffected.\n\nPlease check/replace the primary key in Railway when convenient (no rush).")
-        client = anthropic.Anthropic(api_key=backup_key)
-        return client.messages.create(**kwargs)
+        client = anthropic.AsyncAnthropic(api_key=backup_key)
+        return await client.messages.create(**kwargs)
 
 async def refresh_market_pulse_loop():
     while True:
@@ -666,6 +666,35 @@ Write:
         "listing": saved.data[0]
     }
 
+def _process_and_upload_images(listing_id: str, agent_id: str, images: list) -> list:
+    supabase = get_db()
+    image_urls = []
+
+    for i, img in enumerate(images):
+        image_data = img.get("image_data")
+        img_bytes = base64.b64decode(image_data)
+        pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+        pil_img.thumbnail((1920, 1920))
+        pil_img = _auto_enhance_photo(pil_img)
+
+        buffer = io.BytesIO()
+        pil_img.save(buffer, format="JPEG", quality=80)
+        buffer.seek(0)
+        compressed = buffer.read()
+
+        filename = f"{listing_id}/{i}_{listing_id[:8]}.jpg"
+        supabase.storage.from_("listings-images").upload(
+            filename,
+            compressed,
+            {"content-type": "image/jpeg", "upsert": "true"}
+        )
+
+        url = supabase.storage.from_("listings-images").get_public_url(filename)
+        image_urls.append(url)
+
+    supabase.table("listings").update({"images": image_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
+    return image_urls
+
 @app.post("/api/listings/{listing_id}/upload-images")
 async def upload_listing_images(listing_id: str, request: Request, agent=Depends(get_current_agent)):
     try:
@@ -678,32 +707,7 @@ async def upload_listing_images(listing_id: str, request: Request, agent=Depends
         if len(images) > 15:
             images = images[:15]
 
-        supabase = get_db()
-        image_urls = []
-
-        for i, img in enumerate(images):
-            image_data = img.get("image_data")
-            img_bytes = base64.b64decode(image_data)
-            pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
-            pil_img.thumbnail((1920, 1920))
-            pil_img = _auto_enhance_photo(pil_img)
-
-            buffer = io.BytesIO()
-            pil_img.save(buffer, format="JPEG", quality=80)
-            buffer.seek(0)
-            compressed = buffer.read()
-
-            filename = f"{listing_id}/{i}_{listing_id[:8]}.jpg"
-            supabase.storage.from_("listings-images").upload(
-                filename,
-                compressed,
-                {"content-type": "image/jpeg", "upsert": "true"}
-            )
-
-            url = supabase.storage.from_("listings-images").get_public_url(filename)
-            image_urls.append(url)
-
-        supabase.table("listings").update({"images": image_urls}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+        image_urls = await asyncio.to_thread(_process_and_upload_images, listing_id, agent["id"], images)
 
         return {"success": True, "image_urls": image_urls}
 
