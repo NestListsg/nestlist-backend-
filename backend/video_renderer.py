@@ -156,14 +156,19 @@ def _zoompan_clip(slide_img, out_path, duration, zoom_in=True):
         slide_img.save(tmp.name, format="PNG")
         src_path = tmp.name
 
-    total_frames = max(1, round(duration * FPS))
     z_expr = f"min(zoom+0.0020,{ZOOM_TARGET})" if zoom_in else f"if(lte(zoom,1.0),{ZOOM_TARGET},max(zoom-0.0020,1.0))"
 
+    # -frames:v + zoompan's internal per-frame PTS is a known source of malformed/
+    # non-monotonic timestamps that some players (Chrome included) refuse to start
+    # playback on even though the container itself parses fine. Cutting by -t plus
+    # forcing a constant output frame rate with -r/-vsync restamps clean, regular
+    # PTS instead of trusting zoompan's own.
     cmd = [
         "ffmpeg", "-y", "-loop", "1", "-i", src_path,
         "-vf",
         f"zoompan=z='{z_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={VW}x{VH}:fps={FPS},format=yuv420p",
-        "-frames:v", str(total_frames),
+        "-t", str(duration),
+        "-r", str(FPS), "-vsync", "cfr",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         out_path,
     ]
