@@ -20,6 +20,7 @@ import hashlib
 import time
 from datetime import datetime, timedelta, date
 from PIL import Image as PILImage, ImageEnhance, ImageOps
+import fitz
 import poster_renderer
 import video_renderer
 import ura_market_pulse
@@ -745,6 +746,77 @@ def remove_poster_photo(listing_id: str, agent=Depends(get_current_agent)):
         raise HTTPException(status_code=404, detail="Listing not found")
     get_db().table("listings").update({"poster_photo_url": None}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return {"success": True}
+
+PDF_MIN_PHOTO_DIM = 400  # skip embedded logos/icons/decorative graphics smaller than this
+PDF_MAX_PHOTOS = 15  # matches the overall per-listing photo cap
+
+
+def _extract_photos_from_pdf(pdf_data_b64: str) -> list:
+    """Pulls every embedded raster image out of a PDF (e.g. a marketing brochure),
+    skipping small non-photo graphics (logos, icons, decorative lines) and exact
+    duplicates (a letterhead logo repeated on every page). Returns a list of
+    {"image_data": <base64 jpeg>} dicts, ready to hand to _process_and_upload_images
+    -- this function only extracts and re-encodes, it doesn't touch storage or the DB.
+    """
+    pdf_bytes = base64.b64decode(pdf_data_b64)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    results = []
+    seen_xrefs = set()
+    seen_hashes = set()
+
+    try:
+        for page in doc:
+            for img in page.get_images(full=True):
+                xref = img[0]
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
+
+                try:
+                    extracted = doc.extract_image(xref)
+                    pil_img = PILImage.open(io.BytesIO(extracted["image"])).convert("RGB")
+                except Exception:
+                    continue
+
+                if pil_img.width < PDF_MIN_PHOTO_DIM or pil_img.height < PDF_MIN_PHOTO_DIM:
+                    continue
+
+                content_hash = hashlib.sha1(extracted["image"]).hexdigest()
+                if content_hash in seen_hashes:
+                    continue
+                seen_hashes.add(content_hash)
+
+                pil_img.thumbnail((1920, 1920))
+                buffer = io.BytesIO()
+                pil_img.save(buffer, format="JPEG", quality=85)
+                results.append({"image_data": base64.b64encode(buffer.getvalue()).decode("ascii")})
+
+                if len(results) >= PDF_MAX_PHOTOS:
+                    return results
+    finally:
+        doc.close()
+
+    return results
+
+
+@app.post("/api/listings/extract-pdf-photos")
+async def extract_pdf_photos(request: Request, agent=Depends(get_current_agent)):
+    body = await request.json()
+    pdf_data = body.get("pdf_data")
+    if not pdf_data:
+        raise HTTPException(status_code=400, detail="No PDF provided")
+
+    try:
+        images = await asyncio.to_thread(_extract_photos_from_pdf, pdf_data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read this PDF: {e}")
+
+    if not images:
+        raise HTTPException(status_code=400, detail="No photos found in this PDF")
+
+    return {"images": images}
+
 
 @app.post("/api/listings/{listing_id}/upload-images")
 async def upload_listing_images(listing_id: str, request: Request, agent=Depends(get_current_agent)):
