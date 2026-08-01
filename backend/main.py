@@ -755,8 +755,7 @@ def post_to_facebook(listing_id: str, req: FacebookPostRequest, agent=Depends(ge
 
     response = requests.post(
         f"https://graph.facebook.com/v25.0/{fb_page_id}/photos",
-        data={"url": listing["poster_url"], "caption": caption, "access_token": fb_token}
-    )
+        data={"url": listing["poster_url"], "caption": caption, "access_token": fb_token}, timeout=15)
     data = response.json()
     if "id" in data:
         return {"success": True, "post_id": data["id"]}
@@ -903,8 +902,7 @@ def _wait_for_ig_container_ready(container_id: str, page_token: str, max_attempt
     for _ in range(max_attempts):
         status_res = requests.get(
             f"https://graph.facebook.com/v25.0/{container_id}",
-            params={"fields": "status_code", "access_token": page_token},
-        )
+            params={"fields": "status_code", "access_token": page_token}, timeout=15)
         status_code = status_res.json().get("status_code")
         if status_code == "FINISHED":
             return True
@@ -942,7 +940,7 @@ def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(
 
     r1 = requests.post(f"https://graph.facebook.com/v25.0/{ig_user_id}/media", data={
         "image_url": listing["poster_url"], "caption": caption, "access_token": page_token,
-    })
+    }, timeout=15)
     d1 = r1.json()
     if "id" not in d1:
         err = d1.get("error", {})
@@ -957,7 +955,7 @@ def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(
 
     r2 = requests.post(f"https://graph.facebook.com/v25.0/{ig_user_id}/media_publish", data={
         "creation_id": container_id, "access_token": page_token,
-    })
+    }, timeout=15)
     d2 = r2.json()
     if "id" not in d2:
         err = d2.get("error", {})
@@ -1070,7 +1068,7 @@ def instagram_oauth_callback(req: InstagramOAuthCallbackRequest):
     r1 = requests.get("https://graph.facebook.com/v25.0/oauth/access_token", params={
         "client_id": app_id, "client_secret": app_secret,
         "redirect_uri": INSTAGRAM_OAUTH_REDIRECT_URI, "code": req.code,
-    })
+    }, timeout=15)
     d1 = r1.json()
     if "access_token" not in d1:
         raise HTTPException(status_code=400, detail=f"Instagram connect failed: {d1.get('error', {}).get('message', 'unknown error')}")
@@ -1079,13 +1077,13 @@ def instagram_oauth_callback(req: InstagramOAuthCallbackRequest):
     r2 = requests.get("https://graph.facebook.com/v25.0/oauth/access_token", params={
         "grant_type": "fb_exchange_token", "client_id": app_id,
         "client_secret": app_secret, "fb_exchange_token": short_lived_token,
-    })
+    }, timeout=15)
     d2 = r2.json()
     if "access_token" not in d2:
         raise HTTPException(status_code=400, detail=f"Instagram connect failed: {d2.get('error', {}).get('message', 'unknown error')}")
     long_lived_user_token = d2["access_token"]
 
-    r3 = requests.get("https://graph.facebook.com/v25.0/me/accounts", params={"access_token": long_lived_user_token})
+    r3 = requests.get("https://graph.facebook.com/v25.0/me/accounts", params={"access_token": long_lived_user_token}, timeout=15)
     d3 = r3.json()
     if not d3.get("data"):
         raise HTTPException(status_code=400, detail="No Facebook Page found for this account. Instagram connect requires a Facebook Page linked to your Instagram professional account.")
@@ -1094,7 +1092,7 @@ def instagram_oauth_callback(req: InstagramOAuthCallbackRequest):
 
     r4 = requests.get(f"https://graph.facebook.com/v25.0/{page_id}", params={
         "fields": "instagram_business_account", "access_token": page_token,
-    })
+    }, timeout=15)
     d4 = r4.json()
     ig_account = d4.get("instagram_business_account")
     if not ig_account:
@@ -1103,7 +1101,7 @@ def instagram_oauth_callback(req: InstagramOAuthCallbackRequest):
 
     r5 = requests.get(f"https://graph.facebook.com/v25.0/{ig_user_id}", params={
         "fields": "username", "access_token": page_token,
-    })
+    }, timeout=15)
     ig_username = r5.json().get("username", "")
 
     get_db().table("agents").update({
@@ -1157,7 +1155,7 @@ def facebook_oauth_callback(req: FacebookOAuthCallbackRequest):
     r1 = requests.get("https://graph.facebook.com/v25.0/oauth/access_token", params={
         "client_id": app_id, "client_secret": app_secret,
         "redirect_uri": FACEBOOK_OAUTH_REDIRECT_URI, "code": req.code,
-    })
+    }, timeout=15)
     d1 = r1.json()
     if "access_token" not in d1:
         raise HTTPException(status_code=400, detail=f"Facebook connect failed: {d1.get('error', {}).get('message', 'unknown error')}")
@@ -1166,13 +1164,13 @@ def facebook_oauth_callback(req: FacebookOAuthCallbackRequest):
     r2 = requests.get("https://graph.facebook.com/v25.0/oauth/access_token", params={
         "grant_type": "fb_exchange_token", "client_id": app_id,
         "client_secret": app_secret, "fb_exchange_token": short_lived_token,
-    })
+    }, timeout=15)
     d2 = r2.json()
     if "access_token" not in d2:
         raise HTTPException(status_code=400, detail=f"Facebook connect failed: {d2.get('error', {}).get('message', 'unknown error')}")
     long_lived_user_token = d2["access_token"]
 
-    r3 = requests.get("https://graph.facebook.com/v25.0/me/accounts", params={"access_token": long_lived_user_token})
+    r3 = requests.get("https://graph.facebook.com/v25.0/me/accounts", params={"access_token": long_lived_user_token}, timeout=15)
     d3 = r3.json()
     if not d3.get("data"):
         raise HTTPException(status_code=400, detail="No Facebook Page found for this account. Facebook posting requires a Facebook Page you manage.")
@@ -1191,13 +1189,13 @@ def facebook_oauth_callback(req: FacebookOAuthCallbackRequest):
     # separately if this already covers it.
     r4 = requests.get(f"https://graph.facebook.com/v25.0/{page_id}", params={
         "fields": "instagram_business_account", "access_token": page_token,
-    })
+    }, timeout=15)
     ig_account = r4.json().get("instagram_business_account")
     if ig_account:
         ig_user_id = ig_account["id"]
         r5 = requests.get(f"https://graph.facebook.com/v25.0/{ig_user_id}", params={
             "fields": "username", "access_token": page_token,
-        })
+        }, timeout=15)
         update_payload["instagram_business_account_id"] = ig_user_id
         update_payload["instagram_username"] = r5.json().get("username", "")
         update_payload["instagram_connected_at"] = datetime.utcnow().isoformat()
@@ -1227,8 +1225,7 @@ def debug_instagram_account():
         return {"error": "FB_PAGE_ACCESS_TOKEN or FB_PAGE_ID not set"}
     response = requests.get(
         f"https://graph.facebook.com/v25.0/{fb_page_id}",
-        params={"fields": "instagram_business_account", "access_token": fb_token}
-    )
+        params={"fields": "instagram_business_account", "access_token": fb_token}, timeout=15)
     return response.json()
 
 @app.post("/api/extract-listing-image")
@@ -1364,8 +1361,7 @@ def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_curre
             "client_id": app_id,
             "client_secret": app_secret,
             "fb_exchange_token": req.user_token
-        }
-    )
+        }, timeout=15)
     exchange_data = exchange_response.json()
     if "access_token" not in exchange_data:
         raise HTTPException(status_code=400, detail=f"User token exchange failed: {exchange_data.get('error', {}).get('message', 'unknown error')}")
@@ -1373,8 +1369,7 @@ def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_curre
 
     accounts_response = requests.get(
         "https://graph.facebook.com/v25.0/me/accounts",
-        params={"access_token": long_lived_user_token}
-    )
+        params={"access_token": long_lived_user_token}, timeout=15)
     accounts_data = accounts_response.json()
     if "data" not in accounts_data:
         raise HTTPException(status_code=400, detail=f"Could not fetch Pages: {accounts_data.get('error', {}).get('message', 'unknown error')}")
