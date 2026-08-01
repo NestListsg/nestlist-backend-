@@ -68,6 +68,20 @@ OUTRO_CONTACT_FONT = _load_font(INTER, 34, weight=600, opsz=16)
 OUTRO_TAGLINE_FONT = _load_font(PLAYFAIR, 34, weight=500)
 
 
+def _run_ffmpeg(cmd, timeout):
+    """subprocess.run's default CalledProcessError str() is just the command and
+    exit code -- useless for diagnosing an actual ffmpeg failure. This surfaces the
+    real stderr (truncated) so both Railway logs and the API error response say
+    what actually went wrong."""
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else "(no stderr captured)"
+        raise RuntimeError(f"ffmpeg exited {e.returncode}: {stderr[-1500:]}") from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"ffmpeg timed out after {timeout}s") from e
+
+
 def _fetch_image(url):
     response = requests.get(url, timeout=15)
     response.raise_for_status()
@@ -180,7 +194,7 @@ def _zoompan_clip(slide_img, out_path, duration, zoom_in=True):
         out_path,
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+        _run_ffmpeg(cmd, 60)
     finally:
         os.unlink(src_path)
 
@@ -239,7 +253,7 @@ def render_property_video(image_urls, property_type, district, price_text, stats
                 ]
             else:
                 cmd = ["ffmpeg", "-y", "-i", clip_paths[0], "-c", "copy", "-movflags", "+faststart", final_path]
-            subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+            _run_ffmpeg(cmd, 60)
         else:
             # Chained xfade: each transition dissolves the tail of the running clip
             # into the head of the next one, rather than a hard cut. offset is the
@@ -283,7 +297,7 @@ def render_property_video(image_urls, property_type, district, price_text, stats
                 "-movflags", "+faststart",
                 final_path,
             ]
-            subprocess.run(cmd, check=True, capture_output=True, timeout=90)
+            _run_ffmpeg(cmd, 120)
 
         with open(final_path, "rb") as f:
             return f.read()
