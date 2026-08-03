@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import httpx
 from datetime import datetime, date
 
@@ -90,6 +91,12 @@ async def fetch_all_transactions(access_key: str, token: str) -> list:
             )
             if data.get("Status") == "Success":
                 all_projects.extend(data.get("Result", []))
+            else:
+                # Don't let one failed batch silently make results look
+                # sparser than reality -- this is visible in Railway logs
+                # so a "no matching transactions" report can be told apart
+                # from a genuine data gap during troubleshooting.
+                print(f"URA batch {batch} did not return Success: {data.get('Message')}")
     return all_projects
 
 
@@ -199,10 +206,45 @@ def _map_property_type(nestlist_type: str) -> str:
             return ura_type
     return ""
 
+# Generic road-type words agents commonly append/guess (e.g. typing "Road"
+# when URA's gazetted name actually uses "Walk" or no suffix at all). These
+# are dropped from the fallback word match so a wrong or missing suffix
+# doesn't block an otherwise-correct match.
+_GENERIC_STREET_SUFFIXES = {
+    "road", "street", "st", "avenue", "ave", "walk", "drive", "close",
+    "lane", "park", "grove", "hill", "crescent", "terrace", "way", "rise",
+    "view", "gardens", "garden", "place", "boulevard", "circle", "loop",
+    "green", "walk", "flats", "estate", "jalan", "lorong", "taman",
+}
+
+# URA's street field never includes a house/block number -- strip a leading
+# one (e.g. "9 Minaret Walk" -> "Minaret Walk") before matching.
+_LEADING_NUMBER_RE = re.compile(r"^\d+[a-zA-Z]?\s+")
+
+
 def _matches_street_keyword(street: str, keyword: str) -> bool:
     if not keyword:
         return False
-    return keyword.strip().lower() in (street or "").lower()
+    street_lower = (street or "").lower()
+    cleaned_keyword = _LEADING_NUMBER_RE.sub("", keyword.strip()).lower()
+    if not cleaned_keyword:
+        return False
+
+    # Fast path: the cleaned input matches verbatim (e.g. "Nassim Road"
+    # entered exactly as URA spells it).
+    if cleaned_keyword in street_lower:
+        return True
+
+    # Fallback: agents often guess the wrong road-type suffix, or URA's
+    # gazetted spelling differs from colloquial usage -- match on the
+    # significant words only, ignoring generic suffixes on both sides.
+    keyword_words = [
+        w for w in re.findall(r"[a-z]+", cleaned_keyword)
+        if w not in _GENERIC_STREET_SUFFIXES
+    ]
+    if not keyword_words:
+        return False
+    return all(w in street_lower for w in keyword_words)
 
 def extract_comparable_transactions(projects: list, street_keyword: str, property_type: str = "", window_months: int = 24) -> list:
     """Landed-property transactions near a given street/area, within a
