@@ -217,16 +217,31 @@ _GENERIC_STREET_SUFFIXES = {
     "green", "walk", "flats", "estate", "jalan", "lorong", "taman",
 }
 
-# URA's street field never includes a house/block number -- strip a leading
-# one (e.g. "9 Minaret Walk" -> "Minaret Walk") before matching.
-_LEADING_NUMBER_RE = re.compile(r"^\d+[a-zA-Z]?\s+")
+# URA's street field never includes a house/block/unit number -- these
+# words plus any leading numeric/unit token ("9", "9A", "#01-01", "9-A")
+# are skipped when locating where the actual street name starts, so a
+# full address ("Blk 9 #01-01 Minaret Walk", "No. 9, Minaret Walk") reduces
+# to the same street name as typing "Minaret Walk" alone.
+_ADDRESS_NOISE_WORDS = {"blk", "block", "no", "unit", "level", "lvl", "floor"}
+
+
+def _strip_address_prefix(keyword: str) -> str:
+    tokens = re.findall(r"[A-Za-z]+|[#0-9][#0-9A-Za-z\-]*", keyword.strip())
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.lower() in _ADDRESS_NOISE_WORDS or re.match(r"^[#0-9]", tok):
+            i += 1
+            continue
+        break
+    return " ".join(tokens[i:])
 
 
 def _matches_street_keyword(street: str, keyword: str) -> bool:
     if not keyword:
         return False
     street_lower = (street or "").lower()
-    cleaned_keyword = _LEADING_NUMBER_RE.sub("", keyword.strip()).lower()
+    cleaned_keyword = _strip_address_prefix(keyword).lower()
     if not cleaned_keyword:
         return False
 
