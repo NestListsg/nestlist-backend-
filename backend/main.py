@@ -24,6 +24,7 @@ import fitz
 import poster_renderer
 import video_renderer
 import ura_market_pulse
+import autoenhance
 
 app = FastAPI()
 
@@ -676,8 +677,23 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list) -> 
         image_data = img.get("image_data")
         img_bytes = base64.b64decode(image_data)
         pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
-        pil_img.thumbnail((1920, 1920))
-        pil_img = _auto_enhance_photo(pil_img)
+
+        # Re-encode to a known-good JPEG before handing to Autoenhance --
+        # img_bytes may be PNG/HEIC/whatever the browser sent, and their
+        # upload requires the Content-Type to match the actual bytes.
+        source_buffer = io.BytesIO()
+        pil_img.save(source_buffer, format="JPEG", quality=95)
+        enhanced_bytes = autoenhance.enhance_image(source_buffer.getvalue())
+
+        if enhanced_bytes:
+            pil_img = PILImage.open(io.BytesIO(enhanced_bytes)).convert("RGB")
+            pil_img.thumbnail((1920, 1920))
+        else:
+            # Not configured, or the call failed -- fall back to the local
+            # PIL enhancer so a photo (or a brief Autoenhance outage) never
+            # blocks the upload.
+            pil_img.thumbnail((1920, 1920))
+            pil_img = _auto_enhance_photo(pil_img)
 
         buffer = io.BytesIO()
         pil_img.save(buffer, format="JPEG", quality=80)
