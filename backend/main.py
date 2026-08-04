@@ -25,6 +25,7 @@ import poster_renderer
 import video_renderer
 import ura_market_pulse
 import autoenhance
+import cloudinary_enhance
 
 app = FastAPI()
 
@@ -814,6 +815,41 @@ def delete_listing_image(listing_id: str, image_index: int, agent=Depends(get_cu
     images.pop(image_index)
     get_db().table("listings").update({"images": images}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return {"images": images}
+
+def _enhance_listing_image(listing_id: str, agent_id: str, image_index: int) -> str:
+    result = get_db().table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    images = result.data[0].get("images") or []
+    if image_index < 0 or image_index >= len(images):
+        raise HTTPException(status_code=400, detail="Invalid image index")
+
+    url = images[image_index]
+    fetch_resp = requests.get(url, timeout=30)
+    if fetch_resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Could not fetch this photo to enhance it")
+
+    enhanced_bytes = cloudinary_enhance.enhance_image(fetch_resp.content)
+    if not enhanced_bytes:
+        raise HTTPException(status_code=503, detail="Enhancement isn't available right now -- please try again shortly")
+
+    # listings-images/<listing_id>/<i>_<listing_id[:8]>.jpg -- overwrite the
+    # same storage path so the photo's URL (and its position in `images`)
+    # never changes, only the pixels do.
+    path = url.split("/listings-images/")[-1].split("?")[0]
+    supabase = get_db()
+    supabase.storage.from_("listings-images").upload(
+        path, enhanced_bytes, {"content-type": "image/jpeg", "upsert": "true"}
+    )
+    new_url = f"{supabase.storage.from_('listings-images').get_public_url(path)}?v={uuid.uuid4().hex[:8]}"
+    images[image_index] = new_url
+    supabase.table("listings").update({"images": images}).eq("id", listing_id).eq("agent_id", agent_id).execute()
+    return new_url
+
+@app.post("/api/listings/{listing_id}/images/{image_index}/enhance")
+async def enhance_listing_image(listing_id: str, image_index: int, agent=Depends(get_current_agent)):
+    new_url = await asyncio.to_thread(_enhance_listing_image, listing_id, agent["id"], image_index)
+    return {"success": True, "image_url": new_url}
 
 @app.post("/api/listings/{listing_id}/post-facebook")
 def post_to_facebook(listing_id: str, req: FacebookPostRequest, agent=Depends(get_current_agent)):
