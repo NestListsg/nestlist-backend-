@@ -34,6 +34,10 @@ AUDIO_PATH = os.path.join(os.path.dirname(__file__), "audio", "soft_piano.mp3")
 GOLD = (240, 200, 74, 255)
 WHITE = (248, 244, 236, 255)
 PALE = (255, 255, 255, 255)
+CREAM_BG = (250, 248, 243, 255)
+INK = (28, 27, 23, 255)
+MUTED = (114, 110, 96, 255)
+DEEP_GOLD = (184, 145, 46, 255)  # readable gold-on-cream, same shift poster_renderer uses for text on light backgrounds
 
 FONT_DIR = os.path.join(os.path.dirname(__file__), "fonts")
 PLAYFAIR = os.path.join(FONT_DIR, "PlayfairDisplay-Variable.ttf")
@@ -66,6 +70,14 @@ EYEBROW_FONT = _load_font(INTER, 28, weight=600, opsz=14)
 OUTRO_NAME_FONT = _load_font(INTER, 46, weight=700, opsz=20)
 OUTRO_CONTACT_FONT = _load_font(INTER, 34, weight=600, opsz=16)
 OUTRO_TAGLINE_FONT = _load_font(PLAYFAIR, 34, weight=500)
+
+# "card" style -- a floating info-card that stays fixed over a moving Ken Burns
+# background, the same layered look as a developer's boosted Facebook/Instagram ad.
+CARD_TITLE_FONT = _load_font(PLAYFAIR, 54, weight=700)
+CARD_PRICE_FONT = _load_font(INTER, 44, weight=700, opsz=24)
+CARD_STATS_FONT = _load_font(INTER, 26, weight=500, opsz=14)
+CARD_MONOGRAM_FONT = _load_font(PLAYFAIR, 24, weight=600)
+CARD_CTA_FONT = _load_font(INTER, 30, weight=700, opsz=16)
 
 
 def _run_ffmpeg(cmd, timeout):
@@ -181,6 +193,98 @@ def _render_plain_slide(photo):
     return _fit_with_letterbox(photo, VW, VH).convert("RGB")
 
 
+def _wrap_text(draw, text, font, max_width):
+    """Minimal word-wrapper -- kept local rather than imported from poster_renderer
+    so the two renderers stay independent of each other, same as the font/color
+    constants above are each defined here rather than shared."""
+    if not text:
+        return []
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _build_card_overlay(property_type, district, price_text, stats_line):
+    """Renders the floating info-card + bottom CTA bar once, as a transparent RGBA
+    layer the size of the video canvas. Composited onto every photo slide in 'card'
+    style, so the card reads as a fixed graphic sitting over a moving background --
+    the same layered effect as a developer's boosted Facebook/Instagram ad."""
+    overlay = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    margin, pad_x = 90, 56
+    card_x0, card_x1 = margin, VW - margin
+    content_w = (card_x1 - card_x0) - 2 * pad_x
+    cx = VW // 2
+
+    title = (district or property_type or "").upper()
+    title_lines = _wrap_text(draw, title, CARD_TITLE_FONT, content_w)[:2]
+    stats_lines = _wrap_text(draw, stats_line, CARD_STATS_FONT, content_w)[:2] if stats_line else []
+
+    title_line_h = CARD_TITLE_FONT.size + 14
+    content_h = len(title_lines) * title_line_h + 66  # + divider row
+    if price_text:
+        content_h += CARD_PRICE_FONT.size + 20
+    for _ in stats_lines:
+        content_h += CARD_STATS_FONT.size + 10
+
+    pad_top, pad_bottom = 52, 48
+    card_y0 = int(VH * 0.30)
+    card_y1 = card_y0 + pad_top + content_h + pad_bottom
+    draw.rectangle((card_x0, card_y0, card_x1, card_y1), fill=CREAM_BG, outline=GOLD, width=2)
+
+    y = card_y0 + pad_top
+    for line in title_lines:
+        tw = draw.textbbox((0, 0), line, font=CARD_TITLE_FONT)[2]
+        draw.text((cx - tw / 2, y), line, font=CARD_TITLE_FONT, fill=INK)
+        y += title_line_h
+
+    y += 16
+    circle_d = 32
+    draw.line((cx - 130, y + circle_d / 2, cx - circle_d / 2 - 10, y + circle_d / 2), fill=DEEP_GOLD, width=2)
+    draw.line((cx + circle_d / 2 + 10, y + circle_d / 2, cx + 130, y + circle_d / 2), fill=DEEP_GOLD, width=2)
+    draw.ellipse((cx - circle_d / 2, y, cx + circle_d / 2, y + circle_d), outline=DEEP_GOLD, width=2)
+    mw = draw.textbbox((0, 0), "N", font=CARD_MONOGRAM_FONT)[2]
+    draw.text((cx - mw / 2, y + circle_d / 2 - CARD_MONOGRAM_FONT.size / 2 - 2), "N", font=CARD_MONOGRAM_FONT, fill=DEEP_GOLD)
+    y += circle_d + 20
+
+    if price_text:
+        pw = draw.textbbox((0, 0), price_text, font=CARD_PRICE_FONT)[2]
+        draw.text((cx - pw / 2, y), price_text, font=CARD_PRICE_FONT, fill=DEEP_GOLD)
+        y += CARD_PRICE_FONT.size + 20
+
+    for line in stats_lines:
+        sw = draw.textbbox((0, 0), line, font=CARD_STATS_FONT)[2]
+        draw.text((cx - sw / 2, y), line, font=CARD_STATS_FONT, fill=MUTED)
+        y += CARD_STATS_FONT.size + 10
+
+    bar_h = 130
+    draw.rectangle((0, VH - bar_h, VW, VH), fill=GOLD)
+    bar_text_y = VH - bar_h / 2 - CARD_CTA_FONT.size / 2 - 4
+    draw.text((64, bar_text_y), "VIEW LISTING", font=CARD_CTA_FONT, fill=INK)
+    arrow = "›"
+    aw = draw.textbbox((0, 0), arrow, font=CARD_CTA_FONT)[2]
+    draw.text((VW - 64 - aw, bar_text_y), arrow, font=CARD_CTA_FONT, fill=INK)
+
+    return overlay
+
+
+def _render_card_slide(photo, overlay):
+    base = _fit_with_letterbox(photo, VW, VH).convert("RGBA")
+    base.alpha_composite(overlay)
+    return base.convert("RGB")
+
+
 def _render_outro_slide(agent_name, agent_contact_line):
     base = Image.new("RGBA", (VW, VH), (13, 43, 29, 255))
     draw = ImageDraw.Draw(base)
@@ -259,23 +363,29 @@ def _xfade_pair(base_path, next_path, out_path, base_duration, transition_second
     _run_ffmpeg(cmd, timeout)
 
 
-def render_property_video(image_urls, property_type, district, price_text, stats, agent_name, agent_contact_line):
+def render_property_video(image_urls, property_type, district, price_text, stats, agent_name, agent_contact_line, style="classic"):
     """Returns the finished video as bytes (MP4, H.264 + AAC, 1080x1920).
 
     stats: list of strings, same shape as poster_renderer's (empty entries dropped).
+    style: "classic" (default) -- first slide gets a text overlay, later slides are
+    clean photos, same as the original Ken Burns slideshow. "card" -- every slide
+    carries the same fixed floating info-card + CTA bar over the moving background.
     """
     photos = [_fetch_image(u) for u in image_urls[:MAX_PHOTOS]]
     if not photos:
         raise ValueError("At least one photo is required to generate a video")
 
     stats_line = "   ·   ".join(s for s in stats if s)
+    card_overlay = _build_card_overlay(property_type, district, price_text, stats_line) if style == "card" else None
 
     with tempfile.TemporaryDirectory() as workdir:
         clip_paths = []
         clip_durations = []
 
         for i, photo in enumerate(photos):
-            if i == 0:
+            if style == "card":
+                slide = _render_card_slide(photo, card_overlay)
+            elif i == 0:
                 slide = _render_photo_slide(photo, district, property_type, price_text, stats_line)
             else:
                 slide = _render_plain_slide(photo)

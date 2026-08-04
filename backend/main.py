@@ -1009,12 +1009,27 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
 
     return {"poster_url": poster_url, "poster_template_id": chosen_template_id}
 
+VIDEO_TEMPLATES = [
+    {"id": "classic", "name": "Ken Burns Slideshow"},
+    {"id": "card", "name": "Card Overlay"},
+]
+
+@app.get("/api/video-templates")
+def get_video_templates(agent=Depends(get_current_agent)):
+    return VIDEO_TEMPLATES
+
 @app.post("/api/listings/{listing_id}/generate-video")
-def generate_video(listing_id: str, agent=Depends(get_current_agent)):
+def generate_video(listing_id: str, video_template_id: str = None, agent=Depends(get_current_agent)):
     result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
+
+    if video_template_id and video_template_id not in {t["id"] for t in VIDEO_TEMPLATES}:
+        raise HTTPException(status_code=400, detail="Unknown video template")
+    # Same fallback precedence as generate-poster: explicit choice wins and is
+    # remembered on the listing, otherwise fall back to what this listing last used.
+    chosen_video_template_id = video_template_id or listing.get("video_template_id") or "classic"
 
     images = listing.get("images") or []
     if not images:
@@ -1048,6 +1063,7 @@ def generate_video(listing_id: str, agent=Depends(get_current_agent)):
             stats=stats,
             agent_name=agent["name"],
             agent_contact_line=agent.get("contact", ""),
+            style=chosen_video_template_id,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Video rendering failed: {e}")
@@ -1061,9 +1077,12 @@ def generate_video(listing_id: str, agent=Depends(get_current_agent)):
     )
     video_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
 
-    get_db().table("listings").update({"video_url": video_url}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    update_payload = {"video_url": video_url}
+    if video_template_id:
+        update_payload["video_template_id"] = video_template_id
+    get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
 
-    return {"video_url": video_url}
+    return {"video_url": video_url, "video_template_id": chosen_video_template_id}
 
 def _wait_for_ig_container_ready(container_id: str, page_token: str, max_attempts: int = 10, delay_seconds: float = 1.5) -> bool:
     # Instagram fetches/processes the image asynchronously after the container is
