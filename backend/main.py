@@ -678,23 +678,12 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list) -> 
         image_data = img.get("image_data")
         img_bytes = base64.b64decode(image_data)
         pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
-
-        # Re-encode to a known-good JPEG before handing to Autoenhance --
-        # img_bytes may be PNG/HEIC/whatever the browser sent, and their
-        # upload requires the Content-Type to match the actual bytes.
-        source_buffer = io.BytesIO()
-        pil_img.save(source_buffer, format="JPEG", quality=95)
-        enhanced_bytes = autoenhance.enhance_image(source_buffer.getvalue())
-
-        if enhanced_bytes:
-            pil_img = PILImage.open(io.BytesIO(enhanced_bytes)).convert("RGB")
-            pil_img.thumbnail((1920, 1920))
-        else:
-            # Not configured, or the call failed -- fall back to the local
-            # PIL enhancer so a photo (or a brief Autoenhance outage) never
-            # blocks the upload.
-            pil_img.thumbnail((1920, 1920))
-            pil_img = _auto_enhance_photo(pil_img)
+        pil_img.thumbnail((1920, 1920))
+        # Intentionally no automatic enhancement here -- stored as-is so the
+        # agent's later "Enhance" click in My Listings (cloudinary_enhance)
+        # is the *only* thing that ever processes a photo, applied once, to
+        # a clean source. Stacking upload-time auto-enhance underneath it
+        # produced double-processed, worse-looking photos (see Jane's report).
 
         buffer = io.BytesIO()
         pil_img.save(buffer, format="JPEG", quality=80)
