@@ -292,6 +292,7 @@ def extract_comparable_transactions(projects: list, street_keyword: str, propert
             if price <= 0 or area_sqm <= 0:
                 continue
             area_sqft = area_sqm * SQM_TO_SQFT
+            district_code = txn.get("district", "")
             records.append({
                 "street": street,
                 "price": price,
@@ -299,6 +300,12 @@ def extract_comparable_transactions(projects: list, street_keyword: str, propert
                 "psf": round(price / area_sqft),
                 "property_type": txn.get("propertyType", ""),
                 "contract_date": f"{parsed[1]:02d}/{parsed[0]}",
+                # URA's public API doesn't expose house/block/unit numbers at all
+                # (privacy restriction on their end) -- street is the finest
+                # granularity available. District + tenure are the extra fields
+                # actually present in the raw data that we weren't surfacing.
+                "district": f"D{district_code}" if district_code else "",
+                "tenure": txn.get("tenure", ""),
             })
     records.sort(key=lambda r: r["contract_date"], reverse=True)
     return records
