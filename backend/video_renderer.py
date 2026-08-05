@@ -71,8 +71,10 @@ OUTRO_NAME_FONT = _load_font(INTER, 46, weight=700, opsz=20)
 OUTRO_CONTACT_FONT = _load_font(INTER, 34, weight=600, opsz=16)
 OUTRO_TAGLINE_FONT = _load_font(PLAYFAIR, 34, weight=500)
 
-# "card" style -- a floating info-card that stays fixed over a moving Ken Burns
-# background, the same layered look as a developer's boosted Facebook/Instagram ad.
+# "card" style -- a fixed, static background photo with a floating info-card on top;
+# a small window inset into the card is the only part that actually moves (a Ken Burns
+# clip through the listing's other photos), the same layered look as a developer's
+# boosted Facebook/Instagram ad: the ad itself is a still, only the inset photo plays.
 CARD_TITLE_FONT = _load_font(PLAYFAIR, 54, weight=700)
 CARD_PRICE_FONT = _load_font(INTER, 44, weight=700, opsz=24)
 CARD_STATS_FONT = _load_font(INTER, 26, weight=500, opsz=14)
@@ -214,13 +216,15 @@ def _wrap_text(draw, text, font, max_width):
     return lines
 
 
-def _build_card_overlay(property_type, district, price_text, stats_line):
-    """Renders the floating info-card + bottom CTA bar once, as a transparent RGBA
-    layer the size of the video canvas. Composited onto every photo slide in 'card'
-    style, so the card reads as a fixed graphic sitting over a moving background --
-    the same layered effect as a developer's boosted Facebook/Instagram ad."""
-    overlay = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+def _build_static_card_base(hero_photo, property_type, district, price_text, stats_line):
+    """Renders the still background + floating info-card + bottom CTA bar, all fixed
+    for the whole video -- everything except the inset window below is a single frame,
+    same as a developer's boosted Facebook/Instagram ad is a still image with only a
+    small photo panel actually moving. Returns (image, inset_rect) where inset_rect is
+    the (x, y, w, h) canvas position the caller must overlay a moving clip onto -- left
+    empty here since the video composited on top will cover it completely."""
+    base = _fit_with_letterbox(hero_photo, VW, VH).convert("RGBA")
+    draw = ImageDraw.Draw(base)
 
     margin, pad_x = 90, 56
     card_x0, card_x1 = margin, VW - margin
@@ -232,14 +236,18 @@ def _build_card_overlay(property_type, district, price_text, stats_line):
     stats_lines = _wrap_text(draw, stats_line, CARD_STATS_FONT, content_w)[:2] if stats_line else []
 
     title_line_h = CARD_TITLE_FONT.size + 14
+    inset_w = content_w
+    inset_h = round(inset_w * 0.6)
+
     content_h = len(title_lines) * title_line_h + 66  # + divider row
     if price_text:
         content_h += CARD_PRICE_FONT.size + 20
+    content_h += inset_h + 20
     for _ in stats_lines:
         content_h += CARD_STATS_FONT.size + 10
 
     pad_top, pad_bottom = 52, 48
-    card_y0 = int(VH * 0.30)
+    card_y0 = int(VH * 0.20)
     card_y1 = card_y0 + pad_top + content_h + pad_bottom
     draw.rectangle((card_x0, card_y0, card_x1, card_y1), fill=CREAM_BG, outline=GOLD, width=2)
 
@@ -263,6 +271,12 @@ def _build_card_overlay(property_type, district, price_text, stats_line):
         draw.text((cx - pw / 2, y), price_text, font=CARD_PRICE_FONT, fill=DEEP_GOLD)
         y += CARD_PRICE_FONT.size + 20
 
+    inset_x = card_x0 + pad_x
+    inset_y = y
+    # inset window itself is left blank -- the moving clip overlaid on top in
+    # _compose_card_intro covers this rectangle completely, pixel for pixel
+    y += inset_h + 20
+
     for line in stats_lines:
         sw = draw.textbbox((0, 0), line, font=CARD_STATS_FONT)[2]
         draw.text((cx - sw / 2, y), line, font=CARD_STATS_FONT, fill=MUTED)
@@ -276,13 +290,56 @@ def _build_card_overlay(property_type, district, price_text, stats_line):
     aw = draw.textbbox((0, 0), arrow, font=CARD_CTA_FONT)[2]
     draw.text((VW - 64 - aw, bar_text_y), arrow, font=CARD_CTA_FONT, fill=INK)
 
-    return overlay
+    return base.convert("RGB"), (inset_x, inset_y, inset_w, inset_h)
 
 
-def _render_card_slide(photo, overlay):
-    base = _fit_with_letterbox(photo, VW, VH).convert("RGBA")
-    base.alpha_composite(overlay)
-    return base.convert("RGB")
+def _build_inset_video(photos, inset_w, inset_h, workdir):
+    """Builds the small Ken Burns clip that plays inside the card's inset window --
+    the only moving part of 'card' style. Reuses _zoompan_clip/_xfade_pair at the
+    inset's own (smaller) size rather than the full canvas size."""
+    clip_paths = []
+    clip_durations = []
+    for i, photo in enumerate(photos):
+        slide = ImageOps.fit(photo.convert("RGB"), (inset_w, inset_h), centering=(0.5, 0.4))
+        clip_path = os.path.join(workdir, f"inset_{i:02d}.mp4")
+        _zoompan_clip(slide, clip_path, SECONDS_PER_PHOTO, zoom_in=(i % 2 == 0), w=inset_w, h=inset_h)
+        clip_paths.append(clip_path)
+        clip_durations.append(SECONDS_PER_PHOTO)
+
+    if len(clip_paths) == 1:
+        return clip_paths[0], clip_durations[0]
+
+    running_path = clip_paths[0]
+    running_duration = clip_durations[0]
+    for i in range(1, len(clip_paths)):
+        merged_path = os.path.join(workdir, f"inset_merged_{i:02d}.mp4")
+        _xfade_pair(running_path, clip_paths[i], merged_path, running_duration, TRANSITION_SECONDS, 90)
+        running_path = merged_path
+        running_duration = running_duration + clip_durations[i] - TRANSITION_SECONDS
+    return running_path, running_duration
+
+
+def _compose_card_intro(base_img, inset_path, inset_rect, duration, workdir):
+    """Overlays the moving inset clip onto the still card background for the inset
+    clip's full duration, producing the 'card' style's single opening clip."""
+    base_path = os.path.join(workdir, "card_base.png")
+    base_img.save(base_path, format="PNG")
+
+    x, y, w, h = inset_rect
+    out_path = os.path.join(workdir, "card_intro.mp4")
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", base_path,
+        "-i", inset_path,
+        "-filter_complex",
+        f"[0:v]scale={VW}:{VH},format=yuv420p[bg];[1:v]format=yuv420p[fg];[bg][fg]overlay=x={x}:y={y}:shortest=1",
+        "-t", str(duration),
+        "-r", str(FPS), "-vsync", "cfr",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        out_path,
+    ]
+    _run_ffmpeg(cmd, 90)
+    return out_path
 
 
 def _render_outro_slide(agent_name, agent_contact_line):
@@ -309,10 +366,13 @@ def _render_outro_slide(agent_name, agent_contact_line):
     return base.convert("RGB")
 
 
-def _zoompan_clip(slide_img, out_path, duration, zoom_in=True):
+def _zoompan_clip(slide_img, out_path, duration, zoom_in=True, w=None, h=None):
     """Renders a single still image into a slow-zoom video clip via ffmpeg's zoompan
     filter. Centered zoom (not the default top-left) so the motion reads as a deliberate
-    push-in, not a drift toward a corner."""
+    push-in, not a drift toward a corner. w/h default to the full canvas size, but the
+    'card' style's inset clip passes its own smaller box dimensions."""
+    w = w or VW
+    h = h or VH
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         slide_img.save(tmp.name, format="PNG")
         src_path = tmp.name
@@ -327,7 +387,7 @@ def _zoompan_clip(slide_img, out_path, duration, zoom_in=True):
     cmd = [
         "ffmpeg", "-y", "-loop", "1", "-i", src_path,
         "-vf",
-        f"zoompan=z='{z_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={VW}x{VH}:fps={FPS},format=yuv420p",
+        f"zoompan=z='{z_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={FPS},format=yuv420p",
         "-t", str(duration),
         "-r", str(FPS), "-vsync", "cfr",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -368,31 +428,40 @@ def render_property_video(image_urls, property_type, district, price_text, stats
 
     stats: list of strings, same shape as poster_renderer's (empty entries dropped).
     style: "classic" (default) -- first slide gets a text overlay, later slides are
-    clean photos, same as the original Ken Burns slideshow. "card" -- every slide
-    carries the same fixed floating info-card + CTA bar over the moving background.
+    clean photos, same as the original Ken Burns slideshow. "card" -- a still
+    background photo with a floating info-card on top; only a small window inset
+    into the card actually moves (a Ken Burns clip through the other photos), same
+    as a developer's boosted Facebook/Instagram ad -- the ad itself is a still, only
+    the inset photo plays.
     """
     photos = [_fetch_image(u) for u in image_urls[:MAX_PHOTOS]]
     if not photos:
         raise ValueError("At least one photo is required to generate a video")
 
     stats_line = "   ·   ".join(s for s in stats if s)
-    card_overlay = _build_card_overlay(property_type, district, price_text, stats_line) if style == "card" else None
 
     with tempfile.TemporaryDirectory() as workdir:
         clip_paths = []
         clip_durations = []
 
-        for i, photo in enumerate(photos):
-            if style == "card":
-                slide = _render_card_slide(photo, card_overlay)
-            elif i == 0:
-                slide = _render_photo_slide(photo, district, property_type, price_text, stats_line)
-            else:
-                slide = _render_plain_slide(photo)
-            clip_path = os.path.join(workdir, f"clip_{i:02d}.mp4")
-            _zoompan_clip(slide, clip_path, SECONDS_PER_PHOTO, zoom_in=(i % 2 == 0))
-            clip_paths.append(clip_path)
-            clip_durations.append(SECONDS_PER_PHOTO)
+        if style == "card":
+            hero = photos[0]
+            inset_photos = photos[1:] if len(photos) > 1 else photos[:1]
+            base_img, inset_rect = _build_static_card_base(hero, property_type, district, price_text, stats_line)
+            inset_path, inset_duration = _build_inset_video(inset_photos, inset_rect[2], inset_rect[3], workdir)
+            intro_path = _compose_card_intro(base_img, inset_path, inset_rect, inset_duration, workdir)
+            clip_paths.append(intro_path)
+            clip_durations.append(inset_duration)
+        else:
+            for i, photo in enumerate(photos):
+                if i == 0:
+                    slide = _render_photo_slide(photo, district, property_type, price_text, stats_line)
+                else:
+                    slide = _render_plain_slide(photo)
+                clip_path = os.path.join(workdir, f"clip_{i:02d}.mp4")
+                _zoompan_clip(slide, clip_path, SECONDS_PER_PHOTO, zoom_in=(i % 2 == 0))
+                clip_paths.append(clip_path)
+                clip_durations.append(SECONDS_PER_PHOTO)
 
         outro = _render_outro_slide(agent_name, agent_contact_line)
         outro_path = os.path.join(workdir, "clip_outro.mp4")
