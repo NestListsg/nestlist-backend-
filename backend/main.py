@@ -352,6 +352,14 @@ class SellerLeadRequest(BaseModel):
     temperature: str = "WARM"
     seller_notes: str = ""
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage]
+    listing_id: str = None  # optional -- the listing the agent currently has open, if any
+
 # ================================
 # AUTH HELPERS
 # ================================
@@ -2137,3 +2145,80 @@ def delete_seller(seller_id: str, agent=Depends(get_current_agent)):
     if not result.data:
         raise HTTPException(status_code=404, detail="Seller not found")
     return {"success": True}
+
+# ================================
+# AI CHAT ASSISTANT
+# ================================
+# General-purpose property Q&A -- not tied to a specific listing, but if the agent
+# has one open it's passed as context so "what's the land area of this property"
+# works without them re-typing the numbers. Backed by web search so answers about
+# current rates, regulations, and market conditions are actually current rather
+# than relying on the model's training data.
+_chatbot_hits = {}
+
+@app.post("/api/chat")
+async def chat_with_assistant(req: ChatRequest, agent=Depends(get_current_agent)):
+    if _rate_limited(_chatbot_hits, agent["id"], limit=40, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="You've hit the hourly limit for the assistant -- please try again in a bit.")
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="No message provided")
+
+    listing_context = ""
+    if req.listing_id:
+        result = get_db().table("listings").select("*").eq("id", req.listing_id).eq("agent_id", agent["id"]).execute()
+        if result.data:
+            listing = result.data[0]
+            listing_context = f"""
+
+The agent currently has this listing open. If their question refers to "this property" or "this listing", use these details rather than asking them to repeat it:
+- Property type: {listing.get('property_type', '')}
+- Location: {listing.get('location', '')}
+- Price: SGD {listing.get('price', '')}
+- Built-up area: {listing.get('built_up', '')} sqft
+- Bedrooms: {listing.get('bedrooms', '')}
+- Bathrooms: {listing.get('bathrooms', '')}
+- Tenure: {listing.get('tenure', '')}"""
+
+    system_prompt = (
+        f"You are the NestList AI Assistant, helping a Singapore real estate agent "
+        f"specializing in {agent.get('specialty') or 'landed, GCB, and ultra-luxury properties'}. "
+        "Answer anything relevant to their work: property questions, calculations "
+        "(unit conversions, land area, PSF, stamp duty, mortgage estimates), Singapore "
+        "property regulations, and current market conditions. Use web search whenever "
+        "the question needs current or Singapore-specific information rather than relying "
+        "on your own knowledge -- property figures, rates, and rules change, and agents "
+        "need accurate answers, not guesses. Be concise and direct; agents are often asking "
+        "on the go." + listing_context
+    )
+
+    claude_messages = [{"role": m.role, "content": m.content} for m in req.messages]
+    reply_text = ""
+    sources = []
+
+    try:
+        # Web search is a server-side tool -- Anthropic runs the search and folds the
+        # result into this same response, no client-side tool loop needed. The only
+        # loop here handles the rare case where the server's own internal search
+        # iteration hits its cap mid-turn (stop_reason "pause_turn") and needs one
+        # more request to finish, per Anthropic's documented resume pattern.
+        for _ in range(3):
+            response = await create_claude_message(
+                model="claude-opus-5",
+                max_tokens=1024,
+                system=system_prompt,
+                messages=claude_messages,
+                tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}],
+            )
+            for block in response.content:
+                if block.type == "text":
+                    reply_text += block.text
+                elif block.type == "web_search_tool_result" and isinstance(block.content, list):
+                    for result in block.content:
+                        sources.append({"title": getattr(result, "title", None), "url": getattr(result, "url", None)})
+            if response.stop_reason != "pause_turn":
+                break
+            claude_messages = claude_messages + [{"role": "assistant", "content": response.content}]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Assistant is temporarily unavailable: {e}")
+
+    return {"reply": reply_text.strip(), "sources": sources}
