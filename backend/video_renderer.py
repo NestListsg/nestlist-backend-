@@ -222,8 +222,14 @@ def _build_static_card_base(hero_photo, property_type, district, price_text, sta
     same as a developer's boosted Facebook/Instagram ad is a still image with only a
     small photo panel actually moving. Returns (image, inset_rect) where inset_rect is
     the (x, y, w, h) canvas position the caller must overlay a moving clip onto -- left
-    empty here since the video composited on top will cover it completely."""
-    base = _fit_with_letterbox(hero_photo, VW, VH).convert("RGBA")
+    empty here since the video composited on top will cover it completely.
+
+    Uses a plain cover-crop rather than _fit_with_letterbox's blur treatment --
+    letterboxing exists to avoid cropping when the whole photo has to read clearly
+    (the classic style's full-bleed slides), but here the card already covers most
+    of the frame, so cropping the edges costs little and a sharp, filled background
+    reads far better than a mostly-blurred one behind a card that dominates anyway."""
+    base = _fit(hero_photo, VW, VH).convert("RGBA")
     draw = ImageDraw.Draw(base)
 
     margin, pad_x = 90, 56
@@ -247,8 +253,9 @@ def _build_static_card_base(hero_photo, property_type, district, price_text, sta
         content_h += CARD_STATS_FONT.size + 10
 
     pad_top, pad_bottom = 52, 48
-    card_y0 = int(VH * 0.20)
-    card_y1 = card_y0 + pad_top + content_h + pad_bottom
+    card_h = pad_top + content_h + pad_bottom
+    card_y0 = (VH - card_h) // 2  # vertically centered in the full canvas
+    card_y1 = card_y0 + card_h
     draw.rectangle((card_x0, card_y0, card_x1, card_y1), fill=CREAM_BG, outline=GOLD, width=2)
 
     y = card_y0 + pad_top
