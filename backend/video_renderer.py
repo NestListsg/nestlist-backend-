@@ -237,7 +237,7 @@ def _build_static_card_base(hero_photo, property_type, district, price_text, sta
 
     title_line_h = CARD_TITLE_FONT.size + 14
     inset_w = content_w
-    inset_h = round(inset_w * 0.6)
+    inset_h = round(inset_w * 0.6 / 2) * 2  # libx264 + yuv420p requires even width/height
 
     content_h = len(title_lines) * title_line_h + 66  # + divider row
     if price_text:
