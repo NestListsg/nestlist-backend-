@@ -2156,6 +2156,27 @@ def delete_seller(seller_id: str, agent=Depends(get_current_agent)):
 # than relying on the model's training data.
 _chatbot_hits = {}
 
+# Grounds "how do I..." questions about NestList itself -- without this the model
+# has zero knowledge of the app's actual features and would either guess wrong or
+# give a vague non-answer. Kept to real, current features only; the closing line
+# tells the model to say so rather than invent a button/menu path that doesn't exist.
+NESTLIST_APP_HELP = """
+The agent is using NestList Prestige, a web app for real estate agents specializing in landed/GCB/ultra-luxury Singapore property. If they ask "how do I..." about the app itself (not a property question), use this reference:
+
+- New Listing: fill in property details and NestList generates the listing description with AI.
+- My Listings (Active Listings / Deleted Listings): manage listings. Expand a listing card to: enhance individual photos, download all photos as a ZIP, generate a branded poster (choose from several template styles), generate a property video (Ken Burns Slideshow or Card Overlay style), and share to Facebook/Instagram/WhatsApp/LinkedIn/TikTok -- copy the caption and post manually, or (only for agents with it connected) post directly to Facebook/Instagram from the app via My Profile.
+- Deleted Listings: a listing removed from Active Listings is archived here, not permanently gone -- it can be permanently deleted from this tab.
+- Enquiries: buyer enquiries submitted through public listing pages, each with an AI-generated lead score.
+- Buyer Management: buyer profiles and buyer-to-listing matching.
+- Sellers: seller leads, which can be converted into a full listing.
+- Pricing Reports: generates a comparable-transaction pricing report from live URA data (landed properties only).
+- Dashboard: overview stats and the Singapore Market Pulse panel (live GCB market data from URA).
+- My Profile: update agent details/photo, connect Instagram/Facebook for direct posting, set up notifications.
+- Billing: subscription/plan management.
+
+If asked about something not covered here, or you're not sure of the exact steps, say so plainly rather than guessing -- don't invent a button or menu path that may not exist.
+"""
+
 @app.post("/api/chat")
 async def chat_with_assistant(req: ChatRequest, agent=Depends(get_current_agent)):
     if _rate_limited(_chatbot_hits, agent["id"], limit=40, window_seconds=3600):
@@ -2184,11 +2205,12 @@ The agent currently has this listing open. If their question refers to "this pro
         f"specializing in {agent.get('specialty') or 'landed, GCB, and ultra-luxury properties'}. "
         "Answer anything relevant to their work: property questions, calculations "
         "(unit conversions, land area, PSF, stamp duty, mortgage estimates), Singapore "
-        "property regulations, and current market conditions. Use web search whenever "
-        "the question needs current or Singapore-specific information rather than relying "
-        "on your own knowledge -- property figures, rates, and rules change, and agents "
-        "need accurate answers, not guesses. Be concise and direct; agents are often asking "
-        "on the go." + listing_context
+        "property regulations, current market conditions, and how to use the NestList app "
+        "itself. Use web search whenever a property question needs current or "
+        "Singapore-specific information rather than relying on your own knowledge -- "
+        "property figures, rates, and rules change, and agents need accurate answers, "
+        "not guesses. Be concise and direct; agents are often asking on the go."
+        + NESTLIST_APP_HELP + listing_context
     )
 
     claude_messages = [{"role": m.role, "content": m.content} for m in req.messages]
