@@ -430,7 +430,7 @@ def _xfade_pair(base_path, next_path, out_path, base_duration, transition_second
     _run_ffmpeg(cmd, timeout)
 
 
-def render_property_video(image_urls, property_type, district, price_text, stats, agent_name, agent_contact_line, style="classic"):
+def render_property_video(image_urls, property_type, district, price_text, stats, agent_name, agent_contact_line, style="classic", photo_index=0):
     """Returns the finished video as bytes (MP4, H.264 + AAC, 1080x1920).
 
     stats: list of strings, same shape as poster_renderer's (empty entries dropped).
@@ -440,10 +440,15 @@ def render_property_video(image_urls, property_type, district, price_text, stats
     into the card actually moves (a Ken Burns clip through the other photos), same
     as a developer's boosted Facebook/Instagram ad -- the ad itself is a still, only
     the inset photo plays.
+    photo_index: which listing photo is the "hero" -- the card style's static
+    background, or the classic style's text-overlay opening slide. Same selector
+    the agent already uses to pick the poster's photo (My Listings' star picker).
     """
     photos = [_fetch_image(u) for u in image_urls[:MAX_PHOTOS]]
     if not photos:
         raise ValueError("At least one photo is required to generate a video")
+    if photo_index < 0 or photo_index >= len(photos):
+        photo_index = 0
 
     stats_line = "   ·   ".join(s for s in stats if s)
 
@@ -452,15 +457,19 @@ def render_property_video(image_urls, property_type, district, price_text, stats
         clip_durations = []
 
         if style == "card":
-            hero = photos[0]
-            inset_photos = photos[1:] if len(photos) > 1 else photos[:1]
+            hero = photos[photo_index]
+            inset_photos = [p for i, p in enumerate(photos) if i != photo_index] or photos[:1]
             base_img, inset_rect = _build_static_card_base(hero, property_type, district, price_text, stats_line)
             inset_path, inset_duration = _build_inset_video(inset_photos, inset_rect[2], inset_rect[3], workdir)
             intro_path = _compose_card_intro(base_img, inset_path, inset_rect, inset_duration, workdir)
             clip_paths.append(intro_path)
             clip_durations.append(inset_duration)
         else:
-            for i, photo in enumerate(photos):
+            # Selected hero photo leads (gets the text-overlay treatment), same
+            # relative order for the rest -- so choosing a different star photo
+            # actually changes what opens the slideshow.
+            ordered_photos = [photos[photo_index]] + [p for i, p in enumerate(photos) if i != photo_index]
+            for i, photo in enumerate(ordered_photos):
                 if i == 0:
                     slide = _render_photo_slide(photo, district, property_type, price_text, stats_line)
                 else:

@@ -1027,7 +1027,7 @@ def get_video_templates(agent=Depends(get_current_agent)):
     return VIDEO_TEMPLATES
 
 @app.post("/api/listings/{listing_id}/generate-video")
-def generate_video(listing_id: str, video_template_id: str = None, agent=Depends(get_current_agent)):
+def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, agent=Depends(get_current_agent)):
     result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -1042,6 +1042,8 @@ def generate_video(listing_id: str, video_template_id: str = None, agent=Depends
     images = listing.get("images") or []
     if not images:
         raise HTTPException(status_code=400, detail="Upload at least one photo before generating a video")
+    if photo_index < 0 or photo_index >= len(images):
+        photo_index = 0
 
     price_num = _to_number(listing.get("price"))
     built_up_num = _to_number(listing.get("built_up"))
@@ -1072,6 +1074,7 @@ def generate_video(listing_id: str, video_template_id: str = None, agent=Depends
             agent_name=agent["name"],
             agent_contact_line=agent.get("contact", ""),
             style=chosen_video_template_id,
+            photo_index=photo_index,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Video rendering failed: {e}")
