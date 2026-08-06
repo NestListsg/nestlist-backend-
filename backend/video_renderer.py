@@ -23,7 +23,12 @@ VW, VH = 1080, 1920
 FPS = 25
 SECONDS_PER_PHOTO = 5.5
 OUTRO_SECONDS = 5.5
-MAX_PHOTOS = 15  # matches the app's overall per-listing photo upload cap
+MAX_VIDEO_PHOTOS = 8  # each photo costs its own sequential ffmpeg encode + xfade merge pass
+                       # (see render_property_video) -- past ~8-10 photos, total render time
+                       # risks exceeding the platform's gateway timeout and the agent gets a
+                       # 502 after waiting 2+ minutes with no video produced. Deliberately well
+                       # below the listing's overall 15-photo upload cap (PDF_MAX_PHOTOS in
+                       # main.py), which has no such per-photo rendering cost.
 TRANSITION_SECONDS = 1.8
 ZOOM_TARGET = 1.15
 AUDIO_FADE_SECONDS = 1.5
@@ -499,11 +504,20 @@ def render_property_video(image_urls, property_type, district, price_text, stats
     agent_photo_url: optional -- when set, the closing slide becomes a proper
     signature card with the agent's headshot instead of plain centered text.
     """
-    photos = [_fetch_image(u) for u in image_urls[:MAX_PHOTOS]]
-    if not photos:
+    if not image_urls:
         raise ValueError("At least one photo is required to generate a video")
-    if photo_index < 0 or photo_index >= len(photos):
+    if photo_index < 0 or photo_index >= len(image_urls):
         photo_index = 0
+
+    # Keep the agent's chosen hero photo first, then fill up to MAX_VIDEO_PHOTOS with the
+    # rest of the listing's photos -- slicing image_urls by position before honoring
+    # photo_index would silently drop the hero photo (or point photo_index out of bounds)
+    # whenever the listing has more photos than MAX_VIDEO_PHOTOS.
+    hero_url = image_urls[photo_index]
+    rest_urls = [u for i, u in enumerate(image_urls) if i != photo_index]
+    selected_urls = ([hero_url] + rest_urls)[:MAX_VIDEO_PHOTOS]
+    photos = [_fetch_image(u) for u in selected_urls]
+    photo_index = 0  # hero is always first in `photos` now
 
     agent_photo = None
     if agent_photo_url:
