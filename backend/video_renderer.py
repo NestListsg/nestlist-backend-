@@ -370,14 +370,21 @@ def _render_outro_slide(agent_name, agent_contact_line, agent_photo=None):
 
         # Soft blurred shadow behind the circle, offset slightly downward, so the
         # portrait reads as a lifted, designed element rather than flat-pasted.
-        shadow = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
+        # Blurred on a small crop (not the full 1080x1920 canvas) -- GaussianBlur
+        # cost scales with pixel count, and there's no reason to blur 2M+ pixels
+        # to shadow a ~450px circle.
         shadow_pad = 20
+        blur_radius = 26
+        margin = blur_radius * 3
+        box_half = photo_size / 2 + shadow_pad + margin
+        shadow = Image.new("RGBA", (round(box_half * 2), round(box_half * 2)), (0, 0, 0, 0))
         ImageDraw.Draw(shadow).ellipse(
-            (cx - photo_size / 2 - shadow_pad, photo_cy - photo_size / 2 - shadow_pad + 14,
-             cx + photo_size / 2 + shadow_pad, photo_cy + photo_size / 2 + shadow_pad + 14),
+            (box_half - photo_size / 2 - shadow_pad, box_half - photo_size / 2 - shadow_pad + 14,
+             box_half + photo_size / 2 + shadow_pad, box_half + photo_size / 2 + shadow_pad + 14),
             fill=(0, 0, 0, 140)
         )
-        base.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(26)))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(blur_radius))
+        base.alpha_composite(shadow, dest=(round(cx - box_half), round(photo_cy - box_half)))
         draw = ImageDraw.Draw(base)
 
         square = ImageOps.fit(agent_photo.convert("RGB"), (photo_size, photo_size), centering=(0.5, 0.3))
