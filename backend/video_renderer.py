@@ -350,12 +350,11 @@ def _compose_card_intro(base_img, inset_path, inset_rect, duration, workdir):
 
 
 def _render_outro_slide(agent_name, agent_contact_line, agent_photo=None):
-    """Closing slide. With a profile photo, this reads as a proper signature card --
-    square-cropped headshot with a gold border, same visual language as the agent
-    photo already used on branded posters (poster_renderer.py's _square_photo) --
-    rather than plain centered text. Falls back to the original text-only layout
-    when the agent hasn't uploaded a profile photo, so nothing breaks for agents
-    without one."""
+    """Closing slide. With a profile photo, this reads as a proper portrait feature --
+    large circular headshot with a soft drop shadow and a gold ring, lifted off the
+    flat background rather than a small square photo pinned flat against it (which
+    read as a memorial/obituary photo, not a marketing signature). Falls back to the
+    original text-only layout when the agent hasn't uploaded a profile photo."""
     base = Image.new("RGBA", (VW, VH), (13, 43, 29, 255))
     draw = ImageDraw.Draw(base)
 
@@ -363,13 +362,37 @@ def _render_outro_slide(agent_name, agent_contact_line, agent_photo=None):
     cy = VH // 2
 
     if agent_photo:
-        photo_size = 260
-        photo_top = cy - 380
-        photo = ImageOps.fit(agent_photo.convert("RGB"), (photo_size, photo_size), centering=(0.5, 0.3))
+        photo_size = 420
+        photo_bottom = cy - 120
+        photo_top = photo_bottom - photo_size
+        photo_cy = photo_top + photo_size / 2
         dest = (round(cx - photo_size / 2), photo_top)
-        base.paste(photo, dest)
-        draw.rectangle((dest[0], dest[1], dest[0] + photo_size, dest[1] + photo_size), outline=GOLD, width=4)
-        tagline_y = photo_top + photo_size + 36
+
+        # Soft blurred shadow behind the circle, offset slightly downward, so the
+        # portrait reads as a lifted, designed element rather than flat-pasted.
+        shadow = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
+        shadow_pad = 20
+        ImageDraw.Draw(shadow).ellipse(
+            (cx - photo_size / 2 - shadow_pad, photo_cy - photo_size / 2 - shadow_pad + 14,
+             cx + photo_size / 2 + shadow_pad, photo_cy + photo_size / 2 + shadow_pad + 14),
+            fill=(0, 0, 0, 140)
+        )
+        base.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(26)))
+        draw = ImageDraw.Draw(base)
+
+        square = ImageOps.fit(agent_photo.convert("RGB"), (photo_size, photo_size), centering=(0.5, 0.3))
+        circle_mask = Image.new("L", (photo_size, photo_size), 0)
+        ImageDraw.Draw(circle_mask).ellipse((0, 0, photo_size, photo_size), fill=255)
+        base.paste(square, dest, circle_mask)
+
+        ring_width = 8
+        draw.ellipse(
+            (dest[0] - ring_width / 2, dest[1] - ring_width / 2,
+             dest[0] + photo_size + ring_width / 2, dest[1] + photo_size + ring_width / 2),
+            outline=GOLD, width=ring_width
+        )
+
+        tagline_y = photo_bottom + 36
         divider_y = tagline_y + 50
         name_y = divider_y + 26
         contact_y = name_y + 62
