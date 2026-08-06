@@ -392,7 +392,7 @@ def _render_outro_slide(agent_name, agent_contact_line, agent_photo=None):
         base.alpha_composite(shadow, dest=(round(cx - box_half), round(photo_cy - box_half)))
         draw = ImageDraw.Draw(base)
 
-        square = ImageOps.fit(agent_photo.convert("RGB"), (photo_size, photo_size), centering=(0.5, 0.3))
+        square = ImageOps.fit(agent_photo.convert("RGB"), (photo_size, photo_size), centering=(0.5, 0.42))
         circle_mask = Image.new("L", (photo_size, photo_size), 0)
         ImageDraw.Draw(circle_mask).ellipse((0, 0, photo_size, photo_size), fill=255)
         base.paste(square, dest, circle_mask)

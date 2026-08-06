@@ -145,7 +145,7 @@ def _square_photo(base, agent_photo, cx, cy, size, border_color=GOLD, border_wid
     if not agent_photo:
         return
     half = size / 2
-    photo = ImageOps.fit(agent_photo.convert("RGB"), (size, size), centering=(0.5, 0.3))
+    photo = ImageOps.fit(agent_photo.convert("RGB"), (size, size), centering=(0.5, 0.42))
     dest = (round(cx - half), round(cy - half))
     base.paste(photo, dest)
     x0, y0 = dest
