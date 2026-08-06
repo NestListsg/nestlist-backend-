@@ -23,12 +23,16 @@ VW, VH = 1080, 1920
 FPS = 25
 SECONDS_PER_PHOTO = 5.5
 OUTRO_SECONDS = 5.5
-MAX_VIDEO_PHOTOS = 8  # each photo costs its own sequential ffmpeg encode + xfade merge pass
-                       # (see render_property_video) -- past ~8-10 photos, total render time
-                       # risks exceeding the platform's gateway timeout and the agent gets a
-                       # 502 after waiting 2+ minutes with no video produced. Deliberately well
-                       # below the listing's overall 15-photo upload cap (PDF_MAX_PHOTOS in
-                       # main.py), which has no such per-photo rendering cost.
+MAX_VIDEO_PHOTOS = 5  # each photo costs its own sequential ffmpeg encode + xfade merge pass
+                       # (see render_property_video). Was 8, but live testing on Railway's
+                       # current plan showed even 8 photos completing anywhere from ~60s to
+                       # 250s+/502/hang depending on concurrent CPU load (Railway's CPU graph
+                       # shows renders hitting the plan's ceiling) -- 8 wasn't giving reliable
+                       # margin under the gateway's timeout. Lower for safety margin; if this
+                       # still isn't reliable, the real fix is more Railway CPU headroom, not
+                       # a lower cap. Deliberately well below the listing's overall 15-photo
+                       # upload cap (PDF_MAX_PHOTOS in main.py), which has no such per-photo
+                       # rendering cost.
 TRANSITION_SECONDS = 1.8
 ZOOM_TARGET = 1.15
 AUDIO_FADE_SECONDS = 1.5
