@@ -349,26 +349,49 @@ def _compose_card_intro(base_img, inset_path, inset_rect, duration, workdir):
     return out_path
 
 
-def _render_outro_slide(agent_name, agent_contact_line):
+def _render_outro_slide(agent_name, agent_contact_line, agent_photo=None):
+    """Closing slide. With a profile photo, this reads as a proper signature card --
+    square-cropped headshot with a gold border, same visual language as the agent
+    photo already used on branded posters (poster_renderer.py's _square_photo) --
+    rather than plain centered text. Falls back to the original text-only layout
+    when the agent hasn't uploaded a profile photo, so nothing breaks for agents
+    without one."""
     base = Image.new("RGBA", (VW, VH), (13, 43, 29, 255))
     draw = ImageDraw.Draw(base)
 
     cx = VW // 2
     cy = VH // 2
 
+    if agent_photo:
+        photo_size = 260
+        photo_top = cy - 380
+        photo = ImageOps.fit(agent_photo.convert("RGB"), (photo_size, photo_size), centering=(0.5, 0.3))
+        dest = (round(cx - photo_size / 2), photo_top)
+        base.paste(photo, dest)
+        draw.rectangle((dest[0], dest[1], dest[0] + photo_size, dest[1] + photo_size), outline=GOLD, width=4)
+        tagline_y = photo_top + photo_size + 36
+        divider_y = tagline_y + 50
+        name_y = divider_y + 26
+        contact_y = name_y + 62
+    else:
+        tagline_y = cy - 140
+        divider_y = cy - 60
+        name_y = cy - 20
+        contact_y = cy + 40
+
     tagline = "Smarter Listings. Better Results."
     tw = draw.textbbox((0, 0), tagline, font=OUTRO_TAGLINE_FONT)[2]
-    draw.text((cx - tw / 2, cy - 140), tagline, font=OUTRO_TAGLINE_FONT, fill=(212, 175, 55, 230))
+    draw.text((cx - tw / 2, tagline_y), tagline, font=OUTRO_TAGLINE_FONT, fill=(212, 175, 55, 230))
 
-    draw.line((cx - 60, cy - 60, cx + 60, cy - 60), fill=GOLD, width=2)
+    draw.line((cx - 60, divider_y, cx + 60, divider_y), fill=GOLD, width=2)
 
     name_text = (agent_name or "").upper()
     nw = draw.textbbox((0, 0), name_text, font=OUTRO_NAME_FONT)[2]
-    draw.text((cx - nw / 2, cy - 20), name_text, font=OUTRO_NAME_FONT, fill=PALE)
+    draw.text((cx - nw / 2, name_y), name_text, font=OUTRO_NAME_FONT, fill=PALE)
 
     if agent_contact_line:
         cw = draw.textbbox((0, 0), agent_contact_line, font=OUTRO_CONTACT_FONT)[2]
-        draw.text((cx - cw / 2, cy + 40), agent_contact_line, font=OUTRO_CONTACT_FONT, fill=GOLD)
+        draw.text((cx - cw / 2, contact_y), agent_contact_line, font=OUTRO_CONTACT_FONT, fill=GOLD)
 
     return base.convert("RGB")
 
@@ -430,7 +453,7 @@ def _xfade_pair(base_path, next_path, out_path, base_duration, transition_second
     _run_ffmpeg(cmd, timeout)
 
 
-def render_property_video(image_urls, property_type, district, price_text, stats, agent_name, agent_contact_line, style="classic", photo_index=0):
+def render_property_video(image_urls, property_type, district, price_text, stats, agent_name, agent_contact_line, style="classic", photo_index=0, agent_photo_url=None):
     """Returns the finished video as bytes (MP4, H.264 + AAC, 1080x1920).
 
     stats: list of strings, same shape as poster_renderer's (empty entries dropped).
@@ -443,12 +466,23 @@ def render_property_video(image_urls, property_type, district, price_text, stats
     photo_index: which listing photo is the "hero" -- the card style's static
     background, or the classic style's text-overlay opening slide. Same selector
     the agent already uses to pick the poster's photo (My Listings' star picker).
+    agent_photo_url: optional -- when set, the closing slide becomes a proper
+    signature card with the agent's headshot instead of plain centered text.
     """
     photos = [_fetch_image(u) for u in image_urls[:MAX_PHOTOS]]
     if not photos:
         raise ValueError("At least one photo is required to generate a video")
     if photo_index < 0 or photo_index >= len(photos):
         photo_index = 0
+
+    agent_photo = None
+    if agent_photo_url:
+        try:
+            agent_photo = _fetch_image(agent_photo_url)
+        except Exception:
+            # A broken/missing profile photo shouldn't fail the whole video --
+            # the outro just falls back to its original text-only layout.
+            agent_photo = None
 
     stats_line = "   ·   ".join(s for s in stats if s)
 
@@ -479,7 +513,7 @@ def render_property_video(image_urls, property_type, district, price_text, stats
                 clip_paths.append(clip_path)
                 clip_durations.append(SECONDS_PER_PHOTO)
 
-        outro = _render_outro_slide(agent_name, agent_contact_line)
+        outro = _render_outro_slide(agent_name, agent_contact_line, agent_photo)
         outro_path = os.path.join(workdir, "clip_outro.mp4")
         _zoompan_clip(outro, outro_path, OUTRO_SECONDS, zoom_in=True)
         clip_paths.append(outro_path)

@@ -1075,6 +1075,7 @@ def generate_video(listing_id: str, video_template_id: str = None, photo_index: 
             agent_contact_line=agent.get("contact", ""),
             style=chosen_video_template_id,
             photo_index=photo_index,
+            agent_photo_url=agent.get("photo_url"),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Video rendering failed: {e}")
