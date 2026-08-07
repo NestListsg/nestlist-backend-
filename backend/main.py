@@ -284,6 +284,13 @@ class FacebookOAuthCallbackRequest(BaseModel):
 class FacebookPostRequest(BaseModel):
     caption: str
 
+class LinkedInOAuthCallbackRequest(BaseModel):
+    code: str
+    state: str
+
+class LinkedInPostRequest(BaseModel):
+    caption: str
+
 class PasswordResetRequest(BaseModel):
     email: str
     website: str = ""  # honeypot field, must stay empty
@@ -437,10 +444,27 @@ FACEBOOK_OAUTH_REDIRECT_URI = "https://nestlist.sg/auth/facebook/callback"
 def _can_use_facebook_beta(agent) -> bool:
     return agent.get("email") in FACEBOOK_BETA_ALLOWLIST
 
+# ================================
+# LINKEDIN AUTO-POSTING (hidden beta, same rollout discipline as Instagram/Facebook --
+# gated to Jane's own account first, opened up once verified live). Unlike Facebook,
+# LinkedIn's w_member_social permission posts to a member's OWN personal feed -- there's
+# no "Pages only" platform wall here, so this can genuinely reach every agent once out of
+# beta, not just the minority with a business Page. Requires the "Sign In with LinkedIn
+# using OpenID Connect" and "Share on LinkedIn" products enabled on the LinkedIn Developer
+# app (self-serve, not a lengthy special-access review like Meta's Advanced Access).
+# ================================
+LINKEDIN_BETA_ALLOWLIST = {"leesbjane@gmail.com"}
+LINKEDIN_OAUTH_REDIRECT_URI = "https://nestlist.sg/auth/linkedin/callback"
+LINKEDIN_API_VERSION = "202601"  # Linkedin-Version header, YYYYMM format -- bump periodically
+
+def _can_use_linkedin_beta(agent) -> bool:
+    return agent.get("email") in LINKEDIN_BETA_ALLOWLIST
+
 def _agent_response(agent) -> dict:
     out = {k: v for k, v in agent.items() if k != "password_hash"}
     out["can_use_instagram_beta"] = _can_use_instagram_beta(agent)
     out["can_use_facebook_beta"] = _can_use_facebook_beta(agent)
+    out["can_use_linkedin_beta"] = _can_use_linkedin_beta(agent)
     return out
 
 # ================================
@@ -887,6 +911,87 @@ def post_to_facebook(listing_id: str, req: FacebookPostRequest, agent=Depends(ge
         _clear_facebook_connection()
         raise HTTPException(status_code=401, detail="Your Facebook connection has expired. Please reconnect in My Profile.")
     raise HTTPException(status_code=400, detail=err.get("message", "Failed to post to Facebook"))
+
+@app.post("/api/listings/{listing_id}/post-linkedin")
+def post_to_linkedin(listing_id: str, req: LinkedInPostRequest, agent=Depends(get_current_agent)):
+    if not _can_use_linkedin_beta(agent):
+        raise HTTPException(status_code=403, detail="LinkedIn posting is not yet available on your account")
+
+    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = result.data[0]
+
+    access_token = agent.get("linkedin_access_token")
+    person_urn = agent.get("linkedin_person_urn")
+    if not access_token or not person_urn:
+        raise HTTPException(status_code=400, detail="Connect LinkedIn in My Profile first")
+
+    caption = req.caption[:3000]
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Linkedin-Version": LINKEDIN_API_VERSION,
+        "X-Restli-Protocol-Version": "2.0.0",
+        "Content-Type": "application/json",
+    }
+
+    def _clear_linkedin_connection():
+        get_db().table("agents").update({
+            "linkedin_access_token": None, "linkedin_refresh_token": None,
+            "linkedin_person_urn": None, "linkedin_name": None, "linkedin_connected_at": None,
+        }).eq("id", agent["id"]).execute()
+
+    # Attach the poster if there is one -- LinkedIn requires a real 2-step upload (register,
+    # then PUT the bytes) rather than Facebook's "give me a URL" shortcut. A failed upload
+    # shouldn't block the whole post -- falls back to a text-only post rather than erroring out.
+    media = None
+    poster_url = listing.get("poster_url")
+    if poster_url:
+        try:
+            init_resp = requests.post(
+                "https://api.linkedin.com/rest/images?action=initializeUpload",
+                headers=headers,
+                json={"initializeUploadRequest": {"owner": person_urn}},
+                timeout=15,
+            )
+            init_data = init_resp.json().get("value", {})
+            upload_url = init_data.get("uploadUrl")
+            image_urn = init_data.get("image")
+            if upload_url and image_urn:
+                img_bytes = requests.get(poster_url, timeout=15).content
+                put_resp = requests.put(
+                    upload_url, data=img_bytes,
+                    headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+                )
+                if put_resp.status_code in (200, 201):
+                    media = {"id": image_urn}
+        except Exception:
+            media = None
+
+    body = {
+        "author": person_urn,
+        "commentary": caption,
+        "visibility": "PUBLIC",
+        "distribution": {"feedDistribution": "MAIN_FEED", "targetEntities": [], "thirdPartyDistributionChannels": []},
+        "lifecycleState": "PUBLISHED",
+        "isReshareDisabledByAuthor": False,
+    }
+    if media:
+        body["content"] = {"media": media}
+
+    response = requests.post("https://api.linkedin.com/rest/posts", headers=headers, json=body, timeout=15)
+    if response.status_code == 201:
+        return {"success": True, "post_id": response.headers.get("x-restli-id", "")}
+
+    if response.status_code == 401:
+        _clear_linkedin_connection()
+        raise HTTPException(status_code=401, detail="Your LinkedIn connection has expired. Please reconnect in My Profile.")
+
+    try:
+        err = response.json()
+    except Exception:
+        err = {}
+    raise HTTPException(status_code=400, detail=err.get("message", "Failed to post to LinkedIn"))
 
 # ================================
 # IMAGE ENHANCEMENT
@@ -1404,6 +1509,72 @@ def facebook_oauth_callback(req: FacebookOAuthCallbackRequest):
     get_db().table("agents").update(update_payload).eq("id", agent["id"]).execute()
 
     return {"success": True, "page_name": page_name}
+
+@app.get("/api/profile/linkedin-connect-link")
+def get_linkedin_connect_link(agent=Depends(get_current_agent)):
+    if not _can_use_linkedin_beta(agent):
+        raise HTTPException(status_code=403, detail="LinkedIn connect is not yet available on your account")
+    client_id = os.environ.get("LINKEDIN_CLIENT_ID", "")
+    if not client_id:
+        raise HTTPException(status_code=503, detail="LinkedIn connect is not configured")
+    scope = "openid%20profile%20w_member_social"
+    link = (
+        "https://www.linkedin.com/oauth/v2/authorization"
+        "?response_type=code"
+        f"&client_id={client_id}"
+        f"&redirect_uri={LINKEDIN_OAUTH_REDIRECT_URI}"
+        f"&state={agent['id']}"
+        f"&scope={scope}"
+    )
+    return {"link": link}
+
+@app.post("/api/linkedin/oauth-callback")
+def linkedin_oauth_callback(req: LinkedInOAuthCallbackRequest):
+    if not _is_valid_uuid(req.state):
+        raise HTTPException(status_code=400, detail="Invalid connect request")
+
+    agent_result = get_db().table("agents").select("id, email").eq("id", req.state).execute()
+    if not agent_result.data:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = agent_result.data[0]
+    if not _can_use_linkedin_beta(agent):
+        raise HTTPException(status_code=403, detail="LinkedIn connect is not yet available on your account")
+
+    client_id = os.environ.get("LINKEDIN_CLIENT_ID", "")
+    client_secret = os.environ.get("LINKEDIN_CLIENT_SECRET", "")
+
+    r1 = requests.post(
+        "https://www.linkedin.com/oauth/v2/accessToken",
+        data={
+            "grant_type": "authorization_code", "code": req.code,
+            "client_id": client_id, "client_secret": client_secret,
+            "redirect_uri": LINKEDIN_OAUTH_REDIRECT_URI,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15,
+    )
+    d1 = r1.json()
+    if "access_token" not in d1:
+        raise HTTPException(status_code=400, detail=f"LinkedIn connect failed: {d1.get('error_description', d1.get('error', 'unknown error'))}")
+    access_token = d1["access_token"]
+    refresh_token = d1.get("refresh_token")
+
+    r2 = requests.get("https://api.linkedin.com/v2/userinfo", headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+    d2 = r2.json()
+    person_sub = d2.get("sub")
+    if not person_sub:
+        raise HTTPException(status_code=400, detail="LinkedIn connect failed: could not read member profile")
+    person_urn = f"urn:li:person:{person_sub}"
+    member_name = d2.get("name", "")
+
+    get_db().table("agents").update({
+        "linkedin_access_token": access_token,
+        "linkedin_refresh_token": refresh_token,
+        "linkedin_person_urn": person_urn,
+        "linkedin_name": member_name,
+        "linkedin_connected_at": datetime.utcnow().isoformat(),
+    }).eq("id", agent["id"]).execute()
+
+    return {"success": True, "name": member_name}
 
 @app.get("/api/health")
 def health():
