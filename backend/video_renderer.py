@@ -76,9 +76,9 @@ TITLE_FONT = _load_font(PLAYFAIR, 64, weight=700)
 PRICE_FONT = _load_font(INTER, 58, weight=700, opsz=32)
 STATS_FONT = _load_font(INTER, 34, weight=500, opsz=18)
 EYEBROW_FONT = _load_font(INTER, 28, weight=600, opsz=14)
-OUTRO_NAME_FONT = _load_font(INTER, 46, weight=700, opsz=20)
-OUTRO_CONTACT_FONT = _load_font(INTER, 34, weight=600, opsz=16)
-OUTRO_TAGLINE_FONT = _load_font(PLAYFAIR, 34, weight=500)
+OUTRO_NAME_FONT = _load_font(INTER, 58, weight=700, opsz=20)
+OUTRO_CONTACT_FONT = _load_font(INTER, 40, weight=600, opsz=16)
+OUTRO_TAGLINE_FONT = _load_font(PLAYFAIR, 40, weight=500)
 
 # "card" style -- a fixed, static background photo with a floating info-card on top;
 # a small window inset into the card is the only part that actually moves (a Ken Burns
@@ -371,9 +371,27 @@ def _render_outro_slide(agent_name, agent_contact_line, agent_photo=None):
     cy = VH // 2
 
     if agent_photo:
-        photo_size = 420
-        photo_bottom = cy - 120
-        photo_top = photo_bottom - photo_size
+        photo_size = 620  # was 420 -- Jane: the closing slide read "bare on the page"; a
+        # bigger portrait plus the recentering below is what actually fills the frame,
+        # not just a marginally bigger circle floating in the same empty layout.
+        ring_width = 10
+        gap_photo_to_tagline = 50
+        gap_tagline_to_divider = 56
+        gap_divider_to_name = 34
+        gap_name_to_contact = 78
+        contact_line_height = 56  # approx, only used to center the whole block below
+
+        # Center the ENTIRE block (photo + tagline + divider + name + contact) on the
+        # canvas, rather than anchoring the photo a fixed distance above center like
+        # before -- that fixed offset was tuned for the old, smaller photo and left a
+        # large dead zone below the text once the photo grew. Computing photo_top from
+        # the full block height keeps everything balanced as any of these sizes change.
+        block_height = (
+            photo_size + gap_photo_to_tagline + gap_tagline_to_divider +
+            gap_divider_to_name + gap_name_to_contact + contact_line_height
+        )
+        photo_top = round(cy - block_height / 2)
+        photo_bottom = photo_top + photo_size
         photo_cy = photo_top + photo_size / 2
         dest = (round(cx - photo_size / 2), photo_top)
 
@@ -381,9 +399,9 @@ def _render_outro_slide(agent_name, agent_contact_line, agent_photo=None):
         # portrait reads as a lifted, designed element rather than flat-pasted.
         # Blurred on a small crop (not the full 1080x1920 canvas) -- GaussianBlur
         # cost scales with pixel count, and there's no reason to blur 2M+ pixels
-        # to shadow a ~450px circle.
-        shadow_pad = 20
-        blur_radius = 26
+        # to shadow a ~650px circle.
+        shadow_pad = 26
+        blur_radius = 32
         margin = blur_radius * 3
         box_half = photo_size / 2 + shadow_pad + margin
         shadow = Image.new("RGBA", (round(box_half * 2), round(box_half * 2)), (0, 0, 0, 0))
@@ -401,28 +419,27 @@ def _render_outro_slide(agent_name, agent_contact_line, agent_photo=None):
         ImageDraw.Draw(circle_mask).ellipse((0, 0, photo_size, photo_size), fill=255)
         base.paste(square, dest, circle_mask)
 
-        ring_width = 8
         draw.ellipse(
             (dest[0] - ring_width / 2, dest[1] - ring_width / 2,
              dest[0] + photo_size + ring_width / 2, dest[1] + photo_size + ring_width / 2),
             outline=GOLD, width=ring_width
         )
 
-        tagline_y = photo_bottom + 36
-        divider_y = tagline_y + 50
-        name_y = divider_y + 26
-        contact_y = name_y + 62
+        tagline_y = photo_bottom + gap_photo_to_tagline
+        divider_y = tagline_y + gap_tagline_to_divider
+        name_y = divider_y + gap_divider_to_name
+        contact_y = name_y + gap_name_to_contact
     else:
-        tagline_y = cy - 140
-        divider_y = cy - 60
-        name_y = cy - 20
-        contact_y = cy + 40
+        tagline_y = cy - 165
+        divider_y = cy - 75
+        name_y = cy - 25
+        contact_y = cy + 50
 
     tagline = "Smarter Listings. Better Results."
     tw = draw.textbbox((0, 0), tagline, font=OUTRO_TAGLINE_FONT)[2]
     draw.text((cx - tw / 2, tagline_y), tagline, font=OUTRO_TAGLINE_FONT, fill=(212, 175, 55, 230))
 
-    draw.line((cx - 60, divider_y, cx + 60, divider_y), fill=GOLD, width=2)
+    draw.line((cx - 75, divider_y, cx + 75, divider_y), fill=GOLD, width=3)
 
     name_text = (agent_name or "").upper()
     nw = draw.textbbox((0, 0), name_text, font=OUTRO_NAME_FONT)[2]
