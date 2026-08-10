@@ -702,10 +702,23 @@ Write:
         "listing": saved.data[0]
     }
 
-def _process_and_upload_images(listing_id: str, agent_id: str, images: list) -> list:
+def _process_and_upload_images(listing_id: str, agent_id: str, images: list, append: bool = False) -> list:
+    """append=False (default): this batch becomes the listing's complete photo set,
+    replacing whatever was there -- the original single-request behavior.
+    append=True: this batch is added AFTER the listing's existing photos. Exists so
+    the frontend can upload photos in several small requests instead of one giant
+    one -- the production edge proxy kills request bodies over ~10MB mid-stream
+    (browser sees 'Failed to fetch'), which real phone photos hit easily."""
     supabase = get_db()
-    image_urls = []
 
+    existing_urls = []
+    if append:
+        result = supabase.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
+        if result.data:
+            existing_urls = result.data[0].get("images") or []
+    start_index = len(existing_urls)
+
+    image_urls = []
     for i, img in enumerate(images):
         image_data = img.get("image_data")
         img_bytes = base64.b64decode(image_data)
@@ -722,7 +735,7 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list) -> 
         buffer.seek(0)
         compressed = buffer.read()
 
-        filename = f"{listing_id}/{i}_{listing_id[:8]}.jpg"
+        filename = f"{listing_id}/{start_index + i}_{listing_id[:8]}.jpg"
         supabase.storage.from_("listings-images").upload(
             filename,
             compressed,
@@ -732,8 +745,9 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list) -> 
         url = supabase.storage.from_("listings-images").get_public_url(filename)
         image_urls.append(url)
 
-    supabase.table("listings").update({"images": image_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
-    return image_urls
+    final_urls = existing_urls + image_urls
+    supabase.table("listings").update({"images": final_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
+    return final_urls
 
 PDF_MIN_PHOTO_DIM = 400  # skip embedded logos/icons/decorative graphics smaller than this
 PDF_MAX_PHOTOS = 15  # matches the overall per-listing photo cap
@@ -811,6 +825,7 @@ async def upload_listing_images(listing_id: str, request: Request, agent=Depends
     try:
         body = await request.json()
         images = body.get("images", [])
+        append = bool(body.get("append", False))
 
         if not images:
             raise HTTPException(status_code=400, detail="No images provided")
@@ -818,7 +833,7 @@ async def upload_listing_images(listing_id: str, request: Request, agent=Depends
         if len(images) > 15:
             images = images[:15]
 
-        image_urls = await asyncio.to_thread(_process_and_upload_images, listing_id, agent["id"], images)
+        image_urls = await asyncio.to_thread(_process_and_upload_images, listing_id, agent["id"], images, append)
 
         return {"success": True, "image_urls": image_urls}
 
