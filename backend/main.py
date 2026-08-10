@@ -247,6 +247,9 @@ class ListingRequest(BaseModel):
     site_coverage: float = 0
     sg_citizen: bool = False
 
+class ListingContentRequest(BaseModel):
+    content: str
+
 class ProfileUpdate(BaseModel):
     name: str
     agency: str
@@ -2084,6 +2087,33 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
         "site_coverage": req.site_coverage,
     }).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return updated.data[0]
+
+MAX_LISTING_CONTENT_CHARS = 20000
+
+@app.patch("/api/listings/{listing_id}/content")
+def update_listing_content(listing_id: str, req: ListingContentRequest, agent=Depends(get_current_agent)):
+    # Lets an agent hand-edit the AI-generated write-up. Deliberately touches
+    # ONLY the content column -- unlike PATCH /api/listings/{id}, this must not
+    # promote a "lead" row to "active" just because someone polished the copy.
+    content = (req.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Write-up cannot be empty")
+    if len(content) > MAX_LISTING_CONTENT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Write-up is too long (max {MAX_LISTING_CONTENT_CHARS} characters)"
+        )
+
+    existing = get_db().table("listings").select("id").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    updated = get_db().table("listings").update({"content": content}) \
+        .eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not updated.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    return {"success": True, "content": updated.data[0].get("content", content)}
 
 @app.get("/api/listings/{listing_id}/download-images")
 def download_listing_images(listing_id: str, agent=Depends(get_current_agent)):
