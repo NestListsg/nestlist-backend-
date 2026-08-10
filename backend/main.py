@@ -18,7 +18,7 @@ import re
 import secrets
 import hashlib
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from PIL import Image as PILImage, ImageEnhance, ImageOps
 import fitz
 import poster_renderer
@@ -1146,8 +1146,77 @@ VIDEO_TEMPLATES = [
 def get_video_templates(agent=Depends(get_current_agent)):
     return VIDEO_TEMPLATES
 
+# Video renders take 40-70s+ -- far too long to ride on a single HTTP request.
+# Safari hard-kills any request around the 60s mark (agents saw 'Failed to
+# fetch'/'Load failed' with no explanation), and platform blips (e.g. Railway's
+# US West incident) kill long-lived connections first. So generate-video is
+# fire-and-forget: the endpoint validates, marks the listing 'rendering', kicks
+# the render into a background thread, and returns immediately. The frontend
+# polls the listing until video_status lands on 'done' or 'failed'. Status
+# lives in the DB (not process memory) because uvicorn runs multiple workers --
+# the poll may be answered by a different worker than the one rendering.
+_video_render_tasks = set()
+
+def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, template_was_explicit: bool, photo_index: int):
+    try:
+        images = listing.get("images") or []
+
+        price_num = _to_number(listing.get("price"))
+        built_up_num = _to_number(listing.get("built_up"))
+        price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
+        bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
+        bathrooms_match = re.search(r"\d+", str(listing.get("bathrooms") or ""))
+        bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
+        bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
+
+        district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
+        property_type_text = (listing.get("property_type") or "").upper()
+        district_text = district_match.group(0).upper() if district_match else ""
+
+        stats = [
+            f"{bedrooms_val} Rooms" if bedrooms_val else "",
+            f"{bathrooms_val} Baths" if bathrooms_val else "",
+            f"{built_up_num:,.0f} sqft" if built_up_num else "",
+            f"SGD {price_psf:,} psf" if price_psf else "",
+        ]
+
+        video_bytes = video_renderer.render_property_video(
+            image_urls=images,
+            property_type=property_type_text,
+            district=district_text,
+            price_text=f"SGD {_format_price_millions(listing['price'])}",
+            stats=stats,
+            agent_name=agent["name"],
+            agent_contact_line=agent.get("contact", ""),
+            style=chosen_video_template_id,
+            photo_index=photo_index,
+            agent_photo_url=agent.get("photo_url"),
+        )
+
+        supabase = get_db()
+        filename = f"videos/{listing_id}.mp4"
+        supabase.storage.from_("listings-images").upload(
+            filename,
+            video_bytes,
+            {"content-type": "video/mp4", "upsert": "true"}
+        )
+        video_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
+
+        update_payload = {"video_url": video_url, "video_status": "done", "video_error": None}
+        if template_was_explicit:
+            update_payload["video_template_id"] = chosen_video_template_id
+        get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    except Exception as e:
+        try:
+            get_db().table("listings").update({
+                "video_status": "failed",
+                "video_error": str(e)[:500],
+            }).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+        except Exception:
+            pass  # DB unreachable too -- the stale-lock timeout lets the agent retry
+
 @app.post("/api/listings/{listing_id}/generate-video")
-def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, agent=Depends(get_current_agent)):
+async def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, agent=Depends(get_current_agent)):
     result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -1165,56 +1234,35 @@ def generate_video(listing_id: str, video_template_id: str = None, photo_index: 
     if photo_index < 0 or photo_index >= len(images):
         photo_index = 0
 
-    price_num = _to_number(listing.get("price"))
-    built_up_num = _to_number(listing.get("built_up"))
-    price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
-    bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
-    bathrooms_match = re.search(r"\d+", str(listing.get("bathrooms") or ""))
-    bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
-    bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
+    # One render at a time per listing. The 10-minute stale-lock cutoff exists so
+    # a crashed worker (which can never write 'failed') doesn't lock the listing
+    # out of video generation forever.
+    if listing.get("video_status") == "rendering":
+        started_raw = listing.get("video_render_started_at")
+        still_fresh = False
+        if started_raw:
+            try:
+                started_at = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
+                still_fresh = (datetime.now(timezone.utc) - started_at) < timedelta(minutes=10)
+            except Exception:
+                still_fresh = False
+        if still_fresh:
+            raise HTTPException(status_code=409, detail="A video is already being generated for this listing -- it should be ready in a minute or two.")
 
-    district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
-    property_type_text = (listing.get("property_type") or "").upper()
-    district_text = district_match.group(0).upper() if district_match else ""
+    get_db().table("listings").update({
+        "video_status": "rendering",
+        "video_error": None,
+        "video_render_started_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
 
-    stats = [
-        f"{bedrooms_val} Rooms" if bedrooms_val else "",
-        f"{bathrooms_val} Baths" if bathrooms_val else "",
-        f"{built_up_num:,.0f} sqft" if built_up_num else "",
-        f"SGD {price_psf:,} psf" if price_psf else "",
-    ]
+    task = asyncio.create_task(asyncio.to_thread(
+        _render_video_job, listing_id, agent, listing,
+        chosen_video_template_id, bool(video_template_id), photo_index,
+    ))
+    _video_render_tasks.add(task)
+    task.add_done_callback(_video_render_tasks.discard)
 
-    try:
-        video_bytes = video_renderer.render_property_video(
-            image_urls=images,
-            property_type=property_type_text,
-            district=district_text,
-            price_text=f"SGD {_format_price_millions(listing['price'])}",
-            stats=stats,
-            agent_name=agent["name"],
-            agent_contact_line=agent.get("contact", ""),
-            style=chosen_video_template_id,
-            photo_index=photo_index,
-            agent_photo_url=agent.get("photo_url"),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Video rendering failed: {e}")
-
-    supabase = get_db()
-    filename = f"videos/{listing_id}.mp4"
-    supabase.storage.from_("listings-images").upload(
-        filename,
-        video_bytes,
-        {"content-type": "video/mp4", "upsert": "true"}
-    )
-    video_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
-
-    update_payload = {"video_url": video_url}
-    if video_template_id:
-        update_payload["video_template_id"] = video_template_id
-    get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
-
-    return {"video_url": video_url, "video_template_id": chosen_video_template_id}
+    return {"status": "rendering", "video_template_id": chosen_video_template_id}
 
 def _wait_for_ig_container_ready(container_id: str, page_token: str, max_attempts: int = 10, delay_seconds: float = 1.5) -> bool:
     # Instagram fetches/processes the image asynchronously after the container is
