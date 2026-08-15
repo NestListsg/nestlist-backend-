@@ -1140,10 +1140,34 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
 
     return {"poster_url": poster_url, "poster_template_id": chosen_template_id}
 
+DEFAULT_VIDEO_TEMPLATE_ID = "classic"
+
 VIDEO_TEMPLATES = [
-    {"id": "classic", "name": "Ken Burns Slideshow"},
-    {"id": "card", "name": "Card Overlay"},
+    {"id": DEFAULT_VIDEO_TEMPLATE_ID, "name": "Ken Burns Slideshow"},
 ]
+
+# Templates that shipped once and were then withdrawn. They stay listed here (but out
+# of VIDEO_TEMPLATES, so the frontend picker never offers them again) purely so we can
+# recognise the id when it turns up in old data: listings generated before the
+# withdrawal still carry it in video_template_id, and a browser tab left open across
+# the deploy still holds the old picker in memory. Anything naming a retired template
+# quietly renders the default instead of erroring -- an agent regenerating an old
+# listing must get a video, not a "Unknown video template" wall.
+RETIRED_VIDEO_TEMPLATE_IDS = {"card"}  # "Card Overlay", withdrawn 2026-08-15
+
+_LIVE_VIDEO_TEMPLATE_IDS = {t["id"] for t in VIDEO_TEMPLATES}
+
+
+def _resolve_video_template_id(requested_id):
+    """Maps a requested or stored template id onto one we can actually render.
+    Returns None for an id we have never shipped, so the caller can reject it as a
+    genuine client bug rather than silently papering over a typo."""
+    if requested_id in _LIVE_VIDEO_TEMPLATE_IDS:
+        return requested_id
+    if requested_id in RETIRED_VIDEO_TEMPLATE_IDS:
+        return DEFAULT_VIDEO_TEMPLATE_ID
+    return None
+
 
 @app.get("/api/video-templates")
 def get_video_templates(agent=Depends(get_current_agent)):
@@ -1160,7 +1184,7 @@ def get_video_templates(agent=Depends(get_current_agent)):
 # the poll may be answered by a different worker than the one rendering.
 _video_render_tasks = set()
 
-def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, template_was_explicit: bool, photo_index: int):
+def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int):
     try:
         images = listing.get("images") or []
 
@@ -1206,7 +1230,7 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
         video_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
 
         update_payload = {"video_url": video_url, "video_status": "done", "video_error": None}
-        if template_was_explicit:
+        if persist_video_template_id:
             update_payload["video_template_id"] = chosen_video_template_id
         get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     except Exception as e:
@@ -1225,11 +1249,28 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
 
-    if video_template_id and video_template_id not in {t["id"] for t in VIDEO_TEMPLATES}:
-        raise HTTPException(status_code=400, detail="Unknown video template")
     # Same fallback precedence as generate-poster: explicit choice wins and is
     # remembered on the listing, otherwise fall back to what this listing last used.
-    chosen_video_template_id = video_template_id or listing.get("video_template_id") or "classic"
+    # Both paths go through _resolve_video_template_id so a retired template id --
+    # from an old listing row or a stale browser tab -- degrades to the default
+    # slideshow instead of failing the request.
+    stored_video_template_id = listing.get("video_template_id")
+    if video_template_id:
+        resolved = _resolve_video_template_id(video_template_id)
+        if resolved is None:
+            raise HTTPException(status_code=400, detail="Unknown video template")
+        chosen_video_template_id = resolved
+    else:
+        chosen_video_template_id = (
+            _resolve_video_template_id(stored_video_template_id) if stored_video_template_id else None
+        ) or DEFAULT_VIDEO_TEMPLATE_ID
+
+    # Write the template back when the agent picked one (existing behaviour), and also
+    # whenever the row's stored id isn't what we actually rendered -- that heals a
+    # retired id in place so the fallback fires once per listing, not on every render.
+    persist_video_template_id = bool(video_template_id) or (
+        stored_video_template_id is not None and stored_video_template_id != chosen_video_template_id
+    )
 
     images = listing.get("images") or []
     if not images:
@@ -1260,7 +1301,7 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
 
     task = asyncio.create_task(asyncio.to_thread(
         _render_video_job, listing_id, agent, listing,
-        chosen_video_template_id, bool(video_template_id), photo_index,
+        chosen_video_template_id, persist_video_template_id, photo_index,
     ))
     _video_render_tasks.add(task)
     task.add_done_callback(_video_render_tasks.discard)
@@ -2433,7 +2474,7 @@ NESTLIST_APP_HELP = """
 The agent is using NestList Prestige, a web app for real estate agents specializing in landed/GCB/ultra-luxury Singapore property. If they ask "how do I..." about the app itself (not a property question), use this reference:
 
 - New Listing: fill in property details and NestList generates the listing description with AI.
-- My Listings (Active Listings / Deleted Listings): manage listings. Expand a listing card to: enhance individual photos, download all photos as a ZIP, generate a branded poster (choose from several template styles), generate a property video (Ken Burns Slideshow or Card Overlay style), and share to Facebook/Instagram/WhatsApp/LinkedIn/TikTok -- copy the caption and post manually, or (only for agents with it connected) post directly to Facebook/Instagram from the app via My Profile.
+- My Listings (Active Listings / Deleted Listings): manage listings. Expand a listing card to: enhance individual photos, download all photos as a ZIP, generate a branded poster (choose from several template styles), generate a property video (Ken Burns Slideshow style), and share to Facebook/Instagram/WhatsApp/LinkedIn/TikTok -- copy the caption and post manually, or (only for agents with it connected) post directly to Facebook/Instagram from the app via My Profile.
 - Deleted Listings: a listing removed from Active Listings is archived here, not permanently gone -- it can be permanently deleted from this tab.
 - Enquiries: buyer enquiries submitted through public listing pages, each with an AI-generated lead score.
 - Buyer Management: buyer profiles and buyer-to-listing matching.
