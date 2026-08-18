@@ -17,9 +17,10 @@ import uuid
 import re
 import secrets
 import hashlib
+import threading
 import time
 from datetime import datetime, timedelta, date, timezone
-from PIL import Image as PILImage, ImageEnhance, ImageOps
+from PIL import Image as PILImage, ImageEnhance, ImageOps, ImageStat
 import fitz
 import poster_renderer
 import video_renderer
@@ -705,6 +706,38 @@ Write:
         "listing": saved.data[0]
     }
 
+MAX_LISTING_PHOTOS = 15  # per listing, not per request -- see _process_and_upload_images
+
+# Every photo-array change is a read-modify-write: SELECT images -> change the
+# list in Python -> UPDATE the whole array back. Two requests touching the same
+# listing at the same time therefore clobber each other (both read 14 photos,
+# both write 13, one delete silently vanishes). These per-listing locks serialise
+# those sections inside this worker.
+#
+# Honest limits: Railway runs 4 uvicorn workers, so this is NOT a distributed
+# lock. It removes the races we actually see -- an agent double-clicking, and the
+# frontend firing its split upload batches concurrently -- but two requests that
+# land on different workers can still interleave. That is acceptable now only
+# because storage filenames are no longer derived from the array length (see
+# below), so the worst a surviving race can do is drop an entry from the array
+# while the photo itself stays in storage. Recoverable, not destructive.
+#
+# The map grows by one small lock per listing touched since boot (a few KB for
+# every listing NestList has); worker restarts clear it. Not worth evicting --
+# eviction would need to drop locks other threads are about to acquire.
+_listing_image_locks = {}
+_listing_image_locks_guard = threading.Lock()
+
+
+def _listing_image_lock(listing_id: str) -> threading.Lock:
+    with _listing_image_locks_guard:
+        lock = _listing_image_locks.get(listing_id)
+        if lock is None:
+            lock = threading.Lock()
+            _listing_image_locks[listing_id] = lock
+        return lock
+
+
 def _process_and_upload_images(listing_id: str, agent_id: str, images: list, append: bool = False) -> list:
     """append=False (default): this batch becomes the listing's complete photo set,
     replacing whatever was there -- the original single-request behavior.
@@ -720,6 +753,18 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list, app
         if result.data:
             existing_urls = result.data[0].get("images") or []
     start_index = len(existing_urls)
+
+    # The 15-photo cap is a per-listing limit, not a per-request one. Before
+    # append existed one request WAS the whole set, so capping the batch meant
+    # the same thing; with append an agent could upload three batches of 15 and
+    # end up with 45 photos, which the poster/video/zip paths are not sized for.
+    room = max(0, MAX_LISTING_PHOTOS - len(existing_urls))
+    if room <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This listing already has the maximum of {MAX_LISTING_PHOTOS} photos. Remove one before adding more."
+        )
+    images = images[:room]
 
     image_urls = []
     for i, img in enumerate(images):
@@ -738,7 +783,17 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list, app
         buffer.seek(0)
         compressed = buffer.read()
 
-        filename = f"{listing_id}/{start_index + i}_{listing_id[:8]}.jpg"
+        # The trailing random token is what makes this safe. The old name was
+        # f"{start_index + i}_{listing_id[:8]}.jpg", i.e. derived purely from how
+        # many photos the array currently held -- which collides the moment a
+        # photo has been deleted. A listing that once had 15 photos and lost one
+        # has 14 entries but still has files 0..14 sitting in storage, so the
+        # next appended photo computed "14_..." and, because the upload runs with
+        # upsert, silently overwrote the agent's existing photo 14 with the new
+        # image. The listing then rendered the same photo twice and the original
+        # was gone for good. A unique name can never overwrite an existing photo,
+        # and it also defuses two concurrent appends racing on the same index.
+        filename = f"{listing_id}/{start_index + i}_{listing_id[:8]}_{uuid.uuid4().hex[:8]}.jpg"
         supabase.storage.from_("listings-images").upload(
             filename,
             compressed,
@@ -748,12 +803,52 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list, app
         url = supabase.storage.from_("listings-images").get_public_url(filename)
         image_urls.append(url)
 
-    final_urls = existing_urls + image_urls
-    supabase.table("listings").update({"images": final_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
+    if not append:
+        final_urls = image_urls
+        supabase.table("listings").update({"images": final_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
+        return final_urls
+
+    # Merge under the lock and against a FRESH read, not against the `existing_urls`
+    # snapshot taken before the uploads. Those uploads take seconds, and the
+    # frontend deliberately fires its split batches concurrently -- merging against
+    # the stale snapshot meant whichever batch finished last overwrote the other
+    # batch's photos out of the array (the files stayed in storage, orphaned).
+    with _listing_image_lock(listing_id):
+        current = supabase.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
+        current_urls = (current.data[0].get("images") or []) if current.data else []
+        final_urls = (current_urls + image_urls)[:MAX_LISTING_PHOTOS]
+        supabase.table("listings").update({"images": final_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
     return final_urls
 
 PDF_MIN_PHOTO_DIM = 400  # skip embedded logos/icons/decorative graphics smaller than this
-PDF_MAX_PHOTOS = 15  # matches the overall per-listing photo cap
+# Size alone does not separate photos from graphics: brochures use big solid-colour
+# background panels and colour bars that clear PDF_MIN_PHOTO_DIM comfortably. One
+# such panel (a 500x500 block of flat dark green) is sitting in a live listing right
+# now and renders as an empty-looking tile. Both thresholds below are deliberately
+# extreme -- a real photo scores orders of magnitude above them -- because wrongly
+# dropping one of an agent's photos is far worse than letting a graphic through,
+# which the agent can remove with one click.
+PDF_MIN_DISTINCT_COLOURS = 8    # out of 1024 sampled pixels; a flat panel scores 1
+PDF_MIN_TONAL_SPREAD = 3.0      # greyscale std-dev; a flat panel scores 0.0
+PDF_MAX_PHOTOS = MAX_LISTING_PHOTOS  # a PDF can't fill a listing past its own cap
+
+
+def _is_flat_graphic(pil_img) -> bool:
+    """True for solid-colour blocks and near-flat gradients -- brochure furniture
+    rather than photographs. Real property photos are visually busy: even a plain
+    white wall carries sensor noise, shadow gradients and edge detail. Judged on a
+    32x32 downsample, so the cost is the same whether the source is 500px or 5000px."""
+    try:
+        small = pil_img.resize((32, 32))
+        colours = small.getcolors(32 * 32)
+        if colours is not None and len(colours) <= PDF_MIN_DISTINCT_COLOURS:
+            return True
+        # A panel with a subtle gradient has many distinct "colours" but almost no
+        # tonal spread, so check that separately.
+        return ImageStat.Stat(small.convert("L")).stddev[0] < PDF_MIN_TONAL_SPREAD
+    except Exception:
+        # Never let the filter itself lose a photo -- if it cannot judge, keep it.
+        return False
 
 
 def _extract_photos_from_pdf(pdf_data_b64: str) -> list:
@@ -785,6 +880,9 @@ def _extract_photos_from_pdf(pdf_data_b64: str) -> list:
                     continue
 
                 if pil_img.width < PDF_MIN_PHOTO_DIM or pil_img.height < PDF_MIN_PHOTO_DIM:
+                    continue
+
+                if _is_flat_graphic(pil_img):
                     continue
 
                 content_hash = hashlib.sha1(extracted["image"]).hexdigest()
@@ -833,26 +931,36 @@ async def upload_listing_images(listing_id: str, request: Request, agent=Depends
         if not images:
             raise HTTPException(status_code=400, detail="No images provided")
 
-        if len(images) > 15:
-            images = images[:15]
+        if len(images) > MAX_LISTING_PHOTOS:
+            images = images[:MAX_LISTING_PHOTOS]
 
         image_urls = await asyncio.to_thread(_process_and_upload_images, listing_id, agent["id"], images, append)
 
         return {"success": True, "image_urls": image_urls}
 
+    except HTTPException:
+        # Let deliberate 4xx answers (e.g. "listing is already at 15 photos")
+        # through as themselves instead of relabelling them a 500, which would
+        # show the agent a scary server error for an ordinary limit.
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/listings/{listing_id}/images/{image_index}")
 def delete_listing_image(listing_id: str, image_index: int, agent=Depends(get_current_agent)):
-    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Listing not found")
-    images = result.data[0].get("images") or []
-    if image_index < 0 or image_index >= len(images):
-        raise HTTPException(status_code=400, detail="Invalid image index")
-    images.pop(image_index)
-    get_db().table("listings").update({"images": images}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    # Locked so two deletes on the same listing cannot each read the same array
+    # and each write back their own copy, losing one of the deletions.
+    # The storage file is deliberately left in place: an accidental delete stays
+    # recoverable, and orphans are harmless now that upload filenames are unique.
+    with _listing_image_lock(listing_id):
+        result = get_db().table("listings").select("images").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Listing not found")
+        images = result.data[0].get("images") or []
+        if image_index < 0 or image_index >= len(images):
+            raise HTTPException(status_code=400, detail="Invalid image index")
+        images.pop(image_index)
+        get_db().table("listings").update({"images": images}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return {"images": images}
 
 def _enhance_listing_image(listing_id: str, agent_id: str, image_index: int) -> str:
@@ -881,8 +989,22 @@ def _enhance_listing_image(listing_id: str, agent_id: str, image_index: int) -> 
         path, enhanced_bytes, {"content-type": "image/jpeg", "upsert": "true"}
     )
     new_url = f"{supabase.storage.from_('listings-images').get_public_url(path)}?v={uuid.uuid4().hex[:8]}"
-    images[image_index] = new_url
-    supabase.table("listings").update({"images": images}).eq("id", listing_id).eq("agent_id", agent_id).execute()
+
+    # Enhancing takes tens of seconds (fetch + Cloudinary round trip), so the
+    # `images` snapshot read at the top is stale by now. Writing that whole stale
+    # array back was wrong twice over: it wrote the enhanced URL into whatever
+    # photo now sits at image_index, and it resurrected every photo deleted while
+    # the enhance was running. Re-read under the lock and replace the photo by
+    # identity instead -- and if it has since been deleted, leave the array alone.
+    with _listing_image_lock(listing_id):
+        current = supabase.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
+        current_urls = (current.data[0].get("images") or []) if current.data else []
+        try:
+            pos = current_urls.index(url)
+        except ValueError:
+            return new_url
+        current_urls[pos] = new_url
+        supabase.table("listings").update({"images": current_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
     return new_url
 
 @app.post("/api/listings/{listing_id}/images/{image_index}/enhance")
