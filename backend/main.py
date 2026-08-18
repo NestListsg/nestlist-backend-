@@ -36,6 +36,13 @@ app = FastAPI()
 # Exception strings from Supabase/Cloudinary/Pillow leak internal paths and query
 # details, and mean nothing to a property agent staring at a failed upload.
 logger = logging.getLogger("nestlist")
+if not logger.handlers:
+    # uvicorn only configures its own loggers, so ours needs a handler or
+    # anything below WARNING is swallowed and never reaches the Railway logs.
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [nestlist] %(message)s"))
+    logger.addHandler(_log_handler)
+    logger.setLevel(logging.INFO)
 
 async def send_telegram_alert(message: str, chat_id: str = None):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -193,6 +200,8 @@ async def refresh_market_pulse_loop():
 async def startup_event():
     asyncio.create_task(monitor_api_key())
     asyncio.create_task(refresh_market_pulse_loop())
+    # Backgrounded so a slow database can't hold up the port binding.
+    asyncio.create_task(asyncio.to_thread(_probe_images_cas_encoding))
     await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
     await register_telegram_webhook()
 
@@ -819,6 +828,47 @@ def _cas_update_images(supabase, listing_id, agent_id, previous, new_images):
     logger.error(
         "listings.images will not take a compare-and-swap filter (%s) -- "
         "falling back to a plain update for this write",
+        " | ".join(failures),
+    )
+    return None
+
+
+def _probe_images_cas_encoding():
+    """Work out at boot which literal PostgREST accepts for listings.images, by
+    running the same filter against a SELECT that cannot match any row. Nothing
+    is read and nothing is written: the wrong encoding is rejected outright,
+    which is the signal we want, and the right one simply returns no rows.
+
+    Purely an early-warning convenience -- the first real photo change would
+    work it out anyway. Doing it at startup puts the answer in the deploy logs
+    and behind /api/health, so a broken compare-and-swap is visible before an
+    agent hits it rather than after."""
+    global _IMAGES_CAS_ENCODING
+    if _IMAGES_CAS_ENCODING:
+        return _IMAGES_CAS_ENCODING
+
+    supabase = get_db()
+    failures = []
+    for candidate in ("json", "array"):
+        try:
+            (
+                supabase.table("listings")
+                .select("id")
+                .eq("id", "00000000-0000-0000-0000-000000000000")
+                .filter("images", "eq", _encode_images_filter(["__probe__"], candidate))
+                .execute()
+            )
+        except Exception as exc:
+            failures.append(f"{candidate}: {exc}")
+            continue
+        with _IMAGES_CAS_ENCODING_GUARD:
+            _IMAGES_CAS_ENCODING = candidate
+        logger.info("listings.images compare-and-swap encoding: %r -- photo writes are atomic", candidate)
+        return candidate
+
+    logger.error(
+        "Could not determine a compare-and-swap encoding for listings.images (%s). "
+        "Photo writes will fall back to non-atomic updates.",
         " | ".join(failures),
     )
     return None
@@ -2242,7 +2292,15 @@ def linkedin_oauth_callback(req: LinkedInOAuthCallbackRequest):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "NestList Prestige API"}
+    # photo_writes_atomic false means the compare-and-swap guard is not active
+    # on this worker and concurrent photo changes can clobber each other -- the
+    # rollout gate should check this. Deliberately a plain boolean: it says
+    # whether the guard works, not anything about the schema.
+    return {
+        "status": "ok",
+        "service": "NestList Prestige API",
+        "photo_writes_atomic": bool(_IMAGES_CAS_ENCODING),
+    }
 
 @app.get("/api/telegram/debug-webhook")
 async def debug_telegram_webhook():
