@@ -1,13 +1,16 @@
-fastapi
-uvicorn
-supabase
-bcrypt
-pyjwt
-anthropic
-requests
-python-multipart
-pydantic
-httpx
-Pillow
-httpx
-pymupdf
+# Pinned so a surprise upstream release cannot change what Railway builds.
+# Lower bound = the version currently running in production; upper bound = the
+# next breaking release (for 0.x packages that is the next minor, per semver
+# convention). Bump these deliberately, not by accident.
+fastapi>=0.141.1,<0.142.0
+uvicorn>=0.52.3,<0.53.0
+supabase>=2.31.0,<3.0.0
+bcrypt>=5.0.0,<6.0.0
+pyjwt>=2.13.0,<3.0.0
+anthropic>=0.122.0,<0.123.0
+requests>=2.34.2,<3.0.0
+python-multipart>=0.0.32,<0.0.33
+pydantic>=2.13.4,<3.0.0
+httpx>=0.28.1,<0.29.0
+Pillow>=12.3.0,<13.0.0
+pymupdf>=1.28.2,<2.0.0

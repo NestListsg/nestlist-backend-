@@ -19,6 +19,8 @@ import secrets
 import hashlib
 import threading
 import time
+import random
+import logging
 from datetime import datetime, timedelta, date, timezone
 from PIL import Image as PILImage, ImageEnhance, ImageOps, ImageStat
 import fitz
@@ -29,6 +31,11 @@ import autoenhance
 import cloudinary_enhance
 
 app = FastAPI()
+
+# Real error text goes to the Railway logs; agents get a plain-English sentence.
+# Exception strings from Supabase/Cloudinary/Pillow leak internal paths and query
+# details, and mean nothing to a property agent staring at a failed upload.
+logger = logging.getLogger("nestlist")
 
 async def send_telegram_alert(message: str, chat_id: str = None):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -710,17 +717,16 @@ MAX_LISTING_PHOTOS = 15  # per listing, not per request -- see _process_and_uplo
 
 # Every photo-array change is a read-modify-write: SELECT images -> change the
 # list in Python -> UPDATE the whole array back. Two requests touching the same
-# listing at the same time therefore clobber each other (both read 14 photos,
-# both write 13, one delete silently vanishes). These per-listing locks serialise
-# those sections inside this worker.
+# listing at the same time clobber each other (both read 14 photos, both write
+# 13, one delete silently vanishes -- or worse, a slow enhance writes back a
+# snapshot that resurrects a photo the agent deleted while it was running).
 #
-# Honest limits: Railway runs 4 uvicorn workers, so this is NOT a distributed
-# lock. It removes the races we actually see -- an agent double-clicking, and the
-# frontend firing its split upload batches concurrently -- but two requests that
-# land on different workers can still interleave. That is acceptable now only
-# because storage filenames are no longer derived from the array length (see
-# below), so the worst a surviving race can do is drop an entry from the array
-# while the photo itself stays in storage. Recoverable, not destructive.
+# These per-listing locks serialise those sections inside ONE worker. Railway
+# runs 4 uvicorn workers, so they are not a distributed lock and never were
+# enough on their own. They are kept only because they are free and stop
+# same-worker traffic (an agent double-clicking Delete) from burning retries.
+#
+# The actual guard is the compare-and-swap below.
 #
 # The map grows by one small lock per listing touched since boot (a few KB for
 # every listing NestList has); worker restarts clear it. Not worth evicting --
@@ -738,35 +744,284 @@ def _listing_image_lock(listing_id: str) -> threading.Lock:
         return lock
 
 
-def _process_and_upload_images(listing_id: str, agent_id: str, images: list, append: bool = False) -> list:
-    """append=False (default): this batch becomes the listing's complete photo set,
-    replacing whatever was there -- the original single-request behavior.
-    append=True: this batch is added AFTER the listing's existing photos. Exists so
-    the frontend can upload photos in several small requests instead of one giant
-    one -- the production edge proxy kills request bodies over ~10MB mid-stream
-    (browser sees 'Failed to fetch'), which real phone photos hit easily."""
+# ---------------------------------------------------------------------------
+# Atomic photo-array updates (compare-and-swap)
+# ---------------------------------------------------------------------------
+# The UPDATE carries the array we just read as an extra WHERE filter, so it only
+# lands if nobody changed the array in between. Zero rows back means we lost the
+# race: re-read, re-apply the change to the fresh array, try again. That makes
+# the read-modify-write atomic across all 4 workers without a Postgres function
+# or a version column, either of which would need a migration Jane has to run by
+# hand in the Supabase SQL editor.
+_IMAGES_CAS_MAX_ATTEMPTS = 6
+_IMAGES_CAS_BASE_BACKOFF = 0.05  # seconds; doubles each retry, capped, plus jitter
+_IMAGES_CAS_MAX_BACKOFF = 0.5
+
+# PostgREST wants the previous array spelled the way the column's type expects,
+# and we cannot see the schema from inside the app: a jsonb column wants
+# ["a","b"], a text[] column wants {"a","b"}. Passing the wrong one is *rejected*
+# ("malformed array literal" / "invalid input syntax for type json") rather than
+# silently matching nothing, so we try both once and remember which one the table
+# accepts. Only a success is cached -- a transient network blip must not pin us
+# to the wrong answer for the life of the worker.
+_IMAGES_CAS_ENCODING = None
+_IMAGES_CAS_ENCODING_GUARD = threading.Lock()
+
+
+def _encode_images_filter(previous: list, encoding: str) -> str:
+    if encoding == "json":
+        return json.dumps(list(previous), separators=(",", ":"))
+    escaped = []
+    for url in previous:
+        text = str(url).replace("\\", "\\\\").replace('"', '\\"')
+        escaped.append(f'"{text}"')
+    return "{" + ",".join(escaped) + "}"
+
+
+def _try_images_cas(supabase, listing_id, agent_id, previous, new_images, encoding) -> bool:
+    """One compare-and-swap attempt with one encoding. True if the row was
+    updated, False if the array had already moved on. Raises if PostgREST
+    rejects the filter (wrong encoding) or the database is unreachable."""
+    resp = (
+        supabase.table("listings")
+        .update({"images": new_images})
+        .eq("id", listing_id)
+        .eq("agent_id", agent_id)
+        .filter("images", "eq", _encode_images_filter(previous, encoding))
+        .execute()
+    )
+    return bool(resp.data)
+
+
+def _cas_update_images(supabase, listing_id, agent_id, previous, new_images):
+    """True = applied, False = someone else got there first, None = this table
+    will not accept a compare-and-swap filter at all (caller falls back)."""
+    global _IMAGES_CAS_ENCODING
+
+    encoding = _IMAGES_CAS_ENCODING
+    if encoding:
+        # Known-good encoding: let real database errors propagate to the caller
+        # instead of mistaking them for an encoding problem.
+        return _try_images_cas(supabase, listing_id, agent_id, previous, new_images, encoding)
+
+    failures = []
+    for candidate in ("json", "array"):
+        try:
+            applied = _try_images_cas(supabase, listing_id, agent_id, previous, new_images, candidate)
+        except Exception as exc:
+            failures.append(f"{candidate}: {exc}")
+            continue
+        with _IMAGES_CAS_ENCODING_GUARD:
+            _IMAGES_CAS_ENCODING = candidate
+        logger.info("listings.images compare-and-swap using %r encoding", candidate)
+        return applied
+
+    logger.error(
+        "listings.images will not take a compare-and-swap filter (%s) -- "
+        "falling back to a plain update for this write",
+        " | ".join(failures),
+    )
+    return None
+
+
+def _mutate_listing_images(listing_id: str, agent_id: str, mutate) -> list:
+    """Read the listing's photo array, hand it to `mutate`, and write the result
+    back only if nothing else changed it in the meantime -- retrying against a
+    fresh read each time.
+
+    `mutate(current, ctx)` returns the new array, or None to leave the array
+    alone. `ctx["attempt"]` is the 0-based attempt number, which mutators use to
+    tell "this photo was never there" (attempt 0) from "this photo is gone
+    because our own write probably landed" (later attempts). Raising from
+    `mutate` aborts without writing anything.
+
+    Mutators must be idempotent: an UPDATE can succeed and still report no rows
+    if the response is lost, and we would then re-apply the change to an array
+    that already contains it.
+    """
+    supabase = get_db()
+    delay = _IMAGES_CAS_BASE_BACKOFF
+
+    with _listing_image_lock(listing_id):
+        for attempt in range(_IMAGES_CAS_MAX_ATTEMPTS):
+            result = (
+                supabase.table("listings")
+                .select("images")
+                .eq("id", listing_id)
+                .eq("agent_id", agent_id)
+                .execute()
+            )
+            if not result.data:
+                raise HTTPException(status_code=404, detail="Listing not found")
+
+            previous = result.data[0].get("images") or []
+            new_images = mutate(list(previous), {"attempt": attempt})
+            if new_images is None:
+                return list(previous)
+
+            applied = _cas_update_images(supabase, listing_id, agent_id, previous, new_images)
+            if applied:
+                return new_images
+            if applied is None:
+                # No compare-and-swap available: do what the code did before
+                # (plain update, in-process lock only) rather than refusing to
+                # save the agent's change at all. Logged loudly above.
+                (
+                    supabase.table("listings")
+                    .update({"images": new_images})
+                    .eq("id", listing_id)
+                    .eq("agent_id", agent_id)
+                    .execute()
+                )
+                return new_images
+
+            time.sleep(delay + random.uniform(0, delay))
+            delay = min(delay * 2, _IMAGES_CAS_MAX_BACKOFF)
+
+    logger.warning(
+        "Gave up after %s compare-and-swap attempts on listing %s",
+        _IMAGES_CAS_MAX_ATTEMPTS, listing_id,
+    )
+    raise HTTPException(
+        status_code=503,
+        detail="Couldn't save that photo change because the listing was being updated at the same time -- please try again.",
+    )
+
+
+def _locate_image(images: list, url: str, preferred_index=None):
+    """Position of `url` in `images`, or None. Prefers `preferred_index` when
+    that slot still holds the same URL: rows written by the old filename
+    collision bug can hold the same URL twice, and list.index() always returns
+    the first one, so an index-addressed request could hit the wrong copy."""
+    if preferred_index is not None and 0 <= preferred_index < len(images):
+        if images[preferred_index] == url:
+            return preferred_index
+    for i, existing in enumerate(images):
+        if existing == url:
+            return i
+    return None
+
+
+# --- Multi-batch upload sessions -------------------------------------------
+# A big upload arrives as several requests because the production edge proxy
+# kills request bodies over ~10MB mid-stream. Committing each batch straight
+# into `images` makes the whole upload non-atomic: if batch 3 of 4 fails the
+# agent is left with a half-built listing and no rollback, and a retry that
+# starts again with a replace batch wipes what did land.
+#
+# With an upload_session the batches only *stage* their URLs and the photo array
+# is written exactly once, when the client sends finalize. Staging lives in the
+# storage bucket (no migration needed): one small JSON manifest per batch, named
+# after the batch number, under {listing_id}/_upload-sessions/{session}/.
+#
+# One file per batch, never a shared file, so batches never read-modify-write
+# each other -- and a retried batch simply overwrites its own manifest instead
+# of duplicating its photos.
+_UPLOAD_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_UPLOAD_STAGING_DIR = "_upload-sessions"
+
+
+def _staging_dir(listing_id: str, session_id: str) -> str:
+    return f"{listing_id}/{_UPLOAD_STAGING_DIR}/{session_id}"
+
+
+_STAGING_UNAVAILABLE = "Couldn't gather the photos you just uploaded -- please try uploading them again"
+
+
+def _read_staged_urls(supabase, listing_id: str, session_id: str, strict: bool):
+    """(urls staged so far by this session in batch order, number of batch
+    manifests found). `strict` is for the finalize step, where quietly losing a
+    manifest would quietly lose an agent's photos -- better to fail and let them
+    retry than to commit a partial set."""
+    directory = _staging_dir(listing_id, session_id)
+    try:
+        entries = supabase.storage.from_("listings-images").list(directory)
+    except Exception:
+        logger.exception("Could not list upload session %s", directory)
+        if strict:
+            raise HTTPException(status_code=503, detail=_STAGING_UNAVAILABLE)
+        return [], 0
+
+    urls = []
+    found = 0
+    for entry in sorted(entries or [], key=lambda e: e.get("name") or ""):
+        name = entry.get("name") or ""
+        if not name.endswith(".json"):
+            continue
+        found += 1
+        try:
+            raw = supabase.storage.from_("listings-images").download(f"{directory}/{name}")
+            urls.extend(json.loads(raw.decode("utf-8")))
+        except Exception:
+            logger.exception("Could not read upload manifest %s/%s", directory, name)
+            if strict:
+                raise HTTPException(status_code=503, detail=_STAGING_UNAVAILABLE)
+    return urls, found
+
+
+def _clear_staging(supabase, listing_id: str, session_id: str):
+    """Best effort. Only the small JSON manifests are removed -- never a photo."""
+    directory = _staging_dir(listing_id, session_id)
+    try:
+        entries = supabase.storage.from_("listings-images").list(directory)
+        paths = [f"{directory}/{e['name']}" for e in (entries or []) if e.get("name")]
+        if paths:
+            supabase.storage.from_("listings-images").remove(paths)
+    except Exception:
+        logger.exception("Could not clear upload session %s", directory)
+
+
+def _dedupe_urls(urls: list) -> list:
+    seen = set()
+    out = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def _process_and_upload_images(listing_id: str, agent_id: str, images: list, append: bool = False,
+                               upload_session: str = None, batch_index: int = 0,
+                               finalize: bool = True) -> dict:
+    """append=False (default): this upload becomes the listing's complete photo
+    set, replacing whatever was there -- the original single-request behavior.
+    append=True: these photos are added AFTER the listing's existing ones.
+
+    upload_session/finalize are optional and additive. Without a session every
+    request commits on its own, exactly as before. With one, batches stage and
+    only the finalize call touches the listing.
+    """
     supabase = get_db()
 
-    existing_urls = []
-    if append:
-        result = supabase.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
-        if result.data:
-            existing_urls = result.data[0].get("images") or []
-    start_index = len(existing_urls)
+    # Check ownership before spending 30 seconds on uploads. The old replace path
+    # skipped this and just updated zero rows, so a wrong listing id looked like
+    # a successful upload that vanished.
+    owner = supabase.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
+    if not owner.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    existing_urls = (owner.data[0].get("images") or []) if append else []
+    staged_urls = _read_staged_urls(supabase, listing_id, upload_session, strict=False)[0] if upload_session else []
 
     # The 15-photo cap is a per-listing limit, not a per-request one. Before
     # append existed one request WAS the whole set, so capping the batch meant
     # the same thing; with append an agent could upload three batches of 15 and
     # end up with 45 photos, which the poster/video/zip paths are not sized for.
-    room = max(0, MAX_LISTING_PHOTOS - len(existing_urls))
-    if room <= 0:
+    room = max(0, MAX_LISTING_PHOTOS - len(existing_urls) - len(staged_urls))
+    if room <= 0 and not (upload_session and staged_urls):
         raise HTTPException(
             status_code=400,
             detail=f"This listing already has the maximum of {MAX_LISTING_PHOTOS} photos. Remove one before adding more."
         )
+    # A session whose earlier batches already filled the cap must still be able
+    # to finalize. Erroring here instead would strand every photo the agent had
+    # uploaded so far, which is the exact failure this rewrite exists to remove.
+    capped = len(images) > room
     images = images[:room]
+    start_index = len(existing_urls) + len(staged_urls)
 
-    image_urls = []
+    batch_urls = []
     for i, img in enumerate(images):
         image_data = img.get("image_data")
         img_bytes = base64.b64decode(image_data)
@@ -801,24 +1056,66 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list, app
         )
 
         url = supabase.storage.from_("listings-images").get_public_url(filename)
-        image_urls.append(url)
+        batch_urls.append(url)
 
-    if not append:
-        final_urls = image_urls
-        supabase.table("listings").update({"images": final_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
-        return final_urls
+    if upload_session:
+        try:
+            supabase.storage.from_("listings-images").upload(
+                f"{_staging_dir(listing_id, upload_session)}/{batch_index:04d}.json",
+                json.dumps(batch_urls).encode("utf-8"),
+                {"content-type": "application/json", "upsert": "true"},
+            )
+        except Exception:
+            logger.exception("Could not stage upload batch %s for listing %s", batch_index, listing_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Couldn't save this batch of photos -- please try again",
+            )
 
-    # Merge under the lock and against a FRESH read, not against the `existing_urls`
-    # snapshot taken before the uploads. Those uploads take seconds, and the
-    # frontend deliberately fires its split batches concurrently -- merging against
-    # the stale snapshot meant whichever batch finished last overwrote the other
-    # batch's photos out of the array (the files stayed in storage, orphaned).
-    with _listing_image_lock(listing_id):
-        current = supabase.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
-        current_urls = (current.data[0].get("images") or []) if current.data else []
-        final_urls = (current_urls + image_urls)[:MAX_LISTING_PHOTOS]
-        supabase.table("listings").update({"images": final_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
-    return final_urls
+        if not finalize:
+            pending = _dedupe_urls(staged_urls + batch_urls)
+            return {"success": True, "image_urls": pending, "committed": False,
+                    "staged_count": len(pending), "capped": capped}
+
+        # Re-read so batches that landed on other workers are included. Our own
+        # batch is appended too, in case the storage listing hasn't caught up
+        # yet -- _dedupe_urls keeps it from being counted twice.
+        session_urls, found = _read_staged_urls(supabase, listing_id, upload_session, strict=True)
+        all_urls = _dedupe_urls(session_urls + batch_urls)
+
+        # batch_index is 0-based and contiguous, so finalizing batch N means N+1
+        # manifests should exist. Fewer means the listing hasn't caught up (or a
+        # batch never landed) and committing now would quietly drop photos --
+        # worst of all on a replace, which would delete what did land. Refuse
+        # instead: the agent retries and nothing is lost.
+        if found < batch_index + 1:
+            logger.warning(
+                "Upload session %s/%s finalized with %s of %s batches staged",
+                listing_id, upload_session, found, batch_index + 1,
+            )
+            raise HTTPException(status_code=503, detail=_STAGING_UNAVAILABLE)
+    else:
+        all_urls = batch_urls
+
+    def mutate(current, ctx):
+        if append:
+            merged = list(current)
+            for url in all_urls:
+                if url not in merged:
+                    merged.append(url)
+            merged = merged[:MAX_LISTING_PHOTOS]
+            return None if merged == current else merged
+        # Replace: this upload becomes the listing's complete photo set.
+        replacement = all_urls[:MAX_LISTING_PHOTOS]
+        return None if replacement == current else replacement
+
+    final_urls = _mutate_listing_images(listing_id, agent_id, mutate)
+
+    if upload_session:
+        _clear_staging(supabase, listing_id, upload_session)
+
+    return {"success": True, "image_urls": final_urls, "committed": True,
+            "staged_count": 0, "capped": capped}
 
 PDF_MIN_PHOTO_DIM = 400  # skip embedded logos/icons/decorative graphics smaller than this
 # Size alone does not separate photos from graphics: brochures use big solid-colour
@@ -829,34 +1126,38 @@ PDF_MIN_PHOTO_DIM = 400  # skip embedded logos/icons/decorative graphics smaller
 # dropping one of an agent's photos is far worse than letting a graphic through,
 # which the agent can remove with one click.
 PDF_MIN_DISTINCT_COLOURS = 8    # out of 1024 sampled pixels; a flat panel scores 1
-PDF_MIN_TONAL_SPREAD = 3.0      # greyscale std-dev; a flat panel scores 0.0
 PDF_MAX_PHOTOS = MAX_LISTING_PHOTOS  # a PDF can't fill a listing past its own cap
 
 
 def _is_flat_graphic(pil_img) -> bool:
-    """True for solid-colour blocks and near-flat gradients -- brochure furniture
-    rather than photographs. Real property photos are visually busy: even a plain
-    white wall carries sensor noise, shadow gradients and edge detail. Judged on a
-    32x32 downsample, so the cost is the same whether the source is 500px or 5000px."""
+    """True for solid-colour blocks -- brochure furniture rather than
+    photographs. Judged purely on how many distinct colours survive a 32x32
+    downsample, so the cost is the same whether the source is 500px or 5000px:
+    the flat dark-green panel sitting in a live listing scores 1, a real photo
+    scores hundreds.
+
+    A greyscale std-dev test used to run alongside this (drop anything under
+    3.0) and has been removed: measured against real listing photos it flagged a
+    plain white wall (0.54), a night shot (0.50) and an overcast exterior (1.70)
+    as graphics. Dropping one of an agent's photos is far worse than letting a
+    graphic through, which the agent removes with one click."""
     try:
         small = pil_img.resize((32, 32))
         colours = small.getcolors(32 * 32)
-        if colours is not None and len(colours) <= PDF_MIN_DISTINCT_COLOURS:
-            return True
-        # A panel with a subtle gradient has many distinct "colours" but almost no
-        # tonal spread, so check that separately.
-        return ImageStat.Stat(small.convert("L")).stddev[0] < PDF_MIN_TONAL_SPREAD
+        return colours is not None and len(colours) <= PDF_MIN_DISTINCT_COLOURS
     except Exception:
         # Never let the filter itself lose a photo -- if it cannot judge, keep it.
         return False
 
 
-def _extract_photos_from_pdf(pdf_data_b64: str) -> list:
+def _extract_photos_from_pdf(pdf_data_b64: str) -> dict:
     """Pulls every embedded raster image out of a PDF (e.g. a marketing brochure),
     skipping small non-photo graphics (logos, icons, decorative lines) and exact
-    duplicates (a letterhead logo repeated on every page). Returns a list of
-    {"image_data": <base64 jpeg>} dicts, ready to hand to _process_and_upload_images
-    -- this function only extracts and re-encodes, it doesn't touch storage or the DB.
+    duplicates (a letterhead logo repeated on every page). Returns
+    {"images": [{"image_data": <base64 jpeg>}, ...], "skipped_graphics": n,
+    "skipped_duplicates": n} -- the counts let the UI say "N graphics filtered"
+    so an agent who expected 12 photos and got 9 can see why. This function only
+    extracts and re-encodes, it doesn't touch storage or the DB.
     """
     pdf_bytes = base64.b64decode(pdf_data_b64)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -864,10 +1165,17 @@ def _extract_photos_from_pdf(pdf_data_b64: str) -> list:
     results = []
     seen_xrefs = set()
     seen_hashes = set()
+    skipped_graphics = 0
+    skipped_duplicates = 0
 
     try:
         for page in doc:
+            if len(results) >= PDF_MAX_PHOTOS:
+                break
             for img in page.get_images(full=True):
+                if len(results) >= PDF_MAX_PHOTOS:
+                    break
+
                 xref = img[0]
                 if xref in seen_xrefs:
                     continue
@@ -880,13 +1188,16 @@ def _extract_photos_from_pdf(pdf_data_b64: str) -> list:
                     continue
 
                 if pil_img.width < PDF_MIN_PHOTO_DIM or pil_img.height < PDF_MIN_PHOTO_DIM:
+                    skipped_graphics += 1
                     continue
 
                 if _is_flat_graphic(pil_img):
+                    skipped_graphics += 1
                     continue
 
                 content_hash = hashlib.sha1(extracted["image"]).hexdigest()
                 if content_hash in seen_hashes:
+                    skipped_duplicates += 1
                     continue
                 seen_hashes.add(content_hash)
 
@@ -894,13 +1205,14 @@ def _extract_photos_from_pdf(pdf_data_b64: str) -> list:
                 buffer = io.BytesIO()
                 pil_img.save(buffer, format="JPEG", quality=85)
                 results.append({"image_data": base64.b64encode(buffer.getvalue()).decode("ascii")})
-
-                if len(results) >= PDF_MAX_PHOTOS:
-                    return results
     finally:
         doc.close()
 
-    return results
+    return {
+        "images": results,
+        "skipped_graphics": skipped_graphics,
+        "skipped_duplicates": skipped_duplicates,
+    }
 
 
 @app.post("/api/listings/extract-pdf-photos")
@@ -911,14 +1223,21 @@ async def extract_pdf_photos(request: Request, agent=Depends(get_current_agent))
         raise HTTPException(status_code=400, detail="No PDF provided")
 
     try:
-        images = await asyncio.to_thread(_extract_photos_from_pdf, pdf_data)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read this PDF: {e}")
+        extracted = await asyncio.to_thread(_extract_photos_from_pdf, pdf_data)
+    except Exception:
+        logger.exception("PDF photo extraction failed")
+        raise HTTPException(status_code=400, detail="Could not read this PDF -- please try a different file")
 
-    if not images:
+    if not extracted["images"]:
         raise HTTPException(status_code=400, detail="No photos found in this PDF")
 
-    return {"images": images}
+    # "images" is unchanged for the deployed frontend; the counts are additive.
+    return {
+        "images": extracted["images"],
+        "skipped": extracted["skipped_graphics"],
+        "skipped_graphics": extracted["skipped_graphics"],
+        "skipped_duplicates": extracted["skipped_duplicates"],
+    }
 
 
 @app.post("/api/listings/{listing_id}/upload-images")
@@ -928,88 +1247,203 @@ async def upload_listing_images(listing_id: str, request: Request, agent=Depends
         images = body.get("images", [])
         append = bool(body.get("append", False))
 
+        # Additive: without upload_session this behaves exactly as before, one
+        # commit per request. With it, batches stage and only finalize commits.
+        upload_session = body.get("upload_session") or None
+        batch_index = body.get("batch_index", 0)
+        finalize = bool(body.get("finalize", True)) if upload_session else True
+
         if not images:
             raise HTTPException(status_code=400, detail="No images provided")
+
+        if upload_session and not _UPLOAD_SESSION_RE.match(str(upload_session)):
+            raise HTTPException(status_code=400, detail="Invalid upload session id")
+
+        try:
+            batch_index = int(batch_index)
+        except (TypeError, ValueError):
+            batch_index = 0
+        if batch_index < 0 or batch_index > 999:
+            raise HTTPException(status_code=400, detail="Invalid batch number")
 
         if len(images) > MAX_LISTING_PHOTOS:
             images = images[:MAX_LISTING_PHOTOS]
 
-        image_urls = await asyncio.to_thread(_process_and_upload_images, listing_id, agent["id"], images, append)
-
-        return {"success": True, "image_urls": image_urls}
+        return await asyncio.to_thread(
+            _process_and_upload_images,
+            listing_id, agent["id"], images, append,
+            upload_session, batch_index, finalize,
+        )
 
     except HTTPException:
         # Let deliberate 4xx answers (e.g. "listing is already at 15 photos")
         # through as themselves instead of relabelling them a 500, which would
         # show the agent a scary server error for an ordinary limit.
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Photo upload failed for listing %s", listing_id)
+        raise HTTPException(status_code=500, detail="Something went wrong uploading these photos -- please try again")
+
+def _delete_listing_image(listing_id: str, agent_id: str, image_index, image_url) -> list:
+    """The storage file is deliberately left in place: an accidental delete stays
+    recoverable, and orphans are harmless now that upload filenames are unique."""
+    target = {"url": image_url}
+
+    def mutate(current, ctx):
+        if target["url"] is None:
+            # Index-addressed (older frontend). Resolve to a URL on the first
+            # read so a compare-and-swap retry can never land on a different
+            # photo than the one the agent clicked.
+            if image_index is None or image_index < 0 or image_index >= len(current):
+                raise HTTPException(status_code=400, detail="Invalid image index")
+            target["url"] = current[image_index]
+
+        pos = _locate_image(current, target["url"], image_index)
+        if pos is None:
+            if ctx["attempt"] > 0:
+                # Our own earlier attempt almost certainly landed (or another
+                # request removed the same photo). Either way the agent's intent
+                # is satisfied -- don't show them an error for a done deed.
+                return None
+            raise HTTPException(status_code=404, detail="That photo has already been removed")
+        return current[:pos] + current[pos + 1:]
+
+    return _mutate_listing_images(listing_id, agent_id, mutate)
+
 
 @app.delete("/api/listings/{listing_id}/images/{image_index}")
-def delete_listing_image(listing_id: str, image_index: int, agent=Depends(get_current_agent)):
-    # Locked so two deletes on the same listing cannot each read the same array
-    # and each write back their own copy, losing one of the deletions.
-    # The storage file is deliberately left in place: an accidental delete stays
-    # recoverable, and orphans are harmless now that upload filenames are unique.
-    with _listing_image_lock(listing_id):
-        result = get_db().table("listings").select("images").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
-        if not result.data:
-            raise HTTPException(status_code=404, detail="Listing not found")
-        images = result.data[0].get("images") or []
-        if image_index < 0 or image_index >= len(images):
-            raise HTTPException(status_code=400, detail="Invalid image index")
-        images.pop(image_index)
-        get_db().table("listings").update({"images": images}).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
-    return {"images": images}
+def delete_listing_image(listing_id: str, image_index: int, image_url: str = None, agent=Depends(get_current_agent)):
+    # image_url is optional and additive. Positional indices alone are unsafe:
+    # a client whose copy of the array is stale (a batch finished, or another
+    # tab deleted something) deletes whatever photo now sits at that position.
+    # When the URL is supplied the server matches on it and the index is only a
+    # hint for picking between duplicate entries.
+    return {"images": _delete_listing_image(listing_id, agent["id"], image_index, image_url)}
 
-def _enhance_listing_image(listing_id: str, agent_id: str, image_index: int) -> str:
-    result = get_db().table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
+
+@app.delete("/api/listings/{listing_id}/images")
+def delete_listing_image_by_url(listing_id: str, image_url: str, agent=Depends(get_current_agent)):
+    """Index-free form of the delete above -- preferred for new frontend code."""
+    return {"images": _delete_listing_image(listing_id, agent["id"], None, image_url)}
+
+
+# Enhancing is slow (fetch + Cloudinary round trip) and not idempotent in the way
+# that matters: enhancing an already-enhanced photo visibly over-processes it.
+# This set stops a double-click re-entering while the first pass is in flight.
+# It is per-worker and therefore best effort -- the compare-and-swap on the array
+# is what actually keeps the outcome correct across Railway's 4 workers.
+_enhancing_urls = set()
+_enhancing_guard = threading.Lock()
+
+# Filename marker on the enhanced copy -- doubles as the "already enhanced" flag,
+# so no extra column is needed to remember it.
+_ENHANCED_MARKER = "enhanced_"
+
+
+def _begin_enhance(url: str) -> bool:
+    with _enhancing_guard:
+        if url in _enhancing_urls:
+            return False
+        _enhancing_urls.add(url)
+        return True
+
+
+def _end_enhance(url: str):
+    with _enhancing_guard:
+        _enhancing_urls.discard(url)
+
+
+def _enhance_listing_image(listing_id: str, agent_id: str, image_index, image_url) -> str:
+    supabase = get_db()
+    result = supabase.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     images = result.data[0].get("images") or []
-    if image_index < 0 or image_index >= len(images):
-        raise HTTPException(status_code=400, detail="Invalid image index")
 
-    url = images[image_index]
-    fetch_resp = requests.get(url, timeout=30)
-    if fetch_resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Could not fetch this photo to enhance it")
+    if image_url:
+        pos = _locate_image(images, image_url, image_index)
+        if pos is None:
+            raise HTTPException(
+                status_code=404,
+                detail="That photo is no longer on this listing -- refresh the page and try again",
+            )
+        url = image_url
+    else:
+        if image_index is None or image_index < 0 or image_index >= len(images):
+            raise HTTPException(status_code=400, detail="Invalid image index")
+        pos = image_index
+        url = images[pos]
 
-    enhanced_bytes = cloudinary_enhance.enhance_image(fetch_resp.content)
-    if not enhanced_bytes:
-        raise HTTPException(status_code=503, detail="Enhancement isn't available right now -- please try again shortly")
+    # Enhancing an enhanced photo stacks the processing and looks visibly worse
+    # (the same reason upload-time auto-enhance was removed). Because the
+    # enhanced copy lands under its own name we can just recognise it and stop.
+    # Photos enhanced by the old in-place code aren't marked, so they can still
+    # be re-enhanced -- same as today, no regression.
+    if _ENHANCED_MARKER in url.rsplit("/", 1)[-1]:
+        raise HTTPException(status_code=409, detail="This photo has already been enhanced")
 
-    # listings-images/<listing_id>/<i>_<listing_id[:8]>.jpg -- overwrite the
-    # same storage path so the photo's URL (and its position in `images`)
-    # never changes, only the pixels do.
-    path = url.split("/listings-images/")[-1].split("?")[0]
-    supabase = get_db()
-    supabase.storage.from_("listings-images").upload(
-        path, enhanced_bytes, {"content-type": "image/jpeg", "upsert": "true"}
-    )
-    new_url = f"{supabase.storage.from_('listings-images').get_public_url(path)}?v={uuid.uuid4().hex[:8]}"
+    if not _begin_enhance(url):
+        raise HTTPException(status_code=409, detail="This photo is already being enhanced -- give it a moment")
 
-    # Enhancing takes tens of seconds (fetch + Cloudinary round trip), so the
-    # `images` snapshot read at the top is stale by now. Writing that whole stale
-    # array back was wrong twice over: it wrote the enhanced URL into whatever
-    # photo now sits at image_index, and it resurrected every photo deleted while
-    # the enhance was running. Re-read under the lock and replace the photo by
-    # identity instead -- and if it has since been deleted, leave the array alone.
-    with _listing_image_lock(listing_id):
-        current = supabase.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
-        current_urls = (current.data[0].get("images") or []) if current.data else []
-        try:
-            pos = current_urls.index(url)
-        except ValueError:
-            return new_url
-        current_urls[pos] = new_url
-        supabase.table("listings").update({"images": current_urls}).eq("id", listing_id).eq("agent_id", agent_id).execute()
-    return new_url
+    try:
+        fetch_resp = requests.get(url, timeout=30)
+        if fetch_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Could not fetch this photo to enhance it")
+
+        enhanced_bytes = cloudinary_enhance.enhance_image(fetch_resp.content)
+        if not enhanced_bytes:
+            raise HTTPException(status_code=503, detail="Enhancement isn't available right now -- please try again shortly")
+
+        # Write the enhanced photo to a NEW file. The old code upserted it onto
+        # the original's storage path, which destroyed the untouched original
+        # (nothing to fall back to if the agent dislikes the result) and let a
+        # second enhance read back the already-enhanced pixels and process them
+        # again. A fresh name makes the operation non-destructive and means the
+        # URL itself tells us whether a photo has been swapped yet.
+        filename = f"{listing_id}/enhanced_{listing_id[:8]}_{uuid.uuid4().hex[:8]}.jpg"
+        supabase.storage.from_("listings-images").upload(
+            filename, enhanced_bytes, {"content-type": "image/jpeg", "upsert": "true"}
+        )
+        new_url = supabase.storage.from_("listings-images").get_public_url(filename)
+
+        gone = {"value": False}
+
+        def mutate(current, ctx):
+            if new_url in current:
+                return None  # already swapped in (our write landed, response lost)
+            slot = _locate_image(current, url, pos)
+            if slot is None:
+                gone["value"] = True
+                return None
+            updated = list(current)
+            updated[slot] = new_url
+            return updated
+
+        final_urls = _mutate_listing_images(listing_id, agent_id, mutate)
+
+        if gone["value"] and new_url not in final_urls:
+            # Used to return 200 with a URL pointing at a photo that is not on
+            # the listing, so the UI showed a "done!" for nothing.
+            raise HTTPException(
+                status_code=404,
+                detail="That photo was removed while it was being enhanced, so the enhanced version wasn't saved",
+            )
+        return new_url
+    finally:
+        _end_enhance(url)
+
 
 @app.post("/api/listings/{listing_id}/images/{image_index}/enhance")
-async def enhance_listing_image(listing_id: str, image_index: int, agent=Depends(get_current_agent)):
-    new_url = await asyncio.to_thread(_enhance_listing_image, listing_id, agent["id"], image_index)
+async def enhance_listing_image(listing_id: str, image_index: int, image_url: str = None, agent=Depends(get_current_agent)):
+    # image_url optional and additive -- see delete_listing_image.
+    new_url = await asyncio.to_thread(_enhance_listing_image, listing_id, agent["id"], image_index, image_url)
+    return {"success": True, "image_url": new_url}
+
+
+@app.post("/api/listings/{listing_id}/images/enhance")
+async def enhance_listing_image_by_url(listing_id: str, image_url: str, agent=Depends(get_current_agent)):
+    """Index-free form of the enhance above -- preferred for new frontend code."""
+    new_url = await asyncio.to_thread(_enhance_listing_image, listing_id, agent["id"], None, image_url)
     return {"success": True, "image_url": new_url}
 
 @app.post("/api/listings/{listing_id}/post-facebook")
@@ -1557,8 +1991,9 @@ def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_age
         supabase.table("agents").update({"photo_url": photo_url}).eq("id", agent["id"]).execute()
 
         return {"photo_url": photo_url}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Profile photo upload failed for agent %s", agent["id"])
+        raise HTTPException(status_code=500, detail="Something went wrong uploading that photo -- please try again")
 
 @app.get("/api/profile/telegram-connect-link")
 def get_telegram_connect_link(agent=Depends(get_current_agent)):
