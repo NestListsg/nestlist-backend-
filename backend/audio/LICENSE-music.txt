@@ -1,0 +1,33 @@
+Music bundled with NestList Prestige
+====================================
+
+File:    soft_piano.mp3
+Track:   "Piano Soft Gentle Morning Keys"
+Artist:  Alex Morgan
+Source:  Pixabay (https://pixabay.com/music/  -- track id 575879)
+License: Pixabay Content License
+         https://pixabay.com/service/license-summary/
+
+What the Pixabay Content License permits, in plain terms:
+
+  - Free commercial use. The track may be used in videos NestList produces for
+    paying agents, and in videos those agents post to Facebook, Instagram,
+    TikTok, LinkedIn, YouTube or a property portal.
+  - No attribution required. Crediting Alex Morgan is appreciated but not a
+    condition of use, which is why nothing is burned into the video.
+
+What it does NOT permit (none of which NestList does):
+
+  - Redistributing or selling the audio file on its own, or as part of a
+    music/stock library.
+  - Using it in a way that suggests Pixabay or the artist endorses NestList.
+  - Registering the track (or a video containing it) with a content-ID or
+    rights-management service.
+
+This is the track validated during video prototyping; the file here is
+byte-identical to the one used in those tests (MD5 3052f5ca752ac6ee723c107b8877be62).
+
+If this track is ever swapped, the replacement must carry a licence that also
+permits commercial use without attribution, and this file must be updated to
+name it. Agents' reputations ride on these videos -- an unlicensed music bed
+is a takedown or a copyright strike on their account, not ours.

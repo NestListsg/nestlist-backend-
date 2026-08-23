@@ -1,87 +1,157 @@
-"""NestList property video renderer -- turns a listing's photos into a branded vertical
-slideshow video (1080x1920, suitable for Instagram Reels/Stories, TikTok, LinkedIn).
+"""NestList property video renderer -- the production "Classic tier" listing video.
 
-Each photo becomes a slow-zoom "Ken Burns" clip via ffmpeg's zoompan filter; clips are
-crossfaded together and concatenated with a branded outro slide, with a soft looping
-background track underneath. The bundled track (audio/soft_piano.mp3, "Piano Soft
-Gentle Morning Keys" by Alex Morgan) is downloaded from Pixabay, whose Content License
-permits commercial use, including in videos posted to social media, without attribution
--- see https://pixabay.com/service/license-summary/.
+Turns a listing's photos into a 1440x1080 cinematic slideshow: alternating Ken Burns
+pans, one expressive AI-written room caption per photo, a soft piano bed, and a closing
+contact card built from the agent's own profile.
 
-Requires the `ffmpeg` binary on PATH (see railpack.json).
+This is a port of the recipe validated over three weeks of prototyping (see
+prototypes/classic_build.py, caption_signature.py, contact_card.py, assemble_v28.py).
+The numbers below -- zoom increment, zoom ceiling, caption size and position, music
+volume and fade lengths, card timings -- are the validated values; treat them as tuned
+constants rather than knobs.
+
+RELIABILITY MODEL
+Every optional stage degrades instead of failing. The ladder, worst-case last:
+    music fails      -> silent video
+    captions fail    -> caption-free slideshow
+    card fails       -> slideshow with no closing card
+    a photo fails    -> that photo is skipped
+Only "no usable photos at all" raises. Which degradations fired is returned to the
+caller (and logged) so a quietly-degraded render is visible in Railway's logs rather
+than looking like a normal success.
+
+Requires the `ffmpeg` binary (with `ffprobe`) on PATH -- see railpack.json.
 """
+import base64
 import io
+import json
+import logging
 import os
+import re
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 
-VW, VH = 1080, 1920
-FPS = 25
-SECONDS_PER_PHOTO = 5.5
-OUTRO_SECONDS = 5.5
-MAX_VIDEO_PHOTOS = 5  # each photo costs its own sequential ffmpeg encode + xfade merge pass
-                       # (see render_property_video). Was 8, but live testing on Railway's
-                       # current plan showed even 8 photos completing anywhere from ~60s to
-                       # 250s+/502/hang depending on concurrent CPU load (Railway's CPU graph
-                       # shows renders hitting the plan's ceiling) -- 8 wasn't giving reliable
-                       # margin under the gateway's timeout. Lower for safety margin; if this
-                       # still isn't reliable, the real fix is more Railway CPU headroom, not
-                       # a lower cap. Deliberately well below the listing's overall 15-photo
-                       # upload cap (PDF_MAX_PHOTOS in main.py), which has no such per-photo
-                       # rendering cost.
-TRANSITION_SECONDS = 1.8
-ZOOM_TARGET = 1.15
-AUDIO_FADE_SECONDS = 1.5
-AUDIO_VOLUME = 0.35
+logger = logging.getLogger(__name__)
 
-AUDIO_PATH = os.path.join(os.path.dirname(__file__), "audio", "soft_piano.mp3")
+# ---------------------------------------------------------------------------
+# Validated prototype constants
+# ---------------------------------------------------------------------------
+VW, VH = 1440, 1080
+FPS = 24
+SECONDS_PER_PHOTO = 5.0
+FRAMES_PER_PHOTO = int(SECONDS_PER_PHOTO * FPS)  # 120
 
-GOLD = (240, 200, 74, 255)
-WHITE = (248, 244, 236, 255)
-PALE = (255, 255, 255, 255)
+# zoompan works on an upscaled copy of the photo: at native 1440x1080 the per-frame
+# crop rectangle lands on whole pixels and the pan visibly stair-steps. Upscaling 4x
+# first gives the crop sub-pixel resolution, which is what makes the prototype's pan
+# read as smooth. It also costs memory (a 5760x4320 frame is ~75MB), which is why
+# renders are throttled by _RENDER_SLOTS below.
+ZOOM_UPSCALE = 4
+ZOOM_STEP = 0.0009
+ZOOM_MAX = 1.13
 
-FONT_DIR = os.path.join(os.path.dirname(__file__), "fonts")
-PLAYFAIR = os.path.join(FONT_DIR, "PlayfairDisplay-Variable.ttf")
-INTER = os.path.join(FONT_DIR, "Inter-Variable.ttf")
+OPEN_FADE_SECONDS = 0.75  # first photo fades up from black; never a cold first frame
+
+# Closing card, assembled by the still-frame method (see _build_card_clip).
+CARD_SECONDS = 5.5
+CARD_XFADE_SECONDS = 1.2
+CARD_HOLD_SECONDS = 0.3   # frozen last frame held before the dissolve starts
+CARD_TAIL_SECONDS = 1.6   # length of the frozen-frame input feeding the dissolve
+
+AUDIO_VOLUME = 0.22
+AUDIO_FADE_IN_SECONDS = 1.5
+AUDIO_FADE_OUT_SECONDS = 4.5
+
+# Each photo is one sequential ffmpeg encode. The previous renderer also folded clips
+# together with N-1 progressive xfade passes, each one re-encoding the whole
+# accumulated video -- that cascade, not the per-photo encode, is what forced the cap
+# down to 5. This pipeline concatenates with a stream copy instead (no re-encode at
+# all), so the same CPU budget comfortably covers the 6 shots the prototype was
+# validated at. Still deliberately well below the listing's 15-photo upload cap
+# (MAX_LISTING_PHOTOS in main.py), which has no per-photo rendering cost.
+MAX_VIDEO_PHOTOS = 6
+
+# Ceiling on renders running at once *in this worker process*. Railway runs 4 uvicorn
+# workers, so the real ceiling is 4x this. Renders are background jobs, so waiting is
+# cheap and far better than 50 agents each holding a ~150MB ffmpeg filter graph and
+# taking the instance down. Past the wait window the job fails with a retryable
+# message rather than queueing behind the listing's 10-minute stale-render lock.
+MAX_CONCURRENT_RENDERS = 2
+RENDER_SLOT_WAIT_SECONDS = 240
+_RENDER_SLOTS = threading.Semaphore(MAX_CONCURRENT_RENDERS)
+
+# Whole-job wall-clock budget. Past this we stop adding photos and finish with what is
+# already rendered -- a shorter video beats a listing stuck in 'rendering'.
+RENDER_BUDGET_SECONDS = 420
+
+# Per-step ffmpeg timeouts (seconds).
+TIMEOUT_CLIP = 150
+TIMEOUT_CONCAT = 90
+TIMEOUT_CARD = 120
+TIMEOUT_MUSIC = 120
+TIMEOUT_PROBE = 30
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+# "Piano Soft Gentle Morning Keys" by Alex Morgan, from Pixabay, whose Content License
+# permits commercial use (including social video) without attribution -- see
+# audio/LICENSE-music.txt. Byte-identical to the track validated in the prototypes.
+AUDIO_PATH = os.path.join(_HERE, "audio", "soft_piano.mp3")
+
+FONT_DIR = os.path.join(_HERE, "fonts")
+# Gelasio is metric-compatible with Georgia, which the prototypes used (a macOS system
+# font we cannot ship). Same string at the same size measures identically in both, so
+# the prototype's fontsize/position numbers carry over exactly -- and Gelasio is OFL,
+# so it can live in the repo. See fonts/OFL-Gelasio.txt.
+SERIF_ITALIC = os.path.join(FONT_DIR, "Gelasio-Italic-Variable.ttf")
+SERIF_REGULAR = os.path.join(FONT_DIR, "Gelasio-Variable.ttf")
+
+# Contact card palette (prototypes/contact_card.py).
+CARD_BG = (250, 248, 245)     # warm off-white
+CARD_INK = (43, 43, 43)       # soft charcoal
+CARD_GOLD = (176, 141, 87)    # quiet gold accent
+
+CAPTION_FONT_SIZE = 40
+CAPTION_BASELINE_OFFSET = 135  # y = h - 135
+
+# Identical encoder settings on every clip, so the final concat can be a stream copy
+# (no re-encode) without mismatched stream parameters.
+_ENCODE_ARGS = [
+    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+    "-pix_fmt", "yuv420p", "-r", str(FPS), "-vsync", "cfr", "-an",
+]
+
+CAPTION_MODEL = "claude-sonnet-4-5"  # same model main.py uses for listing copy
+CAPTION_TIMEOUT_SECONDS = 60
+CAPTION_MAX_CHARS = 72
+CAPTION_SEPARATOR = " ... "
+
+# Superlatives the listing-copy rules already ban as unsubstantiated. A caption that
+# reaches for one is dropped rather than rewritten -- one photo silently loses its
+# caption, which is invisible to the viewer, whereas a hedge-word rewrite would not be.
+_BANNED_CAPTION_WORDS = {
+    "luxurious", "luxury", "prestigious", "coveted", "exclusive", "best", "finest",
+    "stunning", "unrivalled", "unrivaled", "world-class", "premier", "ultimate",
+    "epitome", "unparalleled", "iconic", "sought-after", "magnificent", "spectacular",
+    "opulent", "lavish", "breathtaking", "sprawling", "boasts", "nestled",
+}
+_PRICE_TOKENS = ("$", "sgd", "psf", "price", "priced", "psm", "£", "€", "usd")
 
 
-def _load_font(path, size, weight=None, opsz=None):
-    font = ImageFont.truetype(path, size)
-    try:
-        axes = font.get_variation_axes()
-        names = [a["name"].decode() if isinstance(a["name"], bytes) else a["name"] for a in axes]
-        values = []
-        for name in names:
-            if name == "Weight" and weight is not None:
-                values.append(weight)
-            elif name == "Optical size" and opsz is not None:
-                values.append(opsz)
-            else:
-                values.append(next(a["default"] for a in axes if (a["name"].decode() if isinstance(a["name"], bytes) else a["name"]) == name))
-        font.set_variation_by_axes(values)
-    except Exception:
-        pass
-    return font
-
-
-TITLE_FONT = _load_font(PLAYFAIR, 64, weight=700)
-PRICE_FONT = _load_font(INTER, 58, weight=700, opsz=32)
-STATS_FONT = _load_font(INTER, 34, weight=500, opsz=18)
-EYEBROW_FONT = _load_font(INTER, 28, weight=600, opsz=14)
-OUTRO_NAME_FONT = _load_font(INTER, 58, weight=700, opsz=20)
-OUTRO_CONTACT_FONT = _load_font(INTER, 40, weight=600, opsz=16)
-OUTRO_TAGLINE_FONT = _load_font(PLAYFAIR, 40, weight=500)
-
-
+# ---------------------------------------------------------------------------
+# ffmpeg helpers
+# ---------------------------------------------------------------------------
 def _run_ffmpeg(cmd, timeout):
-    """subprocess.run's default CalledProcessError str() is just the command and
-    exit code -- useless for diagnosing an actual ffmpeg failure. This surfaces the
-    real stderr (truncated) so both Railway logs and the API error response say
-    what actually went wrong."""
+    """subprocess.run's default CalledProcessError str() is just the command and exit
+    code -- useless for diagnosing an actual ffmpeg failure. This surfaces the real
+    stderr (truncated) so both Railway's logs and the API error response say what
+    actually went wrong."""
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
     except subprocess.CalledProcessError as e:
@@ -91,33 +161,89 @@ def _run_ffmpeg(cmd, timeout):
         raise RuntimeError(f"ffmpeg timed out after {timeout}s") from e
 
 
-def _fetch_image(url):
-    response = requests.get(url, timeout=15)
-    response.raise_for_status()
-    return Image.open(io.BytesIO(response.content))
+def _probe_duration(path, fallback):
+    """Real duration of a rendered file. Concat and xfade both shift duration slightly
+    off the arithmetic estimate, and the music fade-out has to start 4.5s before the
+    *actual* end or it fades over the wrong thing. Falls back to the estimate if
+    ffprobe is missing or unparseable -- a slightly mistimed fade is not worth failing
+    an otherwise-finished video over."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, timeout=TIMEOUT_PROBE, check=True,
+        )
+        value = float(out.stdout.decode().strip())
+        if value > 0:
+            return value
+    except Exception as e:
+        logger.warning("ffprobe failed on %s (%s); using estimated duration %.2fs", path, e, fallback)
+    return fallback
 
 
-def _fit_with_letterbox(img, w, h, centering=(0.5, 0.4), blur_radius=40, darken=0.55):
-    """Fits a photo into a (w, h) frame without cropping wide/landscape shots.
+def _escape_filter_path(path):
+    """Paths land inside an ffmpeg filter argument, where ':' separates options and
+    '\\' escapes. Our own paths never contain either, but the font/text files are
+    joined onto whatever temp root the OS hands us, so escape rather than assume."""
+    return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
-    Most listing photos are landscape while the video canvas is a tall 9:16 portrait
-    (1080x1920) -- a plain cover-crop would slice off both sides of the photo (a square
-    photo already loses ~44% of its width; a typical 3:2 landscape shot loses ~62%),
-    which can cut a house frontage right out of frame. Instead, when the photo is wider
-    than the target aspect, the full photo is shown letterboxed in the middle, with the
-    empty top/bottom bars filled by a blurred, darkened copy of the same photo -- the
-    same technique Instagram/TikTok use for landscape media in Stories/Reels, so nothing
-    in the original shot is lost.
 
-    Photos already at or near the target aspect (portrait phone shots) skip the
-    letterbox and get a plain cover-fit, since there's nothing meaningful to preserve.
+# ---------------------------------------------------------------------------
+# Photo fetching and normalization
+# ---------------------------------------------------------------------------
+MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024
+MAX_SOURCE_PIXELS = 80_000_000  # decompression-bomb / phone-panorama guard
+
+
+def _fetch_image(url, attempts=2):
+    """Downloads one photo. Streams with a hard byte cap so a mis-uploaded 200MB file
+    can't exhaust memory, and retries once because a single flaky CDN read shouldn't
+    cost the agent a whole video."""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            with requests.get(url, timeout=(5, 25), stream=True) as response:
+                response.raise_for_status()
+                declared = response.headers.get("content-length")
+                if declared and int(declared) > MAX_DOWNLOAD_BYTES:
+                    raise ValueError(f"photo is {int(declared) // 1024 // 1024}MB, over the {MAX_DOWNLOAD_BYTES // 1024 // 1024}MB limit")
+                buffer = io.BytesIO()
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    buffer.write(chunk)
+                    if buffer.tell() > MAX_DOWNLOAD_BYTES:
+                        raise ValueError(f"photo exceeded the {MAX_DOWNLOAD_BYTES // 1024 // 1024}MB limit while downloading")
+            buffer.seek(0)
+            img = Image.open(buffer)
+            if img.width * img.height > MAX_SOURCE_PIXELS:
+                raise ValueError(f"photo is {img.width}x{img.height}, too large to render")
+            img.load()
+            # Phone photos carry their rotation in EXIF; without this a portrait shot
+            # renders on its side.
+            return ImageOps.exif_transpose(img)
+        except Exception as e:
+            last_error = e
+            if attempt + 1 < attempts:
+                time.sleep(1.0)
+    raise RuntimeError(f"could not fetch photo: {last_error}")
+
+
+def _fit_frame(img, w, h, centering=(0.5, 0.4), aspect_tolerance=1.15,
+               blur_radius=40, darken=0.55):
+    """Fits a photo into a (w, h) frame without distorting it and without black bars.
+
+    Against a 4:3 canvas most listing photos (3:2, 4:3) are close enough that a plain
+    cover-fit loses only a sliver of the edges, so that is what they get -- full bleed,
+    nothing to distract from the pan. Genuinely wide shots (16:9, panoramas) would lose
+    a third of their width to that crop, often the part of a frontage that matters, so
+    those are shown whole and letterboxed, with the empty bands filled by a blurred,
+    darkened copy of the same photo (the Instagram/TikTok treatment) rather than black.
     """
     img = img.convert("RGB")
     src_w, src_h = img.size
     src_aspect = src_w / src_h
     target_aspect = w / h
 
-    if src_aspect <= target_aspect * 1.05:
+    if src_aspect <= target_aspect * aspect_tolerance:
         return ImageOps.fit(img, (w, h), centering=centering)
 
     background = ImageOps.fit(img, (w, h), centering=centering)
@@ -125,332 +251,515 @@ def _fit_with_letterbox(img, w, h, centering=(0.5, 0.4), blur_radius=40, darken=
     background = Image.blend(background, Image.new("RGB", (w, h), (0, 0, 0)), darken)
 
     fg_w = w
-    fg_h = round(w / src_aspect)
+    fg_h = max(1, round(w / src_aspect))
     foreground = img.resize((fg_w, fg_h), Image.LANCZOS)
-
-    canvas = background
-    canvas.paste(foreground, (0, (h - fg_h) // 2))
-    return canvas
+    background.paste(foreground, (0, (h - fg_h) // 2))
+    return background
 
 
-def _gradient_scrim(base, y0, y1, from_alpha, to_alpha, color=(8, 12, 10)):
-    height = y1 - y0
-    if height <= 0:
-        return
-    gradient = Image.new("L", (1, height))
-    gradient.putdata([int(from_alpha + (to_alpha - from_alpha) * (row / max(height - 1, 1))) for row in range(height)])
-    alpha = gradient.resize((base.width, height))
-    overlay = Image.new("RGBA", (base.width, height), color)
-    overlay.putalpha(alpha)
-    base.alpha_composite(overlay, dest=(0, y0))
+# ---------------------------------------------------------------------------
+# Expressive room captions (one batched Claude vision call per video)
+# ---------------------------------------------------------------------------
+_CAPTION_PROMPT = """You are writing the on-screen captions for a Singapore property
+listing video. You have been shown {n} photos of one property, in order.
+
+For each photo, identify the room or space, then write ONE caption in exactly this
+style:
+
+    the living hall ... where laughter lingers and memories are made
+    the dining hall ... where every meal becomes a gathering
+    the master suite ... where your private sanctuary awaits
+    quiet mornings ... where rest comes easy
+    the lap pool ... where every day feels like a getaway
+    the terrace ... where golden hours drift by
+
+Rules, no exceptions:
+- All lowercase. No capital letters at all, no full stop at the end.
+- Exactly one " ... " separator: a short name for the space, then an evocative phrase
+  about how it feels to live there.
+- Under 65 characters in total.
+- Plain English letters only. No emoji, no accents, no quotation marks, no colons.
+- NEVER mention a price, a figure, a house number, a unit number, or any digit.
+- NEVER use unsubstantiated superlatives: luxurious, prestigious, coveted, exclusive,
+  stunning, best, finest, world-class, iconic, sought-after, breathtaking, or similar.
+  Describe what is actually visible and how it feels, not status.
+- If a photo shows an exterior, a view, or a detail rather than a room, name that
+  instead ("the terrace", "quiet mornings", "the garden path").
+
+Reply with JSON only, no other text, in exactly this shape:
+{{"captions": [{{"n": 1, "caption": "..."}}, {{"n": 2, "caption": "..."}}]}}
+with one entry per photo, in order, for all {n} photos."""
 
 
-def _text_with_shadow(base, draw, pos, text, font, fill, blur=6, offset=(0, 2)):
-    if not text:
-        return
-    x, y = pos
-    shadow_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    ImageDraw.Draw(shadow_layer).text((x + offset[0], y + offset[1]), text, font=font, fill=(0, 0, 0, 170))
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(blur))
-    base.alpha_composite(shadow_layer)
-    draw.text((x, y), text, font=font, fill=fill)
+def _photo_to_block(img, max_side=768, quality=72):
+    """Downscales a copy of the photo for the vision call. Full-size listing photos are
+    2-4MB each; at 6 photos that is a slow, expensive request for no benefit -- 768px
+    is ample for "which room is this"."""
+    small = img.convert("RGB").copy()
+    small.thumbnail((max_side, max_side), Image.LANCZOS)
+    buffer = io.BytesIO()
+    small.save(buffer, format="JPEG", quality=quality, optimize=True)
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/jpeg",
+            "data": base64.standard_b64encode(buffer.getvalue()).decode("ascii"),
+        },
+    }
 
 
-def _render_photo_slide(photo, eyebrow, title, price_text, stats_line):
-    """First slide gets the full text treatment (eyebrow + title + price + stats);
-    later slides get no text so the property photos read cleanly without repeating
-    the same overlay on every frame."""
-    base = _fit_with_letterbox(photo, VW, VH).convert("RGBA")
-    draw = ImageDraw.Draw(base)
+def _caption_is_safe(caption):
+    """Second layer over the prompt rules. The prompt asks; this enforces. A caption
+    that fails any check is dropped (that photo renders bare) rather than patched --
+    the guarantee agents need is that nothing unvetted is burned into a video, and a
+    missing caption on one photo is invisible to a viewer."""
+    if not caption:
+        return False, "empty"
+    if len(caption) > CAPTION_MAX_CHARS:
+        return False, "too long"
+    if CAPTION_SEPARATOR not in caption:
+        return False, "wrong format"
+    if not caption.isascii() or not caption.isprintable():
+        return False, "non-ascii"
+    if re.search(r"\d", caption):
+        # Covers house numbers, unit numbers, prices, floor areas -- all at once.
+        return False, "contains a digit"
+    lowered = caption.lower()
+    if any(token in lowered for token in _PRICE_TOKENS):
+        return False, "price-adjacent wording"
+    words = set(re.findall(r"[a-z-]+", lowered))
+    hit = words & _BANNED_CAPTION_WORDS
+    if hit:
+        return False, f"superlative ({', '.join(sorted(hit))})"
+    if any(c in caption for c in "'\"\\:%"):
+        # Nothing in the validated style needs these, and they are exactly the
+        # characters that make drawtext arguments ambiguous.
+        return False, "unsupported punctuation"
+    return True, ""
 
-    if eyebrow or title or price_text or stats_line:
-        _gradient_scrim(base, VH - 620, VH, 0, 210)
-        x = 64
-        y = VH - 540
-        if eyebrow:
-            draw.text((x, y), eyebrow.upper(), font=EYEBROW_FONT, fill=GOLD)
-            y += 46
-        if title:
-            _text_with_shadow(base, draw, (x, y), title, TITLE_FONT, WHITE, blur=8)
-            y += 90
-        if price_text:
-            _text_with_shadow(base, draw, (x, y), price_text, PRICE_FONT, GOLD, blur=6)
-            y += 76
-        if stats_line:
-            _text_with_shadow(base, draw, (x, y), stats_line, STATS_FONT, WHITE, blur=5)
 
-    return base.convert("RGB")
+def _generate_room_captions(photos, copy_guard=None):
+    """One batched vision call for the whole video: all photos in, one caption each
+    out. Returns a list the same length as `photos`, with None wherever no safe caption
+    could be produced. Never raises -- a caption-free video is a valid outcome.
+
+    Batching matters for more than cost: it is one network dependency and one timeout
+    for the whole render, instead of one per photo, and it lets the model see the
+    property as a set so it does not caption three different rooms "the living hall"."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    backup_key = os.environ.get("ANTHROPIC_API_KEY_BACKUP", "")
+    if not api_key and not backup_key:
+        logger.warning("captions skipped: no Anthropic API key configured")
+        return [None] * len(photos), "no API key"
+
+    content = []
+    for i, photo in enumerate(photos):
+        content.append({"type": "text", "text": f"Photo {i + 1}:"})
+        content.append(_photo_to_block(photo))
+    content.append({"type": "text", "text": _CAPTION_PROMPT.format(n=len(photos))})
+
+    raw = None
+    last_error = None
+    for key in [k for k in (api_key, backup_key) if k]:
+        try:
+            import anthropic
+            # max_retries=1: the render already has a wall-clock budget, and the SDK's
+            # default of 2 retries on top of a 60s timeout can burn three minutes on a
+            # degraded API before we fall back to no captions.
+            client = anthropic.Anthropic(
+                api_key=key, timeout=CAPTION_TIMEOUT_SECONDS, max_retries=1
+            )
+            response = client.messages.create(
+                model=CAPTION_MODEL,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": content}],
+            )
+            raw = "".join(b.text for b in response.content if getattr(b, "type", "") == "text")
+            break
+        except Exception as e:
+            last_error = e
+            continue
+
+    if raw is None:
+        logger.warning("captions skipped: Claude call failed (%s)", last_error)
+        return [None] * len(photos), f"AI call failed ({type(last_error).__name__})"
+
+    try:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        parsed = json.loads(match.group(0) if match else raw)
+        entries = parsed["captions"]
+    except Exception as e:
+        logger.warning("captions skipped: could not parse model reply (%s)", e)
+        return [None] * len(photos), "AI reply unparseable"
+
+    captions = [None] * len(photos)
+    dropped = 0
+    for entry in entries:
+        try:
+            index = int(entry["n"]) - 1
+            text = str(entry["caption"]).strip().lower()
+        except Exception:
+            dropped += 1
+            continue
+        if not 0 <= index < len(photos):
+            dropped += 1
+            continue
+        text = re.sub(r"\s*\.\.\.\s*", CAPTION_SEPARATOR, text)
+        text = re.sub(r"\s+", " ", text).strip(" .")
+        if copy_guard:
+            # The same guard every other copy surface runs through (house/unit numbers,
+            # price leaks). It never raises and never returns empty.
+            try:
+                text = (copy_guard(text, context="video-caption") or "").strip().lower()
+            except Exception as e:
+                logger.warning("caption copy guard failed (%s); dropping caption", e)
+                dropped += 1
+                continue
+        ok, reason = _caption_is_safe(text)
+        if not ok:
+            logger.warning("caption %d rejected (%s): %r", index + 1, reason, text)
+            dropped += 1
+            continue
+        captions[index] = text
+
+    note = None
+    if dropped:
+        note = f"{dropped} caption(s) rejected by the copy guards"
+    if all(c is None for c in captions):
+        note = "every caption was rejected"
+    return captions, note
 
 
-def _render_plain_slide(photo):
-    return _fit_with_letterbox(photo, VW, VH).convert("RGB")
+# ---------------------------------------------------------------------------
+# Clip rendering
+# ---------------------------------------------------------------------------
+def _kenburns_clip(frame_img, out_path, workdir, index, caption=None, zoom_in=True,
+                   fade_in=False):
+    """One photo -> one 5s Ken Burns clip, with its caption burned in during the same
+    pass. Doing the caption here rather than over the finished video means a per-photo
+    timing window falls out for free, one photo's caption can be omitted without
+    touching the others, and the video is only ever encoded once."""
+    src_path = os.path.join(workdir, f"src_{index:02d}.png")
+    frame_img.save(src_path, format="PNG")
+
+    if zoom_in:
+        z = f"min(zoom+{ZOOM_STEP},{ZOOM_MAX})"
+    else:
+        z = f"if(eq(on,1),{ZOOM_MAX},max(zoom-{ZOOM_STEP},1.0))"
+
+    filters = [
+        f"scale={VW * ZOOM_UPSCALE}:{VH * ZOOM_UPSCALE}",
+        (f"zoompan=z='{z}':d={FRAMES_PER_PHOTO}:s={VW}x{VH}:fps={FPS}"
+         f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"),
+    ]
+
+    if caption:
+        # drawtext reads the caption from a file rather than an inline `text=` value:
+        # the caption is model-written, and inline text has to be escaped against three
+        # nested parsers (shell-free argv, filtergraph, drawtext). textfile= plus
+        # expansion=none removes that whole class of bug -- and with it any chance of a
+        # caption smuggling filter syntax into the command.
+        text_path = os.path.join(workdir, f"cap_{index:02d}.txt")
+        with open(text_path, "w", encoding="utf-8") as f:
+            f.write(caption)
+        filters.append(
+            f"drawtext=fontfile={_escape_filter_path(SERIF_ITALIC)}"
+            f":textfile={_escape_filter_path(text_path)}:expansion=none"
+            f":fontcolor=white:fontsize={CAPTION_FONT_SIZE}"
+            f":x=(w-text_w)/2:y=h-{CAPTION_BASELINE_OFFSET}"
+            f":shadowcolor=black@0.6:shadowx=2:shadowy=2"
+        )
+
+    if fade_in:
+        # After drawtext, so the caption rises out of black with the photo rather than
+        # sitting fully lit over a dark frame.
+        filters.append(f"fade=t=in:st=0:d={OPEN_FADE_SECONDS}")
+
+    filters.append("format=yuv420p")
+
+    cmd = (["ffmpeg", "-y", "-loop", "1", "-t", str(SECONDS_PER_PHOTO), "-i", src_path,
+            "-vf", ",".join(filters), "-frames:v", str(FRAMES_PER_PHOTO)]
+           + _ENCODE_ARGS + [out_path])
+    try:
+        _run_ffmpeg(cmd, TIMEOUT_CLIP)
+    finally:
+        try:
+            os.unlink(src_path)
+        except OSError:
+            pass
 
 
-def _render_outro_slide(agent_name, agent_contact_line, agent_photo=None):
-    """Closing slide. With a profile photo, this reads as a proper portrait feature --
-    large circular headshot with a soft drop shadow and a gold ring, lifted off the
-    flat background rather than a small square photo pinned flat against it (which
-    read as a memorial/obituary photo, not a marketing signature). Falls back to the
-    original text-only layout when the agent hasn't uploaded a profile photo."""
-    base = Image.new("RGBA", (VW, VH), (13, 43, 29, 255))
-    draw = ImageDraw.Draw(base)
+def _concat(clip_paths, out_path, workdir, name, timeout):
+    """Joins clips with a stream copy. Every clip comes out of the same encoder
+    settings (_ENCODE_ARGS), so no re-encode is needed -- which is both far cheaper
+    than the old pairwise xfade cascade and lossless."""
+    list_path = os.path.join(workdir, f"{name}.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for path in clip_paths:
+            f.write(f"file '{os.path.abspath(path)}'\n")
+    _run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                 "-c", "copy", out_path], timeout)
 
+
+# ---------------------------------------------------------------------------
+# Contact card outro
+# ---------------------------------------------------------------------------
+def _fit_text(draw, text, font_path, size, max_width):
+    """Shrinks a line until it fits. A 74px name is right for "Janel Chee" and 300px
+    too wide for a long double-barrelled name plus agency suffix -- without this the
+    name simply runs off both edges of the card."""
+    while size > 24:
+        font = ImageFont.truetype(font_path, size)
+        if draw.textlength(text, font=font) <= max_width:
+            return font
+        size -= 2
+    return ImageFont.truetype(font_path, 24)
+
+
+def _render_contact_card(agent_name, agent_contact_line, agent_photo=None):
+    """The closing still: warm off-white card, gold-ringed portrait, name, divider,
+    invitation, contact in gold. Layout and colours are the prototype's."""
+    card = Image.new("RGB", (VW, VH), CARD_BG)
+    draw = ImageDraw.Draw(card)
     cx = VW // 2
-    cy = VH // 2
 
     if agent_photo:
-        photo_size = 620  # was 420 -- Jane: the closing slide read "bare on the page"; a
-        # bigger portrait plus the recentering below is what actually fills the frame,
-        # not just a marginally bigger circle floating in the same empty layout.
-        ring_width = 10
-        gap_photo_to_tagline = 50
-        gap_tagline_to_divider = 56
-        gap_divider_to_name = 34
-        gap_name_to_contact = 78
-        contact_line_height = 56  # approx, only used to center the whole block below
-
-        # Center the ENTIRE block (photo + tagline + divider + name + contact) on the
-        # canvas, rather than anchoring the photo a fixed distance above center like
-        # before -- that fixed offset was tuned for the old, smaller photo and left a
-        # large dead zone below the text once the photo grew. Computing photo_top from
-        # the full block height keeps everything balanced as any of these sizes change.
-        block_height = (
-            photo_size + gap_photo_to_tagline + gap_tagline_to_divider +
-            gap_divider_to_name + gap_name_to_contact + contact_line_height
-        )
-        photo_top = round(cy - block_height / 2)
-        photo_bottom = photo_top + photo_size
-        photo_cy = photo_top + photo_size / 2
-        dest = (round(cx - photo_size / 2), photo_top)
-
-        # Soft blurred shadow behind the circle, offset slightly downward, so the
-        # portrait reads as a lifted, designed element rather than flat-pasted.
-        # Blurred on a small crop (not the full 1080x1920 canvas) -- GaussianBlur
-        # cost scales with pixel count, and there's no reason to blur 2M+ pixels
-        # to shadow a ~650px circle.
-        shadow_pad = 26
-        blur_radius = 32
-        margin = blur_radius * 3
-        box_half = photo_size / 2 + shadow_pad + margin
-        shadow = Image.new("RGBA", (round(box_half * 2), round(box_half * 2)), (0, 0, 0, 0))
-        ImageDraw.Draw(shadow).ellipse(
-            (box_half - photo_size / 2 - shadow_pad, box_half - photo_size / 2 - shadow_pad + 14,
-             box_half + photo_size / 2 + shadow_pad, box_half + photo_size / 2 + shadow_pad + 14),
-            fill=(0, 0, 0, 140)
-        )
-        shadow = shadow.filter(ImageFilter.GaussianBlur(blur_radius))
-        base.alpha_composite(shadow, dest=(round(cx - box_half), round(photo_cy - box_half)))
-        draw = ImageDraw.Draw(base)
-
-        square = ImageOps.fit(agent_photo.convert("RGB"), (photo_size, photo_size), centering=(0.5, 0.42))
-        circle_mask = Image.new("L", (photo_size, photo_size), 0)
-        ImageDraw.Draw(circle_mask).ellipse((0, 0, photo_size, photo_size), fill=255)
-        base.paste(square, dest, circle_mask)
-
+        diameter = 520
+        photo = agent_photo.convert("RGB")
+        side = min(photo.size)
+        # centering=(0.5, 0.0) takes the TOP square of the portrait. Centre-cropping a
+        # head-and-shoulders shot slices the crown of the head off inside the circle;
+        # anchoring to the top keeps whatever headroom the agent's photo has above the
+        # hair, which is the difference between a portrait and a mugshot.
+        photo = ImageOps.fit(photo, (side, side), centering=(0.5, 0.0))
+        photo = photo.resize((diameter, diameter), Image.LANCZOS)
+        mask = Image.new("L", (diameter, diameter), 0)
+        ImageDraw.Draw(mask).ellipse([0, 0, diameter, diameter], fill=255)
+        top = 96
+        card.paste(photo, (cx - diameter // 2, top), mask)
         draw.ellipse(
-            (dest[0] - ring_width / 2, dest[1] - ring_width / 2,
-             dest[0] + photo_size + ring_width / 2, dest[1] + photo_size + ring_width / 2),
-            outline=GOLD, width=ring_width
+            [cx - diameter // 2 - 4, top - 4, cx + diameter // 2 + 4, top + diameter + 4],
+            outline=CARD_GOLD, width=4,
         )
-
-        tagline_y = photo_bottom + gap_photo_to_tagline
-        divider_y = tagline_y + gap_tagline_to_divider
-        name_y = divider_y + gap_divider_to_name
-        contact_y = name_y + gap_name_to_contact
+        name_y, divider_y, invite_y, contact_y = 680, 795, 830, 905
     else:
-        tagline_y = cy - 165
-        divider_y = cy - 75
-        name_y = cy - 25
-        contact_y = cy + 50
+        # No profile photo: no empty circle, no gap where one would have been -- the
+        # text block simply centres on the card.
+        name_y, divider_y, invite_y, contact_y = 400, 515, 550, 625
 
-    tagline = "Smarter Listings. Better Results."
-    tw = draw.textbbox((0, 0), tagline, font=OUTRO_TAGLINE_FONT)[2]
-    draw.text((cx - tw / 2, tagline_y), tagline, font=OUTRO_TAGLINE_FONT, fill=(212, 175, 55, 230))
+    max_width = VW - 200
+    name_font = _fit_text(draw, agent_name or "", SERIF_REGULAR, 74, max_width)
+    invite_font = ImageFont.truetype(SERIF_ITALIC, 44)
+    contact_font = _fit_text(draw, agent_contact_line or "", SERIF_REGULAR, 54, max_width)
 
-    draw.line((cx - 75, divider_y, cx + 75, divider_y), fill=GOLD, width=3)
+    def centred(text, y, font, fill):
+        if not text:
+            return
+        draw.text((cx - draw.textlength(text, font=font) / 2, y), text, font=font, fill=fill)
 
-    name_text = (agent_name or "").upper()
-    nw = draw.textbbox((0, 0), name_text, font=OUTRO_NAME_FONT)[2]
-    draw.text((cx - nw / 2, name_y), name_text, font=OUTRO_NAME_FONT, fill=PALE)
-
-    if agent_contact_line:
-        cw = draw.textbbox((0, 0), agent_contact_line, font=OUTRO_CONTACT_FONT)[2]
-        draw.text((cx - cw / 2, contact_y), agent_contact_line, font=OUTRO_CONTACT_FONT, fill=GOLD)
-
-    return base.convert("RGB")
-
-
-def _zoompan_clip(slide_img, out_path, duration, zoom_in=True, w=None, h=None):
-    """Renders a single still image into a slow-zoom video clip via ffmpeg's zoompan
-    filter. Centered zoom (not the default top-left) so the motion reads as a deliberate
-    push-in, not a drift toward a corner. w/h default to the full canvas size; callers
-    rendering into a smaller box pass their own dimensions."""
-    w = w or VW
-    h = h or VH
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        slide_img.save(tmp.name, format="PNG")
-        src_path = tmp.name
-
-    z_expr = f"min(zoom+0.0020,{ZOOM_TARGET})" if zoom_in else f"if(lte(zoom,1.0),{ZOOM_TARGET},max(zoom-0.0020,1.0))"
-
-    # -frames:v + zoompan's internal per-frame PTS is a known source of malformed/
-    # non-monotonic timestamps that some players (Chrome included) refuse to start
-    # playback on even though the container itself parses fine. Cutting by -t plus
-    # forcing a constant output frame rate with -r/-vsync restamps clean, regular
-    # PTS instead of trusting zoompan's own.
-    cmd = [
-        "ffmpeg", "-y", "-loop", "1", "-i", src_path,
-        "-vf",
-        f"zoompan=z='{z_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={FPS},format=yuv420p",
-        "-t", str(duration),
-        "-r", str(FPS), "-vsync", "cfr",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        out_path,
-    ]
-    try:
-        _run_ffmpeg(cmd, 60)
-    finally:
-        os.unlink(src_path)
+    centred(agent_name or "", name_y, name_font, CARD_INK)
+    draw.line([cx - 90, divider_y, cx + 90, divider_y], fill=CARD_GOLD, width=3)
+    centred("Contact me to arrange for a viewing", invite_y, invite_font, CARD_INK)
+    centred(agent_contact_line or "", contact_y, contact_font, CARD_GOLD)
+    return card
 
 
-def _xfade_pair(base_path, next_path, out_path, base_duration, transition_seconds, timeout):
-    """Crossfades two clips into one file. Used to build the final video by folding
-    clips together one at a time (2 open input streams per call) instead of handing
-    ffmpeg one filter graph with every clip open at once -- at ~15 photos that single
-    giant graph needs that many concurrent decoders live simultaneously, which is
-    enough to exhaust memory/resources on a small Railway instance and fail outright
-    (confirmed: reliable up to ~6 clips, hard-failed at 15). Folding pairwise keeps
-    peak resource use constant no matter how many photos a listing has."""
-    offset = max(0.0, base_duration - transition_seconds)
-    filter_complex = (
-        f"[0:v]fps={FPS},format=yuv420p[v0];"
-        f"[1:v]fps={FPS},format=yuv420p[v1];"
-        f"[v0][v1]xfade=transition=fade:duration={transition_seconds}:offset={offset:.3f}[vout]"
-    )
-    cmd = [
-        "ffmpeg", "-y", "-i", base_path, "-i", next_path,
-        "-filter_complex", filter_complex,
-        "-map", "[vout]",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        out_path,
-    ]
-    _run_ffmpeg(cmd, timeout)
+def _build_card_clip(body_path, card_img, out_path, workdir):
+    """Dissolves the finished slideshow into the contact card.
+
+    The dissolve is built from two STILLS -- the body's frozen last frame and the card
+    -- and the result is concatenated onto the body. It is never an xfade applied to
+    the body stream itself: xfade over a concat-produced stream silently truncates the
+    output (it reads the first segment's duration, drops the rest, and exits 0, so
+    nothing surfaces as an error) -- the bug documented in prototypes/assemble_v16.py
+    that cost several prototype rounds. Keeping the dissolve on two one-frame inputs
+    means the body is only ever stream-copied and can never be truncated.
+    """
+    last_frame = os.path.join(workdir, "last_frame.jpg")
+    _run_ffmpeg(["ffmpeg", "-y", "-sseof", "-0.2", "-i", body_path,
+                 "-frames:v", "1", "-update", "1", "-q:v", "2", last_frame], TIMEOUT_CARD)
+
+    card_path = os.path.join(workdir, "contact_card.jpg")
+    card_img.save(card_path, format="JPEG", quality=95)
+
+    cmd = (["ffmpeg", "-y",
+            "-loop", "1", "-t", str(CARD_TAIL_SECONDS), "-i", last_frame,
+            "-loop", "1", "-t", str(CARD_SECONDS), "-i", card_path,
+            "-filter_complex",
+            f"[0:v]scale={VW}:{VH},setsar=1,fps={FPS},format=yuv420p[a];"
+            f"[1:v]scale={VW}:{VH},setsar=1,fps={FPS},format=yuv420p[b];"
+            f"[a][b]xfade=transition=fade:duration={CARD_XFADE_SECONDS}"
+            f":offset={CARD_HOLD_SECONDS}[v]",
+            "-map", "[v]"]
+           + _ENCODE_ARGS + [out_path])
+    _run_ffmpeg(cmd, TIMEOUT_CARD)
 
 
-def render_property_video(image_urls, property_type, district, price_text, stats, agent_name, agent_contact_line, style="classic", photo_index=0, agent_photo_url=None):
-    """Returns the finished video as bytes (MP4, H.264 + AAC, 1080x1920).
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def render_property_video(image_urls, property_type=None, district=None, price_text=None,
+                          stats=None, agent_name="", agent_contact_line="",
+                          style="classic", photo_index=0, agent_photo_url=None,
+                          copy_guard=None):
+    """Renders the Classic-tier listing video and returns (mp4_bytes, degradations).
 
-    stats: list of strings, same shape as poster_renderer's (empty entries dropped).
-    style: "classic" is the only style this renderer produces -- first slide gets a
-    text overlay, later slides are clean photos (the Ken Burns slideshow). The
-    parameter is kept so callers can keep naming a style, but any other value renders
-    classic rather than failing: old listing rows still carry the retired "card"
-    overlay id, and an agent regenerating one of those should get a video, not an
-    error. (main.py maps retired ids to the default before calling, so this is the
-    second of two guards.)
-    photo_index: which listing photo is the "hero" -- the photo that opens the
-    slideshow with the text-overlay treatment. Same selector the agent already uses
-    to pick the poster's photo (My Listings' star picker).
-    agent_photo_url: optional -- when set, the closing slide becomes a proper
-    signature card with the agent's headshot instead of plain centered text.
+    `degradations` is a list of plain-language strings naming anything that quietly
+    fell back (no captions, no music, no card). Empty means a full-quality render.
+
+    style: "classic" is the only style this renderer produces. The parameter is kept so
+    callers can keep naming a style, and any other value renders classic rather than
+    failing -- old listing rows still carry the retired "card" overlay id, and an agent
+    regenerating one of those should get a video, not an error. (main.py maps retired
+    ids to the default before calling, so this is the second of two guards.)
+    photo_index: which listing photo is the "hero" -- it opens the video. Same selector
+    the agent already uses for the poster (My Listings' star picker).
+    agent_photo_url: optional. Without it the closing card renders without the portrait
+    circle rather than leaving an empty ring.
+    copy_guard: optional callable(text, context=...) -> text. main.py passes
+    apply_listing_copy_guards so captions go through the same house-number/price
+    stripping as every other copy surface. Passed in rather than imported because
+    main.py imports this module.
+
+    property_type / district / price_text / stats are accepted for signature
+    compatibility and are no longer drawn: the Classic tier's on-screen text is the
+    room captions, and a stats block in the same lower third would collide with them.
     """
     if not image_urls:
         raise ValueError("At least one photo is required to generate a video")
     if photo_index < 0 or photo_index >= len(image_urls):
         photo_index = 0
 
-    # Keep the agent's chosen hero photo first, then fill up to MAX_VIDEO_PHOTOS with the
-    # rest of the listing's photos -- slicing image_urls by position before honoring
-    # photo_index would silently drop the hero photo (or point photo_index out of bounds)
-    # whenever the listing has more photos than MAX_VIDEO_PHOTOS.
+    # Hero photo first, then the rest in their existing order, then truncate. Slicing
+    # before honouring photo_index would silently drop the hero whenever the listing
+    # has more photos than MAX_VIDEO_PHOTOS.
     hero_url = image_urls[photo_index]
     rest_urls = [u for i, u in enumerate(image_urls) if i != photo_index]
     selected_urls = ([hero_url] + rest_urls)[:MAX_VIDEO_PHOTOS]
-    photos = [_fetch_image(u) for u in selected_urls]
-    photo_index = 0  # hero is always first in `photos` now
 
-    agent_photo = None
-    if agent_photo_url:
-        try:
-            agent_photo = _fetch_image(agent_photo_url)
-        except Exception:
-            # A broken/missing profile photo shouldn't fail the whole video --
-            # the outro just falls back to its original text-only layout.
-            agent_photo = None
+    degradations = []
+    started = time.monotonic()
 
-    stats_line = "   ·   ".join(s for s in stats if s)
+    if not _RENDER_SLOTS.acquire(timeout=RENDER_SLOT_WAIT_SECONDS):
+        raise RuntimeError(
+            "The video service is busy with other renders right now. Please try again "
+            "in a few minutes."
+        )
+    try:
+        photos = []
+        for url in selected_urls:
+            try:
+                photos.append(_fetch_image(url))
+            except Exception as e:
+                logger.warning("skipping unreadable photo %s: %s", url, e)
+                degradations.append("a photo could not be read and was skipped")
+        if not photos:
+            raise RuntimeError("None of this listing's photos could be downloaded")
 
-    with tempfile.TemporaryDirectory() as workdir:
-        clip_paths = []
-        clip_durations = []
+        agent_photo = None
+        if agent_photo_url:
+            try:
+                agent_photo = _fetch_image(agent_photo_url)
+            except Exception as e:
+                logger.warning("agent profile photo unavailable (%s)", e)
+                degradations.append("the agent's profile photo could not be loaded, so the closing card has no portrait")
 
-        # Selected hero photo leads (gets the text-overlay treatment), same
-        # relative order for the rest -- so choosing a different star photo
-        # actually changes what opens the slideshow.
-        ordered_photos = [photos[photo_index]] + [p for i, p in enumerate(photos) if i != photo_index]
-        for i, photo in enumerate(ordered_photos):
-            if i == 0:
-                slide = _render_photo_slide(photo, district, property_type, price_text, stats_line)
+        captions, caption_note = _generate_room_captions(photos, copy_guard=copy_guard)
+        if caption_note:
+            degradations.append(f"captions: {caption_note}")
+
+        with tempfile.TemporaryDirectory() as workdir:
+            clip_paths = []
+            for i, photo in enumerate(photos):
+                if i > 0 and time.monotonic() - started > RENDER_BUDGET_SECONDS:
+                    logger.warning("render budget reached after %d photos; finishing early", i)
+                    degradations.append(f"took too long, so only the first {i} photos were used")
+                    break
+                frame = _fit_frame(photo, VW, VH)
+                clip_path = os.path.join(workdir, f"clip_{i:02d}.mp4")
+                try:
+                    _kenburns_clip(
+                        frame, clip_path, workdir, i,
+                        caption=captions[i] if i < len(captions) else None,
+                        zoom_in=(i % 2 == 0),
+                        fade_in=(i == 0),
+                    )
+                except Exception as e:
+                    logger.warning("clip %d failed (%s); skipping that photo", i, e)
+                    degradations.append("a photo failed to render and was skipped")
+                    continue
+                clip_paths.append(clip_path)
+
+            if not clip_paths:
+                raise RuntimeError("No photo could be rendered into the video")
+
+            body_path = os.path.join(workdir, "body.mp4")
+            if len(clip_paths) == 1:
+                os.replace(clip_paths[0], body_path)
             else:
-                slide = _render_plain_slide(photo)
-            clip_path = os.path.join(workdir, f"clip_{i:02d}.mp4")
-            _zoompan_clip(slide, clip_path, SECONDS_PER_PHOTO, zoom_in=(i % 2 == 0))
-            clip_paths.append(clip_path)
-            clip_durations.append(SECONDS_PER_PHOTO)
+                _concat(clip_paths, body_path, workdir, "body_list", TIMEOUT_CONCAT)
+            body_duration = _probe_duration(body_path, len(clip_paths) * SECONDS_PER_PHOTO)
 
-        outro = _render_outro_slide(agent_name, agent_contact_line, agent_photo)
-        outro_path = os.path.join(workdir, "clip_outro.mp4")
-        _zoompan_clip(outro, outro_path, OUTRO_SECONDS, zoom_in=True)
-        clip_paths.append(outro_path)
-        clip_durations.append(OUTRO_SECONDS)
+            # --- closing contact card (degrades to no card) ---
+            silent_path = body_path
+            silent_duration = body_duration
+            try:
+                card_img = _render_contact_card(agent_name, agent_contact_line, agent_photo)
+                card_clip = os.path.join(workdir, "card.mp4")
+                _build_card_clip(body_path, card_img, card_clip, workdir)
+                with_card = os.path.join(workdir, "with_card.mp4")
+                _concat([body_path, card_clip], with_card, workdir, "card_list", TIMEOUT_CONCAT)
+                silent_path = with_card
+                silent_duration = _probe_duration(
+                    with_card, body_duration + CARD_HOLD_SECONDS + CARD_SECONDS)
+            except Exception as e:
+                logger.warning("contact card failed (%s); shipping the slideshow without it", e)
+                degradations.append("the closing contact card could not be built")
 
-        final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
-        has_audio = os.path.exists(AUDIO_PATH)
-
-        def _audio_filter(input_index, total_duration):
-            fade_out_start = max(0.0, total_duration - AUDIO_FADE_SECONDS)
-            return (
-                f"[{input_index}:a]atrim=0:{total_duration:.3f},asetpts=PTS-STARTPTS,"
-                f"volume={AUDIO_VOLUME},afade=t=in:d={AUDIO_FADE_SECONDS},"
-                f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_SECONDS}[aout]"
-            )
-
-        if len(clip_paths) == 1:
-            total_duration = clip_durations[0]
-            if has_audio:
-                cmd = [
-                    "ffmpeg", "-y", "-i", clip_paths[0], "-stream_loop", "-1", "-i", AUDIO_PATH,
-                    "-filter_complex", _audio_filter(1, total_duration),
-                    "-map", "0:v", "-map", "[aout]",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart", final_path,
-                ]
+            # --- music bed (degrades to silence) ---
+            final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
+            wrote_final = False
+            if os.path.exists(AUDIO_PATH):
+                fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
+                audio_filter = (
+                    f"[1:a]atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS,"
+                    f"volume={AUDIO_VOLUME},"
+                    f"afade=t=in:st=0:d={AUDIO_FADE_IN_SECONDS},"
+                    f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_OUT_SECONDS}[aout]"
+                )
+                try:
+                    _run_ffmpeg([
+                        "ffmpeg", "-y", "-i", silent_path,
+                        # -stream_loop so a track shorter than the video still covers it.
+                        "-stream_loop", "-1", "-i", AUDIO_PATH,
+                        "-filter_complex", audio_filter,
+                        "-map", "0:v", "-map", "[aout]",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                        "-movflags", "+faststart", final_path,
+                    ], TIMEOUT_MUSIC)
+                    wrote_final = True
+                except Exception as e:
+                    logger.warning("music bed failed (%s); shipping a silent video", e)
+                    degradations.append("the background music could not be added")
             else:
-                cmd = ["ffmpeg", "-y", "-i", clip_paths[0], "-c", "copy", "-movflags", "+faststart", final_path]
-            _run_ffmpeg(cmd, 60)
-        else:
-            # Fold clips together pairwise (2 open input streams per ffmpeg call) rather
-            # than handing ffmpeg one filter graph with every clip open simultaneously --
-            # see _xfade_pair's docstring for why.
-            running_path = clip_paths[0]
-            running_duration = clip_durations[0]
-            for i in range(1, len(clip_paths)):
-                merged_path = os.path.join(workdir, f"merged_{i:02d}.mp4")
-                _xfade_pair(running_path, clip_paths[i], merged_path, running_duration, TRANSITION_SECONDS, 90)
-                running_path = merged_path
-                running_duration = running_duration + clip_durations[i] - TRANSITION_SECONDS
+                logger.warning("music track missing at %s", AUDIO_PATH)
+                degradations.append("the background music file is missing from the deploy")
 
-            if has_audio:
-                cmd = [
-                    "ffmpeg", "-y", "-i", running_path, "-stream_loop", "-1", "-i", AUDIO_PATH,
-                    "-filter_complex", _audio_filter(1, running_duration),
-                    "-map", "0:v", "-map", "[aout]",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart", final_path,
-                ]
-            else:
-                cmd = ["ffmpeg", "-y", "-i", running_path, "-c", "copy", "-movflags", "+faststart", final_path]
-            _run_ffmpeg(cmd, 60)
+            if not wrote_final:
+                _run_ffmpeg(["ffmpeg", "-y", "-i", silent_path, "-c", "copy",
+                             "-movflags", "+faststart", final_path], TIMEOUT_MUSIC)
 
-        with open(final_path, "rb") as f:
-            return f.read()
+            with open(final_path, "rb") as f:
+                data = f.read()
+
+        if degradations:
+            logger.warning("video rendered with degradations: %s", "; ".join(degradations))
+        logger.info(
+            "video rendered: %d photo(s), %.1fs, %.1fMB, %.0fs wall clock",
+            len(clip_paths), silent_duration, len(data) / 1024 / 1024,
+            time.monotonic() - started,
+        )
+        return data, degradations
+    finally:
+        _RENDER_SLOTS.release()

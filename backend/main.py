@@ -2010,7 +2010,27 @@ _video_render_tasks = set()
 
 def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int):
     try:
+        # Re-read the listing at job start rather than trusting the snapshot the
+        # endpoint captured. A render takes a minute or more, and in that window the
+        # agent may well delete or reorder a photo from the same My Listings screen --
+        # rendering the stale array would put a photo they just removed into a video
+        # they are about to post. The freshest possible read is also the cheapest fix:
+        # one extra select per render. If the re-read fails (DB blip), fall back to the
+        # snapshot rather than losing the render entirely.
+        try:
+            fresh = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+            if fresh.data:
+                listing = fresh.data[0]
+        except Exception as e:
+            logger.warning("video job %s: could not re-read listing (%s); using the queued snapshot", listing_id, e)
+
         images = listing.get("images") or []
+        if not images:
+            raise RuntimeError("This listing has no photos any more -- add a photo and generate the video again.")
+        # The hero photo may have been the one deleted, which would leave photo_index
+        # pointing past the end of the shortened array.
+        if photo_index < 0 or photo_index >= len(images):
+            photo_index = 0
 
         price_num = _to_number(listing.get("price"))
         built_up_num = _to_number(listing.get("built_up"))
@@ -2034,7 +2054,7 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
             f"SGD {price_psf:,} psf" if price_psf else "",
         ]
 
-        video_bytes = video_renderer.render_property_video(
+        video_bytes, degradations = video_renderer.render_property_video(
             image_urls=images,
             property_type=property_type_text,
             district=district_text,
@@ -2045,7 +2065,17 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
             style=chosen_video_template_id,
             photo_index=photo_index,
             agent_photo_url=agent.get("photo_url"),
+            # Room captions are model-written and burned into the video, so they go
+            # through exactly the same house-number/price stripping as every other
+            # copy surface. Passed in rather than imported because video_renderer
+            # cannot import main (main imports it).
+            copy_guard=apply_listing_copy_guards,
         )
+        if degradations:
+            # The agent still gets a video, so this is not a failure -- but a quietly
+            # degraded render should be visible in Railway's logs, not indistinguishable
+            # from a clean one.
+            logger.warning("video %s rendered with degradations: %s", listing_id, "; ".join(degradations))
 
         supabase = get_db()
         filename = f"videos/{listing_id}.mp4"
