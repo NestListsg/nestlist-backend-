@@ -1,8 +1,14 @@
 """NestList property video renderer -- the production "Classic tier" listing video.
 
-Turns a listing's photos into a 1440x1080 cinematic slideshow: alternating Ken Burns
-pans, one expressive AI-written room caption per photo, a soft piano bed, and a closing
-contact card built from the agent's own profile.
+Turns a listing's photos into a 1080x1920 (9:16) cinematic slideshow: alternating Ken
+Burns motion, one expressive AI-written room caption per photo, a soft piano bed, and a
+closing contact card built from the agent's own profile.
+
+Vertical is the only output format, because these videos are posted to Facebook,
+Instagram and TikTok. Since listing photos are overwhelmingly landscape, the frame is
+always filled by a cover-crop and the motion drifts horizontally across whatever width
+the photo has to spare -- a tall frame travelling over a wide room is the shot that
+reads best on Reels, and it recovers the sides a static 9:16 crop would simply lose.
 
 This is a port of the recipe validated over three weeks of prototyping (see
 prototypes/classic_build.py, caption_signature.py, contact_card.py, assemble_v28.py).
@@ -35,24 +41,37 @@ import time
 import uuid
 
 import requests
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Validated prototype constants
 # ---------------------------------------------------------------------------
-VW, VH = 1440, 1080
+VW, VH = 1080, 1920  # 9:16 -- these videos are posted to Reels, Stories and TikTok
 FPS = 24
 SECONDS_PER_PHOTO = 5.0
 FRAMES_PER_PHOTO = int(SECONDS_PER_PHOTO * FPS)  # 120
 
-# zoompan works on an upscaled copy of the photo: at native 1440x1080 the per-frame
-# crop rectangle lands on whole pixels and the pan visibly stair-steps. Upscaling 4x
-# first gives the crop sub-pixel resolution, which is what makes the prototype's pan
-# read as smooth. It also costs memory (a 5760x4320 frame is ~75MB), which is why
-# renders are throttled by _RENDER_SLOTS below.
-ZOOM_UPSCALE = 4
+# Motion works on an upscaled copy of the photo: at native size the per-frame crop
+# rectangle lands on whole pixels and slow motion visibly stair-steps. Upscaling first
+# gives the crop sub-pixel resolution. 2x is the balance point for a 1080x1920 frame --
+# the prototype's 4x was tuned for a much smaller 1440x1080 canvas, and at 9:16 the
+# same factor would mean a 33MP filter frame (~100MB) per concurrent render.
+UPSCALE = 2
+
+# --- horizontal pan (the usual case) ---
+# Listing photos are overwhelmingly landscape, so a 9:16 frame can only ever show a
+# slice of one. Rather than throw the rest away, the frame keeps a working strip 1.3x
+# its own width and drifts across it: a vertical frame travelling over a wide room is
+# the motion that reads best on Reels. Slack is 0.30 x 1080 = 324px over 5s (~65px/s),
+# a slow drift rather than a whip pan.
+PAN_WIDTH_RATIO = 1.30
+# A photo needs this much width (relative to its height) to have anything spare to pan
+# across. Anything squarer than ~3:4 qualifies; taller portrait shots fall back to zoom.
+PAN_MIN_ASPECT = (VW / VH) * PAN_WIDTH_RATIO
+
+# --- zoom fallback (portrait/tall sources with no width to spare) ---
 ZOOM_STEP = 0.0009
 ZOOM_MAX = 1.13
 
@@ -117,8 +136,16 @@ CARD_BG = (250, 248, 245)     # warm off-white
 CARD_INK = (43, 43, 43)       # soft charcoal
 CARD_GOLD = (176, 141, 87)    # quiet gold accent
 
-CAPTION_FONT_SIZE = 40
-CAPTION_BASELINE_OFFSET = 135  # y = h - 135
+# Captions sit in the lower third but well clear of the bottom ~350px, where Reels and
+# TikTok stack their own UI (caption text, handle, action rail, progress bar). Anything
+# drawn down there is covered by the platform on at least one network. The block is two
+# lines split at the " ... ", with its LAST line topped at CAPTION_LAST_LINE_Y, so the
+# block grows upward and the clearance below never changes.
+CAPTION_FONT_SIZE = 54
+CAPTION_MIN_FONT_SIZE = 38
+CAPTION_LAST_LINE_Y = 1460          # 1920 - 1460 = 460px of clearance below the text
+CAPTION_LINE_SPACING = 1.32         # multiple of font size
+CAPTION_SIDE_MARGIN = 60            # so max text width is 1080 - 120 = 960
 
 # Identical encoder settings on every clip, so the final concat can be a stream copy
 # (no re-encode) without mismatched stream parameters.
@@ -227,34 +254,26 @@ def _fetch_image(url, attempts=2):
     raise RuntimeError(f"could not fetch photo: {last_error}")
 
 
-def _fit_frame(img, w, h, centering=(0.5, 0.4), aspect_tolerance=1.15,
-               blur_radius=40, darken=0.55):
-    """Fits a photo into a (w, h) frame without distorting it and without black bars.
+def _prepare_frame(img, centering=(0.5, 0.42)):
+    """Cover-crops a photo to the working size for its motion, returning
+    (image, can_pan).
 
-    Against a 4:3 canvas most listing photos (3:2, 4:3) are close enough that a plain
-    cover-fit loses only a sliver of the edges, so that is what they get -- full bleed,
-    nothing to distract from the pan. Genuinely wide shots (16:9, panoramas) would lose
-    a third of their width to that crop, often the part of a frontage that matters, so
-    those are shown whole and letterboxed, with the empty bands filled by a blurred,
-    darkened copy of the same photo (the Instagram/TikTok treatment) rather than black.
+    The frame is always filled edge to edge -- no letterbox, no bars. A photo with
+    width to spare is cropped to a strip PAN_WIDTH_RATIO times wider than the frame so
+    the pan has somewhere to travel; a tall photo with nothing spare is cropped square
+    to the frame and gets the zoom instead.
+
+    Vertical centering sits slightly above middle: in a 9:16 crop of a room shot, the
+    ceiling is the least interesting band and dead-centring tends to cut the floor.
     """
     img = img.convert("RGB")
     src_w, src_h = img.size
-    src_aspect = src_w / src_h
-    target_aspect = w / h
+    can_pan = (src_w / src_h) >= PAN_MIN_ASPECT
 
-    if src_aspect <= target_aspect * aspect_tolerance:
-        return ImageOps.fit(img, (w, h), centering=centering)
-
-    background = ImageOps.fit(img, (w, h), centering=centering)
-    background = background.filter(ImageFilter.GaussianBlur(blur_radius))
-    background = Image.blend(background, Image.new("RGB", (w, h), (0, 0, 0)), darken)
-
-    fg_w = w
-    fg_h = max(1, round(w / src_aspect))
-    foreground = img.resize((fg_w, fg_h), Image.LANCZOS)
-    background.paste(foreground, (0, (h - fg_h) // 2))
-    return background
+    out_w = round(VW * PAN_WIDTH_RATIO) if can_pan else VW
+    target = (out_w * UPSCALE, VH * UPSCALE)
+    # ImageOps.fit scales to cover the target and crops the overflow -- never pads.
+    return ImageOps.fit(img, target, method=Image.LANCZOS, centering=centering), can_pan
 
 
 # ---------------------------------------------------------------------------
@@ -434,25 +453,72 @@ def _generate_room_captions(photos, copy_guard=None):
 # ---------------------------------------------------------------------------
 # Clip rendering
 # ---------------------------------------------------------------------------
-def _kenburns_clip(frame_img, out_path, workdir, index, caption=None, zoom_in=True,
-                   fade_in=False):
-    """One photo -> one 5s Ken Burns clip, with its caption burned in during the same
+def _caption_lines(caption):
+    """Splits a caption at its " ... " into two centred lines. At 1080 wide a 54px
+    serif runs out of room around 40 characters, so the validated one-line treatment
+    from the 1440-wide prototype would overflow the frame; breaking at the separator is
+    where the phrase already wants to breathe anyway."""
+    head, _, tail = caption.partition(CAPTION_SEPARATOR)
+    lines = [f"{head.strip()} ...", tail.strip()] if tail else [caption]
+    return [ln for ln in lines if ln]
+
+
+def _caption_font_size(captions):
+    """ONE font size for every caption in a video -- the largest that fits the longest
+    line of any of them. Sizing each caption independently would fit more text on the
+    wordy ones, but the type would visibly change size from photo to photo, which reads
+    as a mistake. Consistent typography is worth a few points on the long ones."""
+    lines = [ln for c in captions if c for ln in _caption_lines(c)]
+    if not lines:
+        return CAPTION_FONT_SIZE
+    max_width = VW - 2 * CAPTION_SIDE_MARGIN
+    size = CAPTION_FONT_SIZE
+    while size > CAPTION_MIN_FONT_SIZE:
+        font = ImageFont.truetype(SERIF_ITALIC, size)
+        if max(font.getlength(ln) for ln in lines) <= max_width:
+            break
+        size -= 2
+    return size
+
+
+def _kenburns_clip(frame_img, out_path, workdir, index, caption=None, caption_size=None,
+                   can_pan=True, left_to_right=True, zoom_in=True, fade_in=False):
+    """One photo -> one 5s motion clip, with its caption burned in during the same
     pass. Doing the caption here rather than over the finished video means a per-photo
     timing window falls out for free, one photo's caption can be omitted without
     touching the others, and the video is only ever encoded once."""
-    src_path = os.path.join(workdir, f"src_{index:02d}.png")
-    frame_img.save(src_path, format="PNG")
+    # BMP, deliberately. A prepared pan frame is 2808x3840, and PNG spends real time
+    # compressing something we delete seconds later. JPEG is faster still but hands
+    # ffmpeg a full-range (yuvj420p) source, so the whole video inherits the JPEG range
+    # flag and plays with lifted blacks on players that honour it. BMP is uncompressed
+    # RGB: fast to write, and RGB converts to limited-range yuv420p the same way the
+    # PNG path did.
+    src_path = os.path.join(workdir, f"src_{index:02d}.bmp")
+    frame_img.save(src_path, format="BMP")
 
-    if zoom_in:
-        z = f"min(zoom+{ZOOM_STEP},{ZOOM_MAX})"
+    if can_pan:
+        # Fixed-size window drifting horizontally. zoompan cannot do this: its crop
+        # window always carries the INPUT's aspect ratio, so panning across a strip
+        # wider than 9:16 and forcing the result to 1080x1920 would squeeze the image.
+        # crop takes an explicit 9:16 window and only moves it, so nothing distorts.
+        # x steps by frame number rather than time so the travel is frame-exact.
+        travel = f"(iw-ow)*n/{FRAMES_PER_PHOTO - 1}"
+        if not left_to_right:
+            travel = f"(iw-ow)*(1-n/{FRAMES_PER_PHOTO - 1})"
+        filters = [
+            f"crop=w={VW * UPSCALE}:h={VH * UPSCALE}:x='{travel}':y=0",
+            f"scale={VW}:{VH}",
+        ]
     else:
-        z = f"if(eq(on,1),{ZOOM_MAX},max(zoom-{ZOOM_STEP},1.0))"
-
-    filters = [
-        f"scale={VW * ZOOM_UPSCALE}:{VH * ZOOM_UPSCALE}",
-        (f"zoompan=z='{z}':d={FRAMES_PER_PHOTO}:s={VW}x{VH}:fps={FPS}"
-         f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"),
-    ]
+        if zoom_in:
+            z = f"min(zoom+{ZOOM_STEP},{ZOOM_MAX})"
+        else:
+            z = f"if(eq(on,1),{ZOOM_MAX},max(zoom-{ZOOM_STEP},1.0))"
+        filters = [
+            (f"zoompan=z='{z}':d={FRAMES_PER_PHOTO}:s={VW}x{VH}:fps={FPS}"
+             f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"),
+        ]
+    filters.append("setsar=1")
 
     if caption:
         # drawtext reads the caption from a file rather than an inline `text=` value:
@@ -460,16 +526,25 @@ def _kenburns_clip(frame_img, out_path, workdir, index, caption=None, zoom_in=Tr
         # nested parsers (shell-free argv, filtergraph, drawtext). textfile= plus
         # expansion=none removes that whole class of bug -- and with it any chance of a
         # caption smuggling filter syntax into the command.
-        text_path = os.path.join(workdir, f"cap_{index:02d}.txt")
-        with open(text_path, "w", encoding="utf-8") as f:
-            f.write(caption)
-        filters.append(
-            f"drawtext=fontfile={_escape_filter_path(SERIF_ITALIC)}"
-            f":textfile={_escape_filter_path(text_path)}:expansion=none"
-            f":fontcolor=white:fontsize={CAPTION_FONT_SIZE}"
-            f":x=(w-text_w)/2:y=h-{CAPTION_BASELINE_OFFSET}"
-            f":shadowcolor=black@0.6:shadowx=2:shadowy=2"
-        )
+        # One drawtext per line, each independently centred. drawtext's own multi-line
+        # handling left-aligns lines within the block unless the `text_align` option is
+        # present, which only exists in ffmpeg 7.0+ -- and Railway installs whatever
+        # ffmpeg its base image ships. Two filters centre correctly on any version.
+        lines = _caption_lines(caption)
+        size = caption_size or CAPTION_FONT_SIZE
+        line_height = round(size * CAPTION_LINE_SPACING)
+        first_line_y = CAPTION_LAST_LINE_Y - (len(lines) - 1) * line_height
+        for line_no, line in enumerate(lines):
+            text_path = os.path.join(workdir, f"cap_{index:02d}_{line_no}.txt")
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write(line)
+            filters.append(
+                f"drawtext=fontfile={_escape_filter_path(SERIF_ITALIC)}"
+                f":textfile={_escape_filter_path(text_path)}:expansion=none"
+                f":fontcolor=white:fontsize={size}"
+                f":x=(w-text_w)/2:y={first_line_y + line_no * line_height}"
+                f":shadowcolor=black@0.6:shadowx=2:shadowy=2"
+            )
 
     if fade_in:
         # After drawtext, so the caption rises out of black with the photo rather than
@@ -478,7 +553,11 @@ def _kenburns_clip(frame_img, out_path, workdir, index, caption=None, zoom_in=Tr
 
     filters.append("format=yuv420p")
 
-    cmd = (["ffmpeg", "-y", "-loop", "1", "-t", str(SECONDS_PER_PHOTO), "-i", src_path,
+    # -framerate on the INPUT so the looped still is generated at 24fps: the pan's x
+    # expression counts input frames, and without this ffmpeg loops at its 25fps
+    # default, so the pan would finish its travel slightly before the clip ends.
+    cmd = (["ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS),
+            "-t", str(SECONDS_PER_PHOTO), "-i", src_path,
             "-vf", ",".join(filters), "-frames:v", str(FRAMES_PER_PHOTO)]
            + _ENCODE_ARGS + [out_path])
     try:
@@ -525,7 +604,7 @@ def _render_contact_card(agent_name, agent_contact_line, agent_photo=None):
     cx = VW // 2
 
     if agent_photo:
-        diameter = 520
+        diameter = 620
         photo = agent_photo.convert("RGB")
         side = min(photo.size)
         # centering=(0.5, 0.0) takes the TOP square of the portrait. Centre-cropping a
@@ -536,22 +615,26 @@ def _render_contact_card(agent_name, agent_contact_line, agent_photo=None):
         photo = photo.resize((diameter, diameter), Image.LANCZOS)
         mask = Image.new("L", (diameter, diameter), 0)
         ImageDraw.Draw(mask).ellipse([0, 0, diameter, diameter], fill=255)
-        top = 96
+        # The whole block (circle through contact line) is centred on the 1920-tall
+        # frame rather than pinned near the top: on a phone the card is seen full
+        # height, and a top-weighted layout leaves an obvious dead zone underneath.
+        top = 430
         card.paste(photo, (cx - diameter // 2, top), mask)
         draw.ellipse(
-            [cx - diameter // 2 - 4, top - 4, cx + diameter // 2 + 4, top + diameter + 4],
-            outline=CARD_GOLD, width=4,
+            [cx - diameter // 2 - 5, top - 5, cx + diameter // 2 + 5, top + diameter + 5],
+            outline=CARD_GOLD, width=5,
         )
-        name_y, divider_y, invite_y, contact_y = 680, 795, 830, 905
+        name_y, divider_y, invite_y, contact_y = 1150, 1290, 1330, 1420
     else:
         # No profile photo: no empty circle, no gap where one would have been -- the
-        # text block simply centres on the card.
-        name_y, divider_y, invite_y, contact_y = 400, 515, 550, 625
+        # same text block simply re-centres on the card.
+        name_y, divider_y, invite_y, contact_y = 793, 933, 973, 1063
 
-    max_width = VW - 200
-    name_font = _fit_text(draw, agent_name or "", SERIF_REGULAR, 74, max_width)
-    invite_font = ImageFont.truetype(SERIF_ITALIC, 44)
-    contact_font = _fit_text(draw, agent_contact_line or "", SERIF_REGULAR, 54, max_width)
+    max_width = VW - 160
+    name_font = _fit_text(draw, agent_name or "", SERIF_REGULAR, 86, max_width)
+    invite_font = _fit_text(draw, "Contact me to arrange for a viewing",
+                            SERIF_ITALIC, 52, max_width)
+    contact_font = _fit_text(draw, agent_contact_line or "", SERIF_REGULAR, 64, max_width)
 
     def centred(text, y, font, fill):
         if not text:
@@ -559,7 +642,7 @@ def _render_contact_card(agent_name, agent_contact_line, agent_photo=None):
         draw.text((cx - draw.textlength(text, font=font) / 2, y), text, font=font, fill=fill)
 
     centred(agent_name or "", name_y, name_font, CARD_INK)
-    draw.line([cx - 90, divider_y, cx + 90, divider_y], fill=CARD_GOLD, width=3)
+    draw.line([cx - 105, divider_y, cx + 105, divider_y], fill=CARD_GOLD, width=3)
     centred("Contact me to arrange for a viewing", invite_y, invite_font, CARD_INK)
     centred(agent_contact_line or "", contact_y, contact_font, CARD_GOLD)
     return card
@@ -668,6 +751,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
         captions, caption_note = _generate_room_captions(photos, copy_guard=copy_guard)
         if caption_note:
             degradations.append(f"captions: {caption_note}")
+        caption_size = _caption_font_size(captions)
 
         with tempfile.TemporaryDirectory() as workdir:
             clip_paths = []
@@ -676,12 +760,17 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                     logger.warning("render budget reached after %d photos; finishing early", i)
                     degradations.append(f"took too long, so only the first {i} photos were used")
                     break
-                frame = _fit_frame(photo, VW, VH)
+                frame, can_pan = _prepare_frame(photo)
                 clip_path = os.path.join(workdir, f"clip_{i:02d}.mp4")
                 try:
                     _kenburns_clip(
                         frame, clip_path, workdir, i,
                         caption=captions[i] if i < len(captions) else None,
+                        caption_size=caption_size,
+                        can_pan=can_pan,
+                        # Alternating direction is what gives the sequence its rhythm --
+                        # every clip drifting the same way reads like a conveyor belt.
+                        left_to_right=(i % 2 == 0),
                         zoom_in=(i % 2 == 0),
                         fade_in=(i == 0),
                     )
