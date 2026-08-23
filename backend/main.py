@@ -583,6 +583,180 @@ def confirm_password_reset(req: PasswordResetConfirm):
     return {"success": True}
 
 # ================================
+# LISTING COPY GUARDS
+# ================================
+# Janel's field feedback (see prototypes/output/listing_copy_rules.md): generated
+# copy must never carry a house/unit number, and the listing story must never
+# carry the asking price in any form. Prompt wording alone is not a guarantee --
+# the model can reconstruct a number on a retry or an odd input -- so there are
+# two deterministic layers plus a price check, all of which STRIP rather than
+# reject. A stripped sentence still reads fine; a failed generation costs the
+# agent a listing.
+
+# Layer 1a: leading block/house number -- "22G Tembeling Road" -> "Tembeling Road".
+_HOUSE_NUMBER_PREFIX_RE = re.compile(r"^\s*\d{1,4}[A-Za-z]?\s+(?=\D)")
+# Layer 1b/2b: HDB-style unit number anywhere -- "#03-04".
+_UNIT_NUMBER_RE = re.compile(r"#\d{1,3}-\d{1,5}[A-Za-z]?")
+
+# Layer 2a: a house number the model reconstructed mid-sentence. Anchored on
+# Singapore street suffixes so plain listing numbers ("1,970 sqft", "3 bedrooms")
+# are never touched -- only a number sitting immediately in front of a street name.
+_STREET_SUFFIXES = (
+    r"Road|Ave(?:nue)?|St(?:reet)?|Dr(?:ive)?|Close|Lane|Walk|Park|Pl(?:ace)?|"
+    r"Crescent|Terrace|View|Rise|Way|Grove|Gardens?|Heights|Boulevard|Bt|Jalan|"
+    r"Lorong|Track|Link|Green|Hill|Court|Ct"
+)
+_ADDRESS_NUMBER_RE = re.compile(
+    r"\b\d{1,4}[A-Za-z]?\s+(?=((?:[A-Z][a-z]+\s+){0,2})(?:" + _STREET_SUFFIXES + r")\b)"
+)
+# A few street suffixes double as ordinary listing words ("Terrace" in
+# "Inter-Terrace", "Park" in "3 Bedroom Park View"), so a match whose in-between
+# words are room/measurement words is a false positive and is left alone. Without
+# this, "3 Bedroom Terrace" would silently lose its bedroom count.
+_NON_STREET_WORDS = {
+    "bedroom", "bedrooms", "bed", "beds", "bath", "baths", "bathroom", "bathrooms",
+    "room", "rooms", "storey", "storeys", "story", "stories", "sqft", "sqm",
+    "square", "feet", "foot", "metre", "metres", "meter", "meters", "car", "cars",
+    "level", "levels", "unit", "units", "million", "psf",
+}
+
+
+def _strip_house_number(location) -> str:
+    """Street/area name only -- leading house or block number and any #NN-NN unit
+    number removed. The raw value still goes to the DB (agents want their own
+    record of the exact unit); only copy-facing text uses this."""
+    text = str(location or "")
+    text = _UNIT_NUMBER_RE.sub("", text)
+    text = _HOUSE_NUMBER_PREFIX_RE.sub("", text)
+    # Tidy up punctuation orphaned by the removals ("12 Marine Terrace, #03-04").
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"\s+,", ",", text)
+    text = re.sub(r",\s*,", ",", text)
+    return text.strip().strip(",").strip()
+
+
+def _address_number_hits(text: str) -> list:
+    """Matches of the address-anchored house-number pattern, false positives dropped."""
+    hits = []
+    for match in _ADDRESS_NUMBER_RE.finditer(text):
+        between = (match.group(1) or "").split()
+        if any(word.lower() in _NON_STREET_WORDS for word in between):
+            continue
+        hits.append(match)
+    return hits
+
+
+def _strip_address_numbers(text: str) -> tuple:
+    """Layer 2. Returns (cleaned_text, list_of_stripped_fragments)."""
+    stripped = []
+    hits = _address_number_hits(text)
+    if hits:
+        out, last = [], 0
+        for match in hits:
+            out.append(text[last:match.start()])
+            stripped.append(match.group(0).strip())
+            last = match.end()
+        out.append(text[last:])
+        text = "".join(out)
+    for match in _UNIT_NUMBER_RE.finditer(text):
+        stripped.append(match.group(0))
+    if stripped:
+        text = _UNIT_NUMBER_RE.sub("", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\s+([,.;])", r"\1", text)
+    return text, stripped
+
+
+def _price_leak_strings(price, built_up) -> list:
+    """Every literal spelling of THIS listing's price we refuse to see in copy.
+    Exact strings, not a generic number pattern -- a generic pattern would also
+    match land size / sqft figures like "1,970"."""
+    price_num = _to_number(price)
+    if price_num <= 0:
+        return []
+    millions = _format_price_millions(price_num)          # "5.35M"
+    bare = millions[:-1] if millions.endswith("M") else millions
+    figures = [
+        f"{price_num:,.0f}",                              # 5,350,000
+        f"{price_num:.0f}",                               # 5350000
+        millions,                                         # 5.35M
+        f"{bare} million",
+    ]
+    built_up_num = _to_number(built_up)
+    if built_up_num > 0:
+        psf = round(price_num / built_up_num)
+        figures += [f"{psf:,} psf", f"{psf} psf"]
+    # Each figure also in its currency-prefixed spellings, so "SGD 5.35M" is
+    # removed whole instead of leaving an orphaned "SGD" behind.
+    candidates = set()
+    for figure in figures:
+        candidates.update({figure, f"SGD {figure}", f"S${figure}", f"${figure}"})
+    # Longest first, so the prefixed form always wins over the bare one.
+    return sorted({c for c in candidates if c}, key=len, reverse=True)
+
+
+def _strip_price_leaks(text: str, price, built_up) -> tuple:
+    """Drops the sentence carrying a price figure. Falls back to redacting just
+    the figure if sentence-dropping would gut the write-up."""
+    leaks = _price_leak_strings(price, built_up)
+    if not leaks:
+        return text, []
+    lowered = text.lower()
+    found = [leak for leak in leaks if leak.lower() in lowered]
+    if not found:
+        return text, []
+
+    def _has_leak(chunk: str) -> bool:
+        low = chunk.lower()
+        return any(leak.lower() in low for leak in found)
+
+    def _redact(chunk: str) -> str:
+        for leak in found:
+            chunk = re.sub(re.escape(leak), "", chunk, flags=re.IGNORECASE)
+        # Tidy the separator the figure was hanging off ("Tembeling Road — ").
+        chunk = re.sub(r"[ \t]{2,}", " ", chunk).strip()
+        return chunk.strip(" \t—–-·|,;:").strip()
+
+    kept_lines = []
+    for line in text.split("\n"):
+        if not _has_leak(line):
+            kept_lines.append(line)
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", line)
+        kept = [s for s in sentences if not _has_leak(s)]
+        if kept:
+            kept_lines.append(" ".join(kept).strip())
+        else:
+            # Every sentence on this line carried the figure (typically a
+            # headline). Redact the figure rather than losing the whole line.
+            kept_lines.append(_redact(line))
+    cleaned = "\n".join(kept_lines)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;])", r"\1", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip(), found
+
+
+def apply_listing_copy_guards(text: str, price=None, built_up=None, context: str = "listing") -> str:
+    """Layer 2 + price guard over generated copy. Never raises and never returns
+    empty -- if the guard itself breaks, the agent still gets their write-up and
+    the failure goes to the Railway logs for Jane to see."""
+    if not text:
+        return text
+    try:
+        cleaned, address_hits = _strip_address_numbers(text)
+        cleaned, price_hits = _strip_price_leaks(cleaned, price, built_up)
+        if address_hits:
+            logger.warning("copy guard [%s]: stripped house/unit number(s) %s", context, address_hits)
+        if price_hits:
+            logger.warning("copy guard [%s]: stripped price leak(s) %s", context, price_hits)
+        return cleaned if cleaned.strip() else text
+    except Exception as e:
+        logger.error("copy guard [%s] failed, returning ungated text: %s", context, e)
+        return text
+
+
+# ================================
 # LISTINGS ROUTES
 # ================================
 @app.get("/api/listings")
@@ -597,7 +771,13 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
         # regardless of what value was passed.
         query = query.neq("status", "lead")
     result = query.order("created_at", desc=True).execute()
-    return result.data or []
+    rows = result.data or []
+    # Additive field -- `location` stays exactly as the agent typed it (their own
+    # record), `display_location` is the house/unit-number-free version every
+    # copy surface (captions, poster text, public page) should render instead.
+    for row in rows:
+        row["display_location"] = _strip_house_number(row.get("location"))
+    return rows
 
 @app.post("/api/listings/generate")
 async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)):
@@ -672,25 +852,51 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     if issues:
         return {"compliance": {"passed": passed, "warnings": warnings, "issues": issues}, "listing": None}
 
+    # Layer 1 of the copy guard: the house/unit number is removed BEFORE the
+    # prompt is built, because the model mostly just echoes the Location it is
+    # given. The rule text below is belt; this is braces.
+    display_location = _strip_house_number(req.location)
+
     prompt = f"""You are {agent['name']} from {agent['agency']}, a specialist in {agent['specialty']}.
 Your tone: {agent.get('tone', 'Warm & Conversational')}
 You emphasise: {agent.get('emphasis', 'Lifestyle & Prestige')}
 Your signature phrase: "{agent.get('signature', 'Where your next chapter begins.')}"
 
-Write a premium property listing for:
+Write a property listing for:
 - Type: {req.property_type}
-- Location: {req.location}
+- Location: {display_location}
 - Land size: {req.land_size:,} sqft
 - Built-up: {req.built_up:,} sqft
 - Bedrooms: {req.bedrooms}
 - Bathrooms: {req.bathrooms}
-- Price: SGD {_format_price_millions(req.price)}
 - Features: {req.features}
 
+Follow these rules with no exceptions:
+
+1. NEVER include a house or unit number. If Location contains one (e.g. "22G Tembeling Road",
+   "#03-04 Amber Road", "12A Jalan Sempadan"), drop it and refer only to the street or area name
+   ("Tembeling Road"). Do not invent a substitute number, and do not restate the number even once
+   for "colour."
+
+2. Write the way a knowledgeable person would actually talk to a buyer, not the way a brochure
+   does. Avoid stock real-estate phrases — "coveted", "established enclave", "prestigious address",
+   "epitome of luxury", "nestled in", "boasts", "sprawling". If a plain word says it, use the plain
+   word. Elegant is fine; inflated is not.
+
+3. Every descriptive claim must be traceable to something in the facts above. Do not call the
+   street "sought-after," "prestigious," or "coveted" unless a fact above actually supports it. If
+   you're reaching for a superlative and can't point to what earns it, describe what's concretely
+   there instead — the layout, the orientation, the space, the light — rather than a status claim.
+   A modest, honest line beats an impressive-sounding one that isn't backed up.
+
+4. Do NOT mention price anywhere, in any form — no figure, no "attractively priced," no "priced to
+   sell," no range. Price is shown to buyers separately; leave it out of the write-up entirely.
+
 Write:
-1. A compelling headline
-2. Three paragraphs in your personal voice
-3. A warm call to action
+1. A compelling headline (no house/unit number, no price)
+2. Three short paragraphs in your personal voice — grounded, specific to the facts given, warm
+   rather than formal
+3. A warm call to action (no price)
 4. End with: {agent['name']} | {agent['agency']} Specialist"""
 
     response = await create_claude_message(
@@ -699,6 +905,10 @@ Write:
         messages=[{"role": "user", "content": prompt}]
     )
     listing_text = response.content[0].text.strip().replace('**', '').replace('---', '').replace('# ', '').strip()
+    # Layer 2 + price guard: catches anything the model reconstructed on its own.
+    listing_text = apply_listing_copy_guards(
+        listing_text, price=req.price, built_up=req.built_up, context=f"generate:{agent['id']}"
+    )
 
     saved = get_db().table("listings").insert({
         "agent_id": agent["id"],
@@ -717,9 +927,13 @@ Write:
         "features": req.features,
     }).execute()
 
+    listing_row = saved.data[0]
+    # `location` in the DB stays as the agent typed it; copy surfaces use this.
+    listing_row["display_location"] = display_location
+
     return {
         "compliance": {"passed": passed, "warnings": warnings, "issues": issues},
-        "listing": saved.data[0]
+        "listing": listing_row
     }
 
 MAX_LISTING_PHOTOS = 15  # per listing, not per request -- see _process_and_upload_images
@@ -1700,7 +1914,11 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
     bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
 
-    district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
+    # Posters/videos only ever draw the district token ("DISTRICT 15"), never the
+    # street line -- but the location is sanitized first anyway so a house number
+    # can never reach on-image text if this ever starts drawing more of it.
+    poster_location = _strip_house_number(listing.get("location"))
+    district_match = re.search(r"district\s*\d+", poster_location, re.IGNORECASE)
     property_type_text = (listing.get("property_type") or "").upper()
     district_text = district_match.group(0).upper() if district_match else ""
 
@@ -1802,7 +2020,10 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
         bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
         bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
 
-        district_match = re.search(r"district\s*\d+", str(listing.get("location") or ""), re.IGNORECASE)
+        # Same as the poster path: only the district token is drawn, but the
+        # location is sanitized before it is read so no house number can leak.
+        video_location = _strip_house_number(listing.get("location"))
+        district_match = re.search(r"district\s*\d+", video_location, re.IGNORECASE)
         property_type_text = (listing.get("property_type") or "").upper()
         district_text = district_match.group(0).upper() if district_match else ""
 
@@ -2526,8 +2747,16 @@ def get_public_listing(listing_id: str):
         "id": listing["id"],
         "property_type": listing["property_type"],
         "location": listing["location"],
+        # Buyer-facing surface: the public page should render this, not `location`.
+        # `location` is kept in the payload so nothing that already reads it breaks.
+        "display_location": _strip_house_number(listing.get("location")),
         "price": listing["price"],
-        "content": listing["content"],
+        "content": apply_listing_copy_guards(
+            listing.get("content"),
+            price=listing.get("price"),
+            built_up=listing.get("built_up"),
+            context=f"public:{listing['id']}",
+        ),
         "images": listing.get("images") or [],
         "bedrooms": listing.get("bedrooms"),
         "land_size": listing.get("land_size"),
