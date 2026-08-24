@@ -107,7 +107,6 @@ CONTAIN_ZOOM_STEP = round((CONTAIN_ZOOM_MAX - 1.0) / FRAMES_PER_PHOTO, 6)
 # sharp photo, which is the whole point of the technique.
 CONTAIN_BLUR_RADIUS = 11    # at quarter scale, so ~44px at full resolution
 CONTAIN_BG_DARKEN = 0.18    # just enough that the sharp photo still separates
-CONTAIN_OPEN_FADE = 0.75    # sharp photo fades up over its own backdrop, never black
 
 OPEN_FADE_SECONDS = 0.75  # first photo fades up from black; never a cold first frame
 
@@ -327,14 +326,11 @@ def _prepare_frame(img, centering=(0.5, 0.42)):
     return ImageOps.fit(img, target, method=Image.LANCZOS, centering=centering), can_pan
 
 
-def _contain_over_blur(img, with_foreground=True):
+def _contain_over_blur(img):
     """STYLE B frame: the whole photo, centred over a blurred, darkened copy of
     itself. Nothing is cropped out of the foreground -- the sides a 9:16 cover-crop
     would lose are all still there, and the backdrop fills the frame so there are no
     bars.
-
-    with_foreground=False returns the backdrop alone. That is what the first clip
-    fades up FROM, so the video opens on the photo's own colour rather than on black.
 
     The blur is done at thumbnail size and then scaled up, not applied at full
     resolution. A 28px Gaussian over a 2160x3840 canvas is enormously expensive and
@@ -350,8 +346,6 @@ def _contain_over_blur(img, with_foreground=True):
     background = small.resize((w, h), Image.LANCZOS)
     background = Image.blend(background, Image.new("RGB", (w, h), (0, 0, 0)),
                              CONTAIN_BG_DARKEN)
-    if not with_foreground:
-        return background
 
     # Contain: full width, natural height, centred. A photo taller than the frame
     # (rare, but a phone panorama shot vertically would be) is bounded by height
@@ -577,10 +571,10 @@ def _caption_filters(caption, caption_size, workdir, index, alpha_expr=None,
     """The drawtext filters for one caption, shared by both styles so the caption
     treatment can never drift between them during the bake-off.
 
-    alpha_expr ramps the text in. Style A doesn't need it (the whole frame fades up
-    from black, caption included), but style B's opening fades only the photo in over
-    its backdrop -- without this the caption would sit at full strength over a still
-    half-formed image.
+    alpha_expr ramps the text in and out. Style A doesn't need it (the whole frame
+    fades up from black, caption included); style B uses it to keep each caption
+    inside its own clip's non-overlap window so it never double-strikes through a
+    dissolve.
     """
     if not caption:
         return []
@@ -610,15 +604,15 @@ def _caption_filters(caption, caption_size, workdir, index, alpha_expr=None,
 
 
 def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=None,
-                  zoom_in=True, open_fade=False, first=True, last=True):
+                  zoom_in=True, first=True, last=True):
     """STYLE B: one photo -> one 5s contain-over-blur clip with a gentle zoom.
 
-    On the first clip the sharp photo dissolves up over its own blurred backdrop
-    instead of the whole frame rising from black. That is done by overlaying the full
-    composite onto the backdrop-only still with `fade=alpha=1`: both layers carry an
-    identical backdrop, so the only thing that visibly appears is the photo.
+    Every clip, the first included, opens fully composed -- sharp photo already in
+    place over its backdrop. Jane rejected the earlier fade-up-over-backdrop opening
+    ("i don't want the video to open with a blur screen"): the video starts cold on
+    slide one.
     """
-    composite = _contain_over_blur(photo, with_foreground=True)
+    composite = _contain_over_blur(photo)
     comp_path = os.path.join(workdir, f"b_comp_{index:02d}.bmp")
     composite.save(comp_path, format="BMP")
 
@@ -626,9 +620,8 @@ def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=No
         z = f"min(zoom+{CONTAIN_ZOOM_STEP},{CONTAIN_ZOOM_MAX})"
     else:
         z = f"if(lte(zoom,1.0),{CONTAIN_ZOOM_MAX},max(zoom-{CONTAIN_ZOOM_STEP},1.0))"
-    # d=1 (one output frame per input frame) rather than d=120: the zoom has to
-    # accumulate across a stream of frames here, because on the opening clip the
-    # frames arrive from an overlay rather than from a single still.
+    # d=1 (one output frame per input frame): the looped still arrives as a frame
+    # stream, so the zoom accumulates per frame rather than inside one d=120 hold.
     zoompan = (f"zoompan=z='{z}':d=1:s={VW}x{VH}:fps={FPS}"
                f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'")
     # The caption lives only inside the part of the clip that is NOT shared with a
@@ -638,9 +631,8 @@ def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=No
     # inside the clip's own window means only ever one caption on screen.
     start = 0.0 if first else XFADE_SECONDS
     end = SECONDS_PER_PHOTO if last else SECONDS_PER_PHOTO - XFADE_SECONDS
-    fade_in = CONTAIN_OPEN_FADE if first else 0.35
     caption_alpha = (
-        f"max(0,min(1,min((t-{start:.2f})/{fade_in:.2f},({end:.2f}-t)/0.35)))"
+        f"max(0,min(1,min((t-{start:.2f})/0.35,({end:.2f}-t)/0.35)))"
     )
     tail = ",".join(
         [zoompan, "setsar=1"]
@@ -651,21 +643,9 @@ def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=No
 
     inputs = ["-loop", "1", "-framerate", str(FPS), "-t", str(SECONDS_PER_PHOTO),
               "-i", comp_path]
-    if open_fade:
-        backdrop = _contain_over_blur(photo, with_foreground=False)
-        bg_path = os.path.join(workdir, f"b_bg_{index:02d}.bmp")
-        backdrop.save(bg_path, format="BMP")
-        inputs = (["-loop", "1", "-framerate", str(FPS), "-t", str(SECONDS_PER_PHOTO),
-                   "-i", bg_path] + inputs)
-        graph = (f"[1:v]format=rgba,fade=t=in:alpha=1:st=0:d={CONTAIN_OPEN_FADE}[fg];"
-                 f"[0:v][fg]overlay=0:0:format=auto,{tail}[v]")
-        cmd = (["ffmpeg", "-y"] + inputs + ["-filter_complex", graph, "-map", "[v]",
-                                            "-frames:v", str(FRAMES_PER_PHOTO)]
-               + _ENCODE_ARGS + [out_path])
-    else:
-        cmd = (["ffmpeg", "-y"] + inputs + ["-vf", tail,
-                                            "-frames:v", str(FRAMES_PER_PHOTO)]
-               + _ENCODE_ARGS + [out_path])
+    cmd = (["ffmpeg", "-y"] + inputs + ["-vf", tail,
+                                        "-frames:v", str(FRAMES_PER_PHOTO)]
+           + _ENCODE_ARGS + [out_path])
     _run_ffmpeg(cmd, TIMEOUT_CLIP)
 
 
@@ -1006,7 +986,6 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                             caption=captions[i] if i < len(captions) else None,
                             caption_size=caption_size,
                             zoom_in=(i % 2 == 0),
-                            open_fade=(i == 0),
                             first=(i == 0),
                             last=(i == len(photos) - 1),
                         )
