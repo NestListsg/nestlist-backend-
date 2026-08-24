@@ -82,6 +82,12 @@ ZOOM_MAX = 1.13
 # copy of itself, and dissolves between them. Jane picks the house style.
 # ---------------------------------------------------------------------------
 STYLE_B_ID = "dissolve"
+# The drift-cut look (cover-crop + horizontal pan + hard cuts) that shipped first.
+# Jane picked the dissolve style after the bake-off, so this is now reachable only by
+# naming it explicitly -- it is kept because it costs nothing to keep, it is the
+# fallback if the dissolve ever misbehaves on a listing, and the pan code is the only
+# thing that handles a photo whose width we actively want to travel across.
+STYLE_A_ID = "driftcut"
 # 1.25s = exactly 30 frames at 24fps. The round frame count matters: the dissolve is
 # assembled by cutting clips on frame boundaries (see _dissolve_segments), and a
 # transition length that isn't a whole number of frames cannot be cut cleanly.
@@ -125,11 +131,21 @@ AUDIO_FADE_OUT_SECONDS = 4.5
 MAX_VIDEO_PHOTOS = 6
 
 # Ceiling on renders running at once *in this worker process*. Railway runs 4 uvicorn
-# workers, so the real ceiling is 4x this. Renders are background jobs, so waiting is
-# cheap and far better than 50 agents each holding a ~150MB ffmpeg filter graph and
-# taking the instance down. Past the wait window the job fails with a retryable
-# message rather than queueing behind the listing's 10-minute stale-render lock.
-MAX_CONCURRENT_RENDERS = 2
+# workers, so the fleet ceiling is 4x this. Renders are background jobs, so waiting is
+# cheap and far better than 50 agents each holding an ffmpeg process and taking the
+# instance down. Past the wait window the job fails with a retryable message rather
+# than queueing behind the listing's 10-minute stale-render lock.
+#
+# Set to 1 after measuring one clip render at ~800MB peak RSS (both styles, macOS).
+# At 2 the fleet worst case was 8 concurrent x ~800MB = ~6.6GB, uncomfortably close to
+# the instance limit; at 1 it is 4 x ~800MB = ~3.3GB.
+#
+# The other candidate lever -- lowering UPSCALE -- was measured and rejected: peak RSS
+# is essentially flat across upscale factors (986MB at 1x, 766MB at 2x, 876MB at 3x),
+# so the cost is dominated by the x264 encoder and frame buffering at 1080x1920, not
+# by the source frame. Dropping to 1x would have coarsened the slow zoom for no memory
+# saving at all.
+MAX_CONCURRENT_RENDERS = 1
 RENDER_SLOT_WAIT_SECONDS = 240
 _RENDER_SLOTS = threading.Semaphore(MAX_CONCURRENT_RENDERS)
 
@@ -906,15 +922,12 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     `degradations` is a list of plain-language strings naming anything that quietly
     fell back (no captions, no music, no card). Empty means a full-quality render.
 
-    style: "classic" (style A -- cover-crop, horizontal drift, hard cuts) is the
-    default and the only style main.py offers. "dissolve" (style B -- contain over a
-    blurred backdrop, soft crossfades) is a bake-off variant, reachable only by passing
-    the id explicitly; it is deliberately absent from VIDEO_TEMPLATES so the picker
-    never shows it until Jane chooses a house style. Any other value renders style A
-    rather than failing -- old listing rows still carry the retired "card" overlay id,
-    and an agent regenerating one of those should get a video, not an error. (main.py
-    maps retired ids to the default before calling, so this is the second of two
-    guards.)
+    style: the house style is the dissolve -- each photo shown whole over a blurred
+    copy of itself, soft crossfades between them. Every agent-facing id renders it,
+    including the "classic" id the picker sends and the retired "card" id still stored
+    on old rows, so regenerating an old listing gives today's look rather than an
+    error. Passing "driftcut" explicitly opts into the earlier cover-crop/pan/hard-cut
+    look; nothing in the product does, and it is absent from VIDEO_TEMPLATES.
     photo_index: which listing photo is the "hero" -- it opens the video. Same selector
     the agent already uses for the poster (My Listings' star picker).
     agent_photo_url: optional. Without it the closing card renders without the portrait
@@ -940,9 +953,11 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     rest_urls = [u for i, u in enumerate(image_urls) if i != photo_index]
     selected_urls = ([hero_url] + rest_urls)[:MAX_VIDEO_PHOTOS]
 
-    # Bake-off switch. Anything that isn't the style B id renders style A, so old
-    # rows carrying a retired template id still get a video rather than an error.
-    dissolve = (style == STYLE_B_ID)
+    # The dissolve is the house style. Every agent-facing id ("classic", the retired
+    # "card", or nothing at all) renders it; only an explicit internal "driftcut"
+    # opts out. Defaulting this way round means an old listing row carrying a retired
+    # template id gets today's look rather than an error or a stale one.
+    dissolve = (style != STYLE_A_ID)
 
     degradations = []
     started = time.monotonic()
