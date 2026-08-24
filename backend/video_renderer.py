@@ -41,7 +41,7 @@ import time
 import uuid
 
 import requests
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,34 @@ PAN_MIN_ASPECT = (VW / VH) * PAN_WIDTH_RATIO
 # --- zoom fallback (portrait/tall sources with no width to spare) ---
 ZOOM_STEP = 0.0009
 ZOOM_MAX = 1.13
+
+# ---------------------------------------------------------------------------
+# STYLE B -- "dissolve": contain-over-blur with soft crossfades.
+# A bake-off variant, NOT the default. Style A fills the frame by cropping and
+# drifts across the photo; style B shows each photo whole, centred over a blurred
+# copy of itself, and dissolves between them. Jane picks the house style.
+# ---------------------------------------------------------------------------
+STYLE_B_ID = "dissolve"
+# 1.25s = exactly 30 frames at 24fps. The round frame count matters: the dissolve is
+# assembled by cutting clips on frame boundaries (see _dissolve_segments), and a
+# transition length that isn't a whole number of frames cannot be cut cleanly.
+XFADE_SECONDS = 1.25
+XFADE_FRAMES = int(XFADE_SECONDS * FPS)  # 30
+# The zoom here is deliberately far gentler than style A's 1.13. It magnifies the
+# WHOLE composite, so every extra percent crops a little off the edges of a photo
+# whose entire point is being shown whole. At 1.06 the photo is complete at one end
+# of every clip and loses 3% a side at the other -- motion without visibly eating
+# the picture.
+CONTAIN_ZOOM_MAX = 1.06
+CONTAIN_ZOOM_STEP = round((CONTAIN_ZOOM_MAX - 1.0) / FRAMES_PER_PHOTO, 6)
+# Backdrop tuning. The first cut used radius 28 at quarter scale (~112px at full
+# resolution) plus 42% black, which turned every bright interior into the same flat
+# grey -- the backdrop stopped reading as the photo at all. A moderate blur with only
+# slight darkening keeps the room's actual colour and shape recognisable behind the
+# sharp photo, which is the whole point of the technique.
+CONTAIN_BLUR_RADIUS = 11    # at quarter scale, so ~44px at full resolution
+CONTAIN_BG_DARKEN = 0.18    # just enough that the sharp photo still separates
+CONTAIN_OPEN_FADE = 0.75    # sharp photo fades up over its own backdrop, never black
 
 OPEN_FADE_SECONDS = 0.75  # first photo fades up from black; never a cold first frame
 
@@ -112,6 +140,7 @@ RENDER_BUDGET_SECONDS = 420
 # Per-step ffmpeg timeouts (seconds).
 TIMEOUT_CLIP = 150
 TIMEOUT_CONCAT = 90
+TIMEOUT_XFADE_CHAIN = 300  # style B re-encodes the whole body in this one pass
 TIMEOUT_CARD = 120
 TIMEOUT_MUSIC = 120
 TIMEOUT_PROBE = 30
@@ -152,6 +181,12 @@ CAPTION_SIDE_MARGIN = 60            # so max text width is 1080 - 120 = 960
 _ENCODE_ARGS = [
     "-c:v", "libx264", "-preset", "fast", "-crf", "18",
     "-pix_fmt", "yuv420p", "-r", str(FPS), "-vsync", "cfr", "-an",
+    # A keyframe every 30 frames (1.25s), with scene detection off so the spacing is
+    # exact. Style B's dissolve assembly stream-copies clip segments starting at frame
+    # 30, and a stream copy can only start on a keyframe -- without this the cut would
+    # silently snap back to frame 0. Harmless for style A, and it makes both styles
+    # more responsive to scrub on social players.
+    "-g", str(XFADE_FRAMES), "-sc_threshold", "0",
 ]
 
 CAPTION_MODEL = "claude-sonnet-4-5"  # same model main.py uses for listing copy
@@ -274,6 +309,46 @@ def _prepare_frame(img, centering=(0.5, 0.42)):
     target = (out_w * UPSCALE, VH * UPSCALE)
     # ImageOps.fit scales to cover the target and crops the overflow -- never pads.
     return ImageOps.fit(img, target, method=Image.LANCZOS, centering=centering), can_pan
+
+
+def _contain_over_blur(img, with_foreground=True):
+    """STYLE B frame: the whole photo, centred over a blurred, darkened copy of
+    itself. Nothing is cropped out of the foreground -- the sides a 9:16 cover-crop
+    would lose are all still there, and the backdrop fills the frame so there are no
+    bars.
+
+    with_foreground=False returns the backdrop alone. That is what the first clip
+    fades up FROM, so the video opens on the photo's own colour rather than on black.
+
+    The blur is done at thumbnail size and then scaled up, not applied at full
+    resolution. A 28px Gaussian over a 2160x3840 canvas is enormously expensive and
+    the result is indistinguishable -- blurring is destroying detail, so doing it to
+    a small copy and enlarging that produces the same image for a fraction of the
+    cost.
+    """
+    img = img.convert("RGB")
+    w, h = VW * UPSCALE, VH * UPSCALE
+
+    small = ImageOps.fit(img, (VW // 4, VH // 4), method=Image.LANCZOS, centering=(0.5, 0.5))
+    small = small.filter(ImageFilter.GaussianBlur(CONTAIN_BLUR_RADIUS))
+    background = small.resize((w, h), Image.LANCZOS)
+    background = Image.blend(background, Image.new("RGB", (w, h), (0, 0, 0)),
+                             CONTAIN_BG_DARKEN)
+    if not with_foreground:
+        return background
+
+    # Contain: full width, natural height, centred. A photo taller than the frame
+    # (rare, but a phone panorama shot vertically would be) is bounded by height
+    # instead so it still fits whole.
+    src_w, src_h = img.size
+    fg_w = w
+    fg_h = max(1, round(w * src_h / src_w))
+    if fg_h > h:
+        fg_h = h
+        fg_w = max(1, round(h * src_w / src_h))
+    foreground = img.resize((fg_w, fg_h), Image.LANCZOS)
+    background.paste(foreground, ((w - fg_w) // 2, (h - fg_h) // 2))
+    return background
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +556,165 @@ def _caption_font_size(captions):
     return size
 
 
+def _caption_filters(caption, caption_size, workdir, index, alpha_expr=None,
+                     enable_expr=None):
+    """The drawtext filters for one caption, shared by both styles so the caption
+    treatment can never drift between them during the bake-off.
+
+    alpha_expr ramps the text in. Style A doesn't need it (the whole frame fades up
+    from black, caption included), but style B's opening fades only the photo in over
+    its backdrop -- without this the caption would sit at full strength over a still
+    half-formed image.
+    """
+    if not caption:
+        return []
+    alpha = f":alpha='{alpha_expr}'" if alpha_expr else ""
+    enable = f":enable='{enable_expr}'" if enable_expr else ""
+    # One drawtext per line, each independently centred. drawtext's own multi-line
+    # handling left-aligns lines within the block unless the `text_align` option is
+    # present, which only exists in ffmpeg 7.0+ -- and Railway installs whatever
+    # ffmpeg its base image ships. Two filters centre correctly on any version.
+    lines = _caption_lines(caption)
+    size = caption_size or CAPTION_FONT_SIZE
+    line_height = round(size * CAPTION_LINE_SPACING)
+    first_line_y = CAPTION_LAST_LINE_Y - (len(lines) - 1) * line_height
+    out = []
+    for line_no, line in enumerate(lines):
+        text_path = os.path.join(workdir, f"cap_{index:02d}_{line_no}.txt")
+        with open(text_path, "w", encoding="utf-8") as f:
+            f.write(line)
+        out.append(
+            f"drawtext=fontfile={_escape_filter_path(SERIF_ITALIC)}"
+            f":textfile={_escape_filter_path(text_path)}:expansion=none"
+            f":fontcolor=white:fontsize={size}"
+            f":x=(w-text_w)/2:y={first_line_y + line_no * line_height}"
+            f":shadowcolor=black@0.6:shadowx=2:shadowy=2{alpha}{enable}"
+        )
+    return out
+
+
+def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=None,
+                  zoom_in=True, open_fade=False, first=True, last=True):
+    """STYLE B: one photo -> one 5s contain-over-blur clip with a gentle zoom.
+
+    On the first clip the sharp photo dissolves up over its own blurred backdrop
+    instead of the whole frame rising from black. That is done by overlaying the full
+    composite onto the backdrop-only still with `fade=alpha=1`: both layers carry an
+    identical backdrop, so the only thing that visibly appears is the photo.
+    """
+    composite = _contain_over_blur(photo, with_foreground=True)
+    comp_path = os.path.join(workdir, f"b_comp_{index:02d}.bmp")
+    composite.save(comp_path, format="BMP")
+
+    if zoom_in:
+        z = f"min(zoom+{CONTAIN_ZOOM_STEP},{CONTAIN_ZOOM_MAX})"
+    else:
+        z = f"if(lte(zoom,1.0),{CONTAIN_ZOOM_MAX},max(zoom-{CONTAIN_ZOOM_STEP},1.0))"
+    # d=1 (one output frame per input frame) rather than d=120: the zoom has to
+    # accumulate across a stream of frames here, because on the opening clip the
+    # frames arrive from an overlay rather than from a single still.
+    zoompan = (f"zoompan=z='{z}':d=1:s={VW}x{VH}:fps={FPS}"
+               f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'")
+    # The caption lives only inside the part of the clip that is NOT shared with a
+    # neighbouring clip. Consecutive clips overlap for the length of the dissolve, so a
+    # caption drawn across that region cross-fades through the next one and renders as
+    # unreadable double-struck text (confirmed on the first style B cut). Keeping it
+    # inside the clip's own window means only ever one caption on screen.
+    start = 0.0 if first else XFADE_SECONDS
+    end = SECONDS_PER_PHOTO if last else SECONDS_PER_PHOTO - XFADE_SECONDS
+    fade_in = CONTAIN_OPEN_FADE if first else 0.35
+    caption_alpha = (
+        f"max(0,min(1,min((t-{start:.2f})/{fade_in:.2f},({end:.2f}-t)/0.35)))"
+    )
+    tail = ",".join(
+        [zoompan, "setsar=1"]
+        + _caption_filters(caption, caption_size, workdir, index,
+                           alpha_expr=caption_alpha,
+                           enable_expr=f"between(t,{start:.2f},{end:.2f})")
+        + ["format=yuv420p"])
+
+    inputs = ["-loop", "1", "-framerate", str(FPS), "-t", str(SECONDS_PER_PHOTO),
+              "-i", comp_path]
+    if open_fade:
+        backdrop = _contain_over_blur(photo, with_foreground=False)
+        bg_path = os.path.join(workdir, f"b_bg_{index:02d}.bmp")
+        backdrop.save(bg_path, format="BMP")
+        inputs = (["-loop", "1", "-framerate", str(FPS), "-t", str(SECONDS_PER_PHOTO),
+                   "-i", bg_path] + inputs)
+        graph = (f"[1:v]format=rgba,fade=t=in:alpha=1:st=0:d={CONTAIN_OPEN_FADE}[fg];"
+                 f"[0:v][fg]overlay=0:0:format=auto,{tail}[v]")
+        cmd = (["ffmpeg", "-y"] + inputs + ["-filter_complex", graph, "-map", "[v]",
+                                            "-frames:v", str(FRAMES_PER_PHOTO)]
+               + _ENCODE_ARGS + [out_path])
+    else:
+        cmd = (["ffmpeg", "-y"] + inputs + ["-vf", tail,
+                                            "-frames:v", str(FRAMES_PER_PHOTO)]
+               + _ENCODE_ARGS + [out_path])
+    _run_ffmpeg(cmd, TIMEOUT_CLIP)
+
+
+def _dissolve_segments(clip_paths, out_path, workdir, timeout):
+    """Assembles the clips into one dissolved timeline with BOUNDED memory.
+
+    The obvious implementation -- one filtergraph with every clip as an input and the
+    xfades chained together -- was measured and rejected. Chained xfades buffer their
+    upstream frames until each fade's offset arrives, so memory grows with the photo
+    count rather than staying flat: 2.4GB peak at 6 photos and 4.5GB at 15, on a
+    Railway instance that has nowhere near that. It also repeats the mistake the old
+    renderer's docstring already warned about.
+
+    Instead the timeline is cut into pieces, and only the joins are re-encoded:
+
+        [clip0 frames 0-90] [dissolve] [clip1 frames 30-90] [dissolve] ... [clipN 30-120]
+
+    A dissolve is its own tiny ffmpeg call over just the 1.25s tail of one clip and the
+    1.25s head of the next -- two short inputs, no matter how many photos there are.
+    Every other second of video is stream-copied, never re-encoded. Peak memory is
+    therefore flat in the photo count, and total work is linear rather than the
+    quadratic re-encode cascade the old renderer used.
+
+    Stream-copying a segment that starts mid-clip is only exact because the clips are
+    encoded with a keyframe every XFADE_FRAMES (see _ENCODE_ARGS).
+    """
+    body_start = XFADE_SECONDS                      # 1.25s -> frame 30 (a keyframe)
+    body_end = SECONDS_PER_PHOTO - XFADE_SECONDS    # 3.75s -> frame 90
+
+    segments = []
+    for i, clip in enumerate(clip_paths):
+        first, last = (i == 0), (i == len(clip_paths) - 1)
+        body = os.path.join(workdir, f"seg_body_{i:02d}.mp4")
+        cut = ["ffmpeg", "-y"]
+        if not first:
+            cut += ["-ss", f"{body_start:.3f}"]
+        cut += ["-i", clip]
+        if not last:
+            # -t counts from the seek point, so the middle clips keep 2.5s and the
+            # first keeps 3.75s.
+            cut += ["-t", f"{(body_end - (0.0 if first else body_start)):.3f}"]
+        cut += ["-c", "copy", body]
+        _run_ffmpeg(cut, timeout)
+        segments.append(body)
+
+        if not last:
+            join = os.path.join(workdir, f"seg_join_{i:02d}.mp4")
+            _run_ffmpeg(
+                ["ffmpeg", "-y",
+                 "-ss", f"{body_end:.3f}", "-t", f"{XFADE_SECONDS:.3f}", "-i", clip,
+                 "-t", f"{XFADE_SECONDS:.3f}", "-i", clip_paths[i + 1],
+                 "-filter_complex",
+                 f"[0:v]fps={FPS},format=yuv420p,setsar=1[a];"
+                 f"[1:v]fps={FPS},format=yuv420p,setsar=1[b];"
+                 f"[a][b]xfade=transition=fade:duration={XFADE_SECONDS}:offset=0[v]",
+                 "-map", "[v]"] + _ENCODE_ARGS + [join],
+                timeout,
+            )
+            segments.append(join)
+
+    _concat(segments, out_path, workdir, "dissolve_list", timeout)
+    n = len(clip_paths)
+    return n * SECONDS_PER_PHOTO - (n - 1) * XFADE_SECONDS
+
+
 def _kenburns_clip(frame_img, out_path, workdir, index, caption=None, caption_size=None,
                    can_pan=True, left_to_right=True, zoom_in=True, fade_in=False):
     """One photo -> one 5s motion clip, with its caption burned in during the same
@@ -520,31 +754,12 @@ def _kenburns_clip(frame_img, out_path, workdir, index, caption=None, caption_si
         ]
     filters.append("setsar=1")
 
-    if caption:
-        # drawtext reads the caption from a file rather than an inline `text=` value:
-        # the caption is model-written, and inline text has to be escaped against three
-        # nested parsers (shell-free argv, filtergraph, drawtext). textfile= plus
-        # expansion=none removes that whole class of bug -- and with it any chance of a
-        # caption smuggling filter syntax into the command.
-        # One drawtext per line, each independently centred. drawtext's own multi-line
-        # handling left-aligns lines within the block unless the `text_align` option is
-        # present, which only exists in ffmpeg 7.0+ -- and Railway installs whatever
-        # ffmpeg its base image ships. Two filters centre correctly on any version.
-        lines = _caption_lines(caption)
-        size = caption_size or CAPTION_FONT_SIZE
-        line_height = round(size * CAPTION_LINE_SPACING)
-        first_line_y = CAPTION_LAST_LINE_Y - (len(lines) - 1) * line_height
-        for line_no, line in enumerate(lines):
-            text_path = os.path.join(workdir, f"cap_{index:02d}_{line_no}.txt")
-            with open(text_path, "w", encoding="utf-8") as f:
-                f.write(line)
-            filters.append(
-                f"drawtext=fontfile={_escape_filter_path(SERIF_ITALIC)}"
-                f":textfile={_escape_filter_path(text_path)}:expansion=none"
-                f":fontcolor=white:fontsize={size}"
-                f":x=(w-text_w)/2:y={first_line_y + line_no * line_height}"
-                f":shadowcolor=black@0.6:shadowx=2:shadowy=2"
-            )
+    # drawtext reads the caption from a file rather than an inline `text=` value: the
+    # caption is model-written, and inline text has to be escaped against three nested
+    # parsers (shell-free argv, filtergraph, drawtext). textfile= plus expansion=none
+    # removes that whole class of bug -- and with it any chance of a caption smuggling
+    # filter syntax into the command.
+    filters += _caption_filters(caption, caption_size, workdir, index)
 
     if fade_in:
         # After drawtext, so the caption rises out of black with the photo rather than
@@ -691,11 +906,15 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     `degradations` is a list of plain-language strings naming anything that quietly
     fell back (no captions, no music, no card). Empty means a full-quality render.
 
-    style: "classic" is the only style this renderer produces. The parameter is kept so
-    callers can keep naming a style, and any other value renders classic rather than
-    failing -- old listing rows still carry the retired "card" overlay id, and an agent
-    regenerating one of those should get a video, not an error. (main.py maps retired
-    ids to the default before calling, so this is the second of two guards.)
+    style: "classic" (style A -- cover-crop, horizontal drift, hard cuts) is the
+    default and the only style main.py offers. "dissolve" (style B -- contain over a
+    blurred backdrop, soft crossfades) is a bake-off variant, reachable only by passing
+    the id explicitly; it is deliberately absent from VIDEO_TEMPLATES so the picker
+    never shows it until Jane chooses a house style. Any other value renders style A
+    rather than failing -- old listing rows still carry the retired "card" overlay id,
+    and an agent regenerating one of those should get a video, not an error. (main.py
+    maps retired ids to the default before calling, so this is the second of two
+    guards.)
     photo_index: which listing photo is the "hero" -- it opens the video. Same selector
     the agent already uses for the poster (My Listings' star picker).
     agent_photo_url: optional. Without it the closing card renders without the portrait
@@ -720,6 +939,10 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     hero_url = image_urls[photo_index]
     rest_urls = [u for i, u in enumerate(image_urls) if i != photo_index]
     selected_urls = ([hero_url] + rest_urls)[:MAX_VIDEO_PHOTOS]
+
+    # Bake-off switch. Anything that isn't the style B id renders style A, so old
+    # rows carrying a retired template id still get a video rather than an error.
+    dissolve = (style == STYLE_B_ID)
 
     degradations = []
     started = time.monotonic()
@@ -760,20 +983,32 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                     logger.warning("render budget reached after %d photos; finishing early", i)
                     degradations.append(f"took too long, so only the first {i} photos were used")
                     break
-                frame, can_pan = _prepare_frame(photo)
                 clip_path = os.path.join(workdir, f"clip_{i:02d}.mp4")
                 try:
-                    _kenburns_clip(
-                        frame, clip_path, workdir, i,
-                        caption=captions[i] if i < len(captions) else None,
-                        caption_size=caption_size,
-                        can_pan=can_pan,
-                        # Alternating direction is what gives the sequence its rhythm --
-                        # every clip drifting the same way reads like a conveyor belt.
-                        left_to_right=(i % 2 == 0),
-                        zoom_in=(i % 2 == 0),
-                        fade_in=(i == 0),
-                    )
+                    if dissolve:
+                        _contain_clip(
+                            photo, clip_path, workdir, i,
+                            caption=captions[i] if i < len(captions) else None,
+                            caption_size=caption_size,
+                            zoom_in=(i % 2 == 0),
+                            open_fade=(i == 0),
+                            first=(i == 0),
+                            last=(i == len(photos) - 1),
+                        )
+                    else:
+                        frame, can_pan = _prepare_frame(photo)
+                        _kenburns_clip(
+                            frame, clip_path, workdir, i,
+                            caption=captions[i] if i < len(captions) else None,
+                            caption_size=caption_size,
+                            can_pan=can_pan,
+                            # Alternating direction is what gives the sequence its
+                            # rhythm -- every clip drifting the same way reads like a
+                            # conveyor belt.
+                            left_to_right=(i % 2 == 0),
+                            zoom_in=(i % 2 == 0),
+                            fade_in=(i == 0),
+                        )
                 except Exception as e:
                     logger.warning("clip %d failed (%s); skipping that photo", i, e)
                     degradations.append("a photo failed to render and was skipped")
@@ -784,11 +1019,16 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                 raise RuntimeError("No photo could be rendered into the video")
 
             body_path = os.path.join(workdir, "body.mp4")
+            estimated = len(clip_paths) * SECONDS_PER_PHOTO
             if len(clip_paths) == 1:
                 os.replace(clip_paths[0], body_path)
+            elif dissolve:
+                # One filtergraph pass, all clips dissolving into each other.
+                estimated = _dissolve_segments(clip_paths, body_path, workdir,
+                                               TIMEOUT_XFADE_CHAIN)
             else:
                 _concat(clip_paths, body_path, workdir, "body_list", TIMEOUT_CONCAT)
-            body_duration = _probe_duration(body_path, len(clip_paths) * SECONDS_PER_PHOTO)
+            body_duration = _probe_duration(body_path, estimated)
 
             # --- closing contact card (degrades to no card) ---
             silent_path = body_path
