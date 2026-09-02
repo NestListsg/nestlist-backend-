@@ -270,6 +270,10 @@ class ListingContentRequest(BaseModel):
 class RewriteSelectionRequest(BaseModel):
     selected_text: str
     instruction: str = ""
+    # The editor's live content, which after the first rewrite no longer matches
+    # what's saved -- the frontend applies each rewrite client-side and only saves
+    # later. Optional so older clients keep working against the saved copy.
+    current_text: str = ""
 
 class ProfileUpdate(BaseModel):
     name: str
@@ -3077,6 +3081,13 @@ async def rewrite_listing_selection(listing_id: str, req: RewriteSelectionReques
     if len(instruction) > 500:
         raise HTTPException(status_code=400, detail="Instruction is too long (max 500 characters)")
 
+    current_text = (req.current_text or "").strip()
+    if len(current_text) > MAX_LISTING_CONTENT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Write-up is too long (max {MAX_LISTING_CONTENT_CHARS} characters)"
+        )
+
     if not _is_valid_uuid(listing_id):
         raise HTTPException(status_code=404, detail="Listing not found")
 
@@ -3086,13 +3097,22 @@ async def rewrite_listing_selection(listing_id: str, req: RewriteSelectionReques
         raise HTTPException(status_code=404, detail="Listing not found")
 
     listing = result.data[0]
-    full_text = (listing.get("content") or "").strip()
+    # The selection is validated against whatever the agent is actually looking
+    # at. Rewrites are applied in the editor and only saved later, so from the
+    # second rewrite onward the editor has diverged from the saved copy -- and
+    # checking the saved copy 409s on every rewrite after the first. The row is
+    # still fetched above: it is what proves ownership, and it carries the price
+    # and built-up the copy guards need.
+    #
+    # current_text is the agent's own unsaved draft, so it is trusted as context
+    # but never written anywhere -- this endpoint still saves nothing.
+    full_text = current_text or (listing.get("content") or "").strip()
     if not full_text:
         raise HTTPException(status_code=409, detail="This listing has no write-up to rewrite yet")
 
     # The frontend sends the exact highlighted string, so an exact hit is the
     # normal path. The normalised retry only rescues whitespace differences; a
-    # genuinely stale selection (someone edited the write-up in another tab)
+    # genuinely stale selection (the text really isn't in the editor any more)
     # still gets a 409 rather than a rewrite of something that isn't there.
     if selected not in full_text and _normalise_for_match(selected) not in _normalise_for_match(full_text):
         raise HTTPException(
