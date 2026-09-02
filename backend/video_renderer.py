@@ -191,6 +191,17 @@ CAPTION_LAST_LINE_Y = 1460          # 1920 - 1460 = 460px of clearance below the
 CAPTION_LINE_SPACING = 1.32         # multiple of font size
 CAPTION_SIDE_MARGIN = 60            # so max text width is 1080 - 120 = 960
 
+# White caption type on a cream-bright interior is close to unreadable -- the 2px
+# drop shadow on its own was not enough (Janel, on a bright bedroom around 0:12).
+# A soft dark band sits behind the caption rows so the type reads on any photo.
+# The type itself is untouched: same Gelasio italic, same size, same positions,
+# same shadow. Only what's behind it changes.
+CAPTION_SCRIM_ALPHA = 0.46          # peak darkness directly behind the rows
+CAPTION_SCRIM_PAD = 12              # full-strength margin around the text block
+CAPTION_SCRIM_FEATHER = 180         # px of fade-out above and below that core
+CAPTION_SCRIM_STEPS = 45            # strips the feather is built from (4px each)
+CAPTION_GLYPH_HEIGHT = 1.30         # Gelasio ascent+descent as a multiple of size
+
 # Identical encoder settings on every clip, so the final concat can be a stream copy
 # (no re-encode) without mismatched stream parameters.
 _ENCODE_ARGS = [
@@ -566,6 +577,51 @@ def _caption_font_size(captions):
     return size
 
 
+def _caption_scrim_filters(first_line_y, last_line_y, size):
+    """The soft dark band that sits behind the caption rows.
+
+    Stacked drawbox strips rather than one rectangle, so the band feathers out
+    instead of drawing a hard line across the frame. Not drawtext's own `box=`:
+    at this line spacing a per-line box would be 70px of glyph plus two borders
+    against only 71px between the rows, so the two boxes would overlap and the
+    overlap would compound into a darker stripe between the lines.
+
+    drawbox has no per-frame alpha, so the band is drawn for the whole clip
+    rather than only inside style B's caption window. That is deliberate: it
+    cannot pop in or out, and two clips dissolving into each other carry an
+    identical band, so the band holds still while the photos cross-fade.
+    """
+    glyph_h = round(size * CAPTION_GLYPH_HEIGHT)
+    core_top = first_line_y - CAPTION_SCRIM_PAD
+    core_bottom = last_line_y + glyph_h + CAPTION_SCRIM_PAD
+    step = max(1, round(CAPTION_SCRIM_FEATHER / CAPTION_SCRIM_STEPS))
+
+    def strip(y, height, alpha):
+        # Clamp into the frame: a caption pushed high by a three-line block must
+        # not hand ffmpeg a negative y, which it rejects outright.
+        top = max(0, int(y))
+        bottom = min(VH, int(y) + int(height))
+        if bottom <= top or alpha < 0.005:
+            return None
+        return (f"drawbox=x=0:y={top}:w=iw:h={bottom - top}"
+                f":color=black@{alpha:.3f}:t=fill")
+
+    out = [strip(core_top, core_bottom - core_top, CAPTION_SCRIM_ALPHA)]
+    for j in range(CAPTION_SCRIM_STEPS):
+        # j=0 is the strip touching the core and carries full strength; each step
+        # further out is fainter, easing to nothing at the edge of the feather.
+        #
+        # Smoothstep, not a straight line: it flattens at BOTH ends, so there is
+        # no seam where the feather meets the core and none where it meets the
+        # photo. A linear ramp in this few steps showed visible stair-stepping on
+        # a white frame; this keeps every step under ~4 levels of 255.
+        t = (CAPTION_SCRIM_STEPS - j) / CAPTION_SCRIM_STEPS
+        alpha = CAPTION_SCRIM_ALPHA * t * t * (3 - 2 * t)
+        out.append(strip(core_top - (j + 1) * step, step, alpha))
+        out.append(strip(core_bottom + j * step, step, alpha))
+    return [f for f in out if f]
+
+
 def _caption_filters(caption, caption_size, workdir, index, alpha_expr=None,
                      enable_expr=None):
     """The drawtext filters for one caption, shared by both styles so the caption
@@ -588,7 +644,9 @@ def _caption_filters(caption, caption_size, workdir, index, alpha_expr=None,
     size = caption_size or CAPTION_FONT_SIZE
     line_height = round(size * CAPTION_LINE_SPACING)
     first_line_y = CAPTION_LAST_LINE_Y - (len(lines) - 1) * line_height
-    out = []
+    # Band first: everything after it draws on top, so the shadow and the type
+    # still land over the photo-plus-band rather than under it.
+    out = _caption_scrim_filters(first_line_y, CAPTION_LAST_LINE_Y, size)
     for line_no, line in enumerate(lines):
         text_path = os.path.join(workdir, f"cap_{index:02d}_{line_no}.txt")
         with open(text_path, "w", encoding="utf-8") as f:

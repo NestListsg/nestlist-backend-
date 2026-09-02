@@ -267,6 +267,10 @@ class ListingRequest(BaseModel):
 class ListingContentRequest(BaseModel):
     content: str
 
+class RewriteSelectionRequest(BaseModel):
+    selected_text: str
+    instruction: str = ""
+
 class ProfileUpdate(BaseModel):
     name: str
     agency: str
@@ -3029,6 +3033,141 @@ def update_listing_content(listing_id: str, req: ListingContentRequest, agent=De
         raise HTTPException(status_code=404, detail="Listing not found")
 
     return {"success": True, "content": updated.data[0].get("content", content)}
+
+
+# Selective rewrite: the agent highlights a phrase or paragraph in the write-up
+# and asks for just that bit to be redone. Deliberately READ-ONLY on the listing
+# -- it returns the replacement and nothing else. The frontend swaps the span in
+# the editor and saves through PATCH /api/listings/{id}/content as usual, so a
+# rewrite the agent doesn't like costs them nothing and there is no window where
+# a half-applied rewrite is sitting in the database.
+MAX_SELECTION_CHARS = 3000
+
+# Each call is a Claude request, so this is rate-limited like the assistant. The
+# ceiling is higher because rewriting is iterative by nature -- an agent polishing
+# one write-up may reasonably try a dozen spans, and re-roll a few of them.
+_rewrite_selection_hits = {}
+
+
+def _normalise_for_match(text: str) -> str:
+    """Whitespace-only normalisation used as a fallback when the exact span isn't
+    found. Browsers hand back non-breaking spaces and \\r\\n line endings that the
+    stored copy doesn't have; those are not a real mismatch and shouldn't cost the
+    agent a confusing error."""
+    return re.sub(r"\s+", " ", (text or "").replace(" ", " ")).strip()
+
+
+@app.post("/api/listings/{listing_id}/rewrite-selection")
+async def rewrite_listing_selection(listing_id: str, req: RewriteSelectionRequest, agent=Depends(get_current_agent)):
+    if _rate_limited(_rewrite_selection_hits, agent["id"], limit=60, window_seconds=3600):
+        raise HTTPException(
+            status_code=429,
+            detail="You've hit the hourly limit for rewrites -- please try again in a bit."
+        )
+
+    selected = (req.selected_text or "").strip()
+    instruction = (req.instruction or "").strip()
+    if not selected:
+        raise HTTPException(status_code=400, detail="Select some text to rewrite first")
+    if len(selected) > MAX_SELECTION_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"That selection is too long to rewrite (max {MAX_SELECTION_CHARS} characters) -- try one paragraph at a time"
+        )
+    if len(instruction) > 500:
+        raise HTTPException(status_code=400, detail="Instruction is too long (max 500 characters)")
+
+    if not _is_valid_uuid(listing_id):
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    result = get_db().table("listings").select("content, price, built_up") \
+        .eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    listing = result.data[0]
+    full_text = (listing.get("content") or "").strip()
+    if not full_text:
+        raise HTTPException(status_code=409, detail="This listing has no write-up to rewrite yet")
+
+    # The frontend sends the exact highlighted string, so an exact hit is the
+    # normal path. The normalised retry only rescues whitespace differences; a
+    # genuinely stale selection (someone edited the write-up in another tab)
+    # still gets a 409 rather than a rewrite of something that isn't there.
+    if selected not in full_text and _normalise_for_match(selected) not in _normalise_for_match(full_text):
+        raise HTTPException(
+            status_code=409,
+            detail="That selection is no longer in the write-up -- it may have been edited since. Reload the listing and select the text again."
+        )
+
+    length_rule = (
+        "Match the tone and roughly the length of the original span"
+        if not instruction else
+        "Follow the agent's instruction above; otherwise keep the tone and roughly the length of the original span"
+    )
+    instruction_block = f"\nThe agent's instruction for this rewrite: \"{instruction}\"\n" if instruction else ""
+
+    prompt = f"""Here is the full property write-up an agent is editing, for context only:
+
+<write_up>
+{full_text}
+</write_up>
+
+The agent has highlighted this exact span inside it and wants only this span rewritten:
+
+<selected_span>
+{selected}
+</selected_span>
+{instruction_block}
+Write a replacement for ONLY the highlighted span. Rules, no exceptions:
+
+1. Return the replacement text and nothing else -- no preamble, no explanation, no
+   quotation marks around it, no markdown. It will be pasted straight back into the
+   write-up in place of the highlighted span, so it must read correctly in that slot.
+2. {length_rule}. Do not rewrite, extend, or summarise any other part of the write-up.
+3. Never include a house or unit number, and never include a price in any form -- no
+   figure, no range, no "attractively priced".
+4. Plain, warm language. Avoid stock real-estate phrases -- "coveted", "established
+   enclave", "prestigious address", "epitome of luxury", "nestled in", "boasts",
+   "sprawling". If a plain word says it, use the plain word.
+5. Every claim must be traceable to something already in the write-up above. No
+   superlatives or status claims you can't point to -- describe what is concretely
+   there instead."""
+
+    try:
+        response = await create_claude_message(
+            model="claude-sonnet-4-5",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}],
+            # The SDK default is 10 minutes, which is far too long for something the
+            # agent is sat watching. Fail fast and let them retry instead.
+            timeout=60.0,
+        )
+    except Exception as e:
+        logger.error("rewrite-selection failed for agent %s: %s", agent["id"], e)
+        raise HTTPException(status_code=502, detail="Rewrite is temporarily unavailable -- please try again in a moment.")
+
+    rewritten = "".join(
+        block.text for block in response.content if getattr(block, "type", None) == "text"
+    ).strip()
+    rewritten = rewritten.replace("**", "").replace("---", "").replace("# ", "").strip()
+    # Models occasionally wrap a short span in quotes despite rule 1; strip them
+    # only when they wrap the whole thing, never mid-sentence quotes.
+    if len(rewritten) > 1 and rewritten[0] in "\"'“" and rewritten[-1] in "\"'”":
+        rewritten = rewritten[1:-1].strip()
+
+    if not rewritten:
+        raise HTTPException(status_code=502, detail="Rewrite came back empty -- please try again.")
+
+    rewritten = apply_listing_copy_guards(
+        rewritten,
+        price=listing.get("price"),
+        built_up=listing.get("built_up"),
+        context=f"rewrite:{agent['id']}",
+    )
+
+    return {"rewritten_text": rewritten}
+
 
 @app.get("/api/listings/{listing_id}/download-images")
 def download_listing_images(listing_id: str, agent=Depends(get_current_agent)):
