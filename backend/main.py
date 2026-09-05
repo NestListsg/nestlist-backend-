@@ -1975,7 +1975,7 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
 DEFAULT_VIDEO_TEMPLATE_ID = "classic"
 
 VIDEO_TEMPLATES = [
-    {"id": DEFAULT_VIDEO_TEMPLATE_ID, "name": "Ken Burns Slideshow"},
+    {"id": DEFAULT_VIDEO_TEMPLATE_ID, "name": "Cinematic Gallery"},
 ]
 
 # Templates that shipped once and were then withdrawn. They stay listed here (but out
@@ -3507,7 +3507,7 @@ NESTLIST_APP_HELP = """
 The agent is using NestList Prestige, a web app for real estate agents specializing in landed/GCB/ultra-luxury Singapore property. If they ask "how do I..." about the app itself (not a property question), use this reference:
 
 - New Listing: fill in property details and NestList generates the listing description with AI.
-- My Listings (Active Listings / Deleted Listings): manage listings. Expand a listing card to: enhance individual photos, download all photos as a ZIP, generate a branded poster (choose from several template styles), generate a property video (Ken Burns Slideshow style), and share to Facebook/Instagram/WhatsApp/LinkedIn/TikTok -- copy the caption and post manually, or (only for agents with it connected) post directly to Facebook/Instagram from the app via My Profile.
+- My Listings (Active Listings / Deleted Listings): manage listings. Expand a listing card to: enhance individual photos, download all photos as a ZIP, generate a branded poster (choose from several template styles), generate a property video (Cinematic Gallery style), and share to Facebook/Instagram/WhatsApp/LinkedIn/TikTok -- copy the caption and post manually, or (only for agents with it connected) post directly to Facebook/Instagram from the app via My Profile.
 - Deleted Listings: a listing removed from Active Listings is archived here, not permanently gone -- it can be permanently deleted from this tab.
 - Enquiries: buyer enquiries submitted through public listing pages, each with an AI-generated lead score.
 - Buyer Management: buyer profiles and buyer-to-listing matching.
