@@ -22,6 +22,7 @@ import time
 import random
 import logging
 from datetime import datetime, timedelta, date, timezone
+from urllib.parse import quote
 from PIL import Image as PILImage, ImageEnhance, ImageOps, ImageStat
 import fitz
 import poster_renderer
@@ -224,6 +225,11 @@ async def options_handler(path: str):
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "nestlist-secret-2026")
 security = HTTPBearer()
+
+# Public-facing frontend base (same host the password-reset link uses). Buyer-shareable
+# listing pages live at /l/<listing_id>. Env-overridable so a preview/staging host can
+# point elsewhere, but defaults to production so nothing breaks if the var is unset.
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_URL", "https://nestlist.sg").rstrip("/")
 
 _supabase = None
 
@@ -2943,6 +2949,113 @@ def delete_enquiry(enquiry_id: str, agent=Depends(get_current_agent)):
     if not result.data:
         raise HTTPException(status_code=404, detail="Client record not found")
     return {"success": True}
+
+@app.post("/api/enquiries/{enquiry_id}/auto-reply")
+async def generate_enquiry_auto_reply(enquiry_id: str, agent=Depends(get_current_agent)):
+    """NestList Auto-Reply: one-click, buyer-ready WhatsApp reply for an enquiry.
+
+    Additive demo feature -- it never mutates the enquiry or listing, and it must
+    NEVER 500 on AI/asset failure: any Claude error, timeout, or missing key falls
+    back to a hand-written template so the agent always gets a sendable message.
+    The reply bundles the listing's video + full-details page link, which is our
+    differentiator vs a static brochure."""
+    # 1) Enquiry, scoped to the signed-in agent (so an agent can't reply as another).
+    enq_result = get_db().table("enquiries").select("*").eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
+    if not enq_result.data:
+        raise HTTPException(status_code=404, detail="Enquiry not found")
+    enquiry = enq_result.data[0]
+
+    # 2) Its listing -- may be missing (old enquiry / deleted listing). Degrade gracefully,
+    #    never raise: the reply is still useful without full listing detail.
+    listing = {}
+    listing_id = enquiry.get("listing_id")
+    if listing_id:
+        try:
+            l_result = get_db().table("listings").select("*").eq("id", listing_id).execute()
+            if l_result.data:
+                listing = l_result.data[0]
+        except Exception as e:
+            logger.warning("auto-reply: listing fetch failed for %s: %s", listing_id, e)
+
+    property_type = listing.get("property_type") or "the property"
+    location = listing.get("location") or ""
+    district = _extract_district_token(location)
+    # Prefer the district token ("D15"), else a house-number-free location, else neutral.
+    area_phrase = district or (_strip_house_number(location) if location else "") or "the area"
+
+    buyer_name = enquiry.get("client_name") or ""
+    first_name = (buyer_name.strip().split() or ["there"])[0]
+    buyer_message = (enquiry.get("message") or enquiry.get("notes") or "").strip()
+    agent_name = agent.get("name") or "Your agent"
+
+    # Contract: video_url is strictly listing.video_url (or null).
+    video_url = listing.get("video_url") or None
+    poster_url = listing.get("poster_url") or None
+    listing_link = f"{FRONTEND_BASE_URL}/l/{listing_id}" if listing_id else FRONTEND_BASE_URL
+
+    # Template fallback -- always sendable, never mentions price.
+    fallback_message = (
+        f"Hi {first_name}, thanks for reaching out about the {property_type} in {area_phrase}! "
+        f"I'd be happy to help. I've put together a short video tour plus the full details for you to look through. "
+        f"Would you be free for a viewing this week? Happy to work around your schedule. — {agent_name}"
+    )
+
+    message = fallback_message
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        try:
+            prompt = f"""You are {agent_name}, a friendly Singapore property agent writing a WhatsApp reply to a buyer named {first_name} who just enquired about your listing.
+
+Listing: {property_type} in {area_phrase}.
+Their enquiry: "{buyer_message or 'General interest in the property.'}"
+
+Write the WhatsApp reply as 3-5 short sentences, warm and concise, natural WhatsApp tone:
+- Greet {first_name} by first name.
+- Acknowledge their specific enquiry.
+- Highlight the {property_type} in {area_phrase}.
+- Mention that a short video tour and the full details are included.
+- Invite them to a viewing.
+- Sign off as {agent_name}.
+Do NOT mention any price, budget, or dollar figure. Return ONLY the message text -- no preamble, no surrounding quotes."""
+            ai_response = await create_claude_message(
+                model="claude-sonnet-4-5",
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            ai_text = (ai_response.content[0].text or "").strip()
+            if ai_text:
+                message = ai_text
+        except Exception as e:
+            logger.warning("auto-reply: AI generation failed for enquiry %s, using template: %s", enquiry_id, e)
+            message = fallback_message
+
+    # Price-privacy guard over whatever we send (AI or template), same guard the
+    # public listing page uses. Never returns empty; if it somehow does, fall back.
+    message = apply_listing_copy_guards(
+        message,
+        price=listing.get("price"),
+        built_up=listing.get("built_up"),
+        context=f"auto-reply:{enquiry_id}",
+    ) or fallback_message
+
+    # WhatsApp deep link: normalise phone to digits, assume Singapore (+65) for bare
+    # 8-digit locals, and prefill the reply + listing link. No phone -> null.
+    whatsapp_link = None
+    digits = re.sub(r"\D", "", enquiry.get("phone") or "")
+    if digits:
+        if len(digits) == 8:
+            digits = "65" + digits
+        wa_text = quote(f"{message}\n\n{listing_link}")
+        whatsapp_link = f"https://wa.me/{digits}?text={wa_text}"
+
+    return {
+        "message": message,
+        "buyer_name": buyer_name,
+        "listing_link": listing_link,
+        "video_url": video_url,
+        "poster_url": poster_url,
+        "whatsapp_link": whatsapp_link,
+    }
 
 @app.delete("/api/listings/{listing_id}")
 def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
