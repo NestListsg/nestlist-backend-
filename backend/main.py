@@ -1971,7 +1971,10 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     )
     poster_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
 
-    update_payload = {"poster_url": poster_url}
+    # Persist which photo this poster was built from, so the agent's chosen
+    # hero shot survives a page reload instead of silently reverting to photo 0
+    # the next time the poster is (re)generated.
+    update_payload = {"poster_url": poster_url, "poster_photo_url": images[photo_index]}
     if template_id:
         update_payload["poster_template_id"] = template_id
     get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
