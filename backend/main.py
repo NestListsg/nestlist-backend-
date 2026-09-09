@@ -789,8 +789,13 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
     # Additive field -- `location` stays exactly as the agent typed it (their own
     # record), `display_location` is the house/unit-number-free version every
     # copy surface (captions, poster text, public page) should render instead.
+    # `code` already rides along via select("*"); `agent_code` (the owner agent's
+    # code) is added so the frontend can build the memorable enquiry link
+    # nestlist.sg/enquiry/{agent_code}/{code}. Purely additive.
+    owner_code = agent.get("code")
     for row in rows:
         row["display_location"] = _strip_house_number(row.get("location"))
+        row["agent_code"] = owner_code
     return rows
 
 @app.post("/api/listings/generate")
@@ -2780,27 +2785,10 @@ def _whatsapp_link_for(phone: str) -> str:
         digits = "65" + digits
     return f"https://wa.me/{digits}"
 
-@app.get("/api/public/listings/{listing_id}")
-def get_public_listing(listing_id: str):
-    # Accept either the full UUID or a short id-prefix (e.g. the first 8 hex
-    # chars) so social captions can carry a short, easy-to-type link like
-    # nestlist.sg/l/5cc93b41. Collisions across 8 hex chars are astronomically
-    # unlikely; if several ever match, serve the first.
-    code = (listing_id or "").strip().lower()
-    query = get_db().table("listings").select("*")
-    if _is_valid_uuid(code):
-        result = query.eq("id", code).execute()
-    elif re.fullmatch(r"[0-9a-f]{8}", code):
-        # `id` is a uuid column, so LIKE won't work on it. The short code is the
-        # first uuid group (8 hex chars); resolve it via a uuid range instead.
-        lo = f"{code}-0000-0000-0000-000000000000"
-        hi = f"{code}-ffff-ffff-ffff-ffffffffffff"
-        result = query.gte("id", lo).lte("id", hi).execute()
-    else:
-        raise HTTPException(status_code=404, detail="Listing not found")
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Listing not found")
-    listing = result.data[0]
+def _public_listing_payload(listing) -> dict:
+    # Shared builder for the buyer-facing listing payload. Both the by-id public
+    # endpoint and the memorable /enquiry/{agent_code}/{listing_code} endpoint
+    # return this exact shape, so the public page renders identically either way.
     agent_result = get_db().table("agents").select("name, agency, specialty").eq("id", listing["agent_id"]).execute()
     agent_info = agent_result.data[0] if agent_result.data else {}
     return {
@@ -2824,6 +2812,72 @@ def get_public_listing(listing_id: str):
         "features": listing.get("features"),
         "agent": {"name": agent_info.get("name"), "agency": agent_info.get("agency")}
     }
+
+
+def _ilike_literal(value: str) -> str:
+    # Escape ILIKE wildcards so a short code is matched literally, never as a
+    # pattern. Buyer-supplied codes arrive from the URL; without this a code
+    # containing % or _ would match multiple/unintended rows.
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@app.get("/api/public/listings/{listing_id}")
+def get_public_listing(listing_id: str):
+    # Accept either the full UUID or a short id-prefix (e.g. the first 8 hex
+    # chars) so social captions can carry a short, easy-to-type link like
+    # nestlist.sg/l/5cc93b41. Collisions across 8 hex chars are astronomically
+    # unlikely; if several ever match, serve the first.
+    code = (listing_id or "").strip().lower()
+    query = get_db().table("listings").select("*")
+    if _is_valid_uuid(code):
+        result = query.eq("id", code).execute()
+    elif re.fullmatch(r"[0-9a-f]{8}", code):
+        # `id` is a uuid column, so LIKE won't work on it. The short code is the
+        # first uuid group (8 hex chars); resolve it via a uuid range instead.
+        lo = f"{code}-0000-0000-0000-000000000000"
+        hi = f"{code}-ffff-ffff-ffff-ffffffffffff"
+        result = query.gte("id", lo).lte("id", hi).execute()
+    else:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = result.data[0]
+    return _public_listing_payload(listing)
+
+
+@app.get("/api/public/enquiry/{agent_code}/{listing_code}")
+def get_public_listing_by_codes(agent_code: str, listing_code: str):
+    # Memorable, privacy-preserving buyer link: nestlist.sg/enquiry/JC8/WMC.
+    # AGENT_CODE identifies the agent; LISTING_CODE is a discreet per-agent code
+    # the agent chooses, so the URL never leaks which property it is.
+    # Buyer-facing and hit at scale: guard all input, filter in the DB, and never
+    # surface anything but a clean 404 for blank/unknown/weird codes.
+    agent_code_norm = (agent_code or "").strip()
+    listing_code_norm = (listing_code or "").strip()
+    if not agent_code_norm or not listing_code_norm:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    # Match the agent case-insensitively, filtered in the DB (never fetch-all).
+    agent_result = (
+        get_db().table("agents").select("id")
+        .ilike("code", _ilike_literal(agent_code_norm))
+        .limit(1).execute()
+    )
+    if not agent_result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    agent_id = agent_result.data[0]["id"]
+
+    # Among THAT agent's listings, match the listing code case-insensitively.
+    # If a code somehow repeats for one agent, newest wins — never error.
+    listing_result = (
+        get_db().table("listings").select("*")
+        .eq("agent_id", agent_id)
+        .ilike("code", _ilike_literal(listing_code_norm))
+        .order("created_at", desc=True).limit(1).execute()
+    )
+    if not listing_result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    return _public_listing_payload(listing_result.data[0])
 
 @app.post("/api/public/enquiries")
 async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
