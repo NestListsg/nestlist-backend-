@@ -2790,8 +2790,12 @@ def get_public_listing(listing_id: str):
     query = get_db().table("listings").select("*")
     if _is_valid_uuid(code):
         result = query.eq("id", code).execute()
-    elif re.fullmatch(r"[0-9a-f]{6,32}", code):
-        result = query.like("id", f"{code}%").execute()
+    elif re.fullmatch(r"[0-9a-f]{8}", code):
+        # `id` is a uuid column, so LIKE won't work on it. The short code is the
+        # first uuid group (8 hex chars); resolve it via a uuid range instead.
+        lo = f"{code}-0000-0000-0000-000000000000"
+        hi = f"{code}-ffff-ffff-ffff-ffffffffffff"
+        result = query.gte("id", lo).lte("id", hi).execute()
     else:
         raise HTTPException(status_code=404, detail="Listing not found")
     if not result.data:
