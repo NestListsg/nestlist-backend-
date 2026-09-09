@@ -2757,6 +2757,10 @@ def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_curre
 # ================================
 _public_enquiry_hits = {}
 _password_reset_hits = {}
+# Public read endpoints (by-id and coded enquiry links). Rate-limited per IP so
+# short 3-char codes can't be enumerated by hammering the endpoint. Generous
+# enough that a real buyer refreshing/reloading a listing is never blocked.
+_public_listing_view_hits = {}
 
 def _rate_limited(store: dict, key: str, limit: int = 5, window_seconds: int = 3600) -> bool:
     now = datetime.utcnow()
@@ -2822,7 +2826,10 @@ def _ilike_literal(value: str) -> str:
 
 
 @app.get("/api/public/listings/{listing_id}")
-def get_public_listing(listing_id: str):
+def get_public_listing(listing_id: str, request: Request):
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if _rate_limited(_public_listing_view_hits, client_ip, limit=120, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Too many requests — please try again later")
     # Accept either the full UUID or a short id-prefix (e.g. the first 8 hex
     # chars) so social captions can carry a short, easy-to-type link like
     # nestlist.sg/l/5cc93b41. Collisions across 8 hex chars are astronomically
@@ -2846,15 +2853,28 @@ def get_public_listing(listing_id: str):
 
 
 @app.get("/api/public/enquiry/{agent_code}/{listing_code}")
-def get_public_listing_by_codes(agent_code: str, listing_code: str):
+def get_public_listing_by_codes(agent_code: str, listing_code: str, request: Request):
     # Memorable, privacy-preserving buyer link: nestlist.sg/enquiry/JC8/WMC.
     # AGENT_CODE identifies the agent; LISTING_CODE is a discreet per-agent code
     # the agent chooses, so the URL never leaks which property it is.
     # Buyer-facing and hit at scale: guard all input, filter in the DB, and never
     # surface anything but a clean 404 for blank/unknown/weird codes.
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if _rate_limited(_public_listing_view_hits, client_ip, limit=120, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Too many requests — please try again later")
+
     agent_code_norm = (agent_code or "").strip()
     listing_code_norm = (listing_code or "").strip()
     if not agent_code_norm or not listing_code_norm:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    # Strict allowlist BEFORE any DB query. Codes are alnum + hyphen only, so
+    # PostgREST wildcard syntax (`*` = SQL %) and any other pattern char can
+    # never reach .ilike(). Without this, /enquiry/*/* would resolve to
+    # `code ILIKE '%'` and hand an anonymous visitor a real listing -- the exact
+    # opposite of a discreet link. Anything else is an unknown code -> 404.
+    _code_ok = re.compile(r"[A-Za-z0-9-]{1,32}")
+    if not _code_ok.fullmatch(agent_code_norm) or not _code_ok.fullmatch(listing_code_norm):
         raise HTTPException(status_code=404, detail="Listing not found")
 
     # Match the agent case-insensitively, filtered in the DB (never fetch-all).
