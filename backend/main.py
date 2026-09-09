@@ -2782,9 +2782,18 @@ def _whatsapp_link_for(phone: str) -> str:
 
 @app.get("/api/public/listings/{listing_id}")
 def get_public_listing(listing_id: str):
-    if not _is_valid_uuid(listing_id):
+    # Accept either the full UUID or a short id-prefix (e.g. the first 8 hex
+    # chars) so social captions can carry a short, easy-to-type link like
+    # nestlist.sg/l/5cc93b41. Collisions across 8 hex chars are astronomically
+    # unlikely; if several ever match, serve the first.
+    code = (listing_id or "").strip().lower()
+    query = get_db().table("listings").select("*")
+    if _is_valid_uuid(code):
+        result = query.eq("id", code).execute()
+    elif re.fullmatch(r"[0-9a-f]{6,32}", code):
+        result = query.like("id", f"{code}%").execute()
+    else:
         raise HTTPException(status_code=404, detail="Listing not found")
-    result = get_db().table("listings").select("*").eq("id", listing_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
