@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
+from typing import Optional
 from supabase import create_client
 import bcrypt
 import os
@@ -254,6 +255,10 @@ class RegisterRequest(BaseModel):
     name: str
     agency: str
     specialty: str
+    # Optional public handle the agent chooses at signup -> their
+    # nestlist.sg/<handle>/<listing-code> link. Falls back to a slug of `name`.
+    # Optional (not `str | None`) to keep older clients working on Python 3.9.
+    username: Optional[str] = None
 
 class ListingRequest(BaseModel):
     property_type: str
@@ -515,22 +520,129 @@ def login(req: LoginRequest):
     token = create_token(str(agent["id"]))
     return {"token": token, "agent": _agent_response(agent)}
 
+# Public handles live in the FIRST URL segment (nestlist.sg/<handle>/...), so a
+# handle must never collide with one of the app's own top-level page slugs or a
+# few structural words -- otherwise a handle could shadow a real page. This set
+# is the guardrail; keep it in sync if new top-level routes are added.
+RESERVED_HANDLES = {
+    "l", "api", "auth", "login", "register", "signup", "reset-password",
+    "admin", "www", "nestlist", "support", "help", "about", "terms",
+    "privacy", "contact", "enquiry", "dashboard", "new-listing",
+    "my-listings", "active-listings", "deleted-listings", "enquiries",
+    "buyer-management", "sellers", "pricing-reports",
+    "property-tax-calculator", "resources", "my-profile", "billing", "logout",
+}
+
+def _slugify_handle(s):
+    # lowercase; spaces/underscores -> single hyphen; keep only [a-z0-9-];
+    # collapse repeated hyphens; strip leading/trailing hyphens; cap at 32.
+    s = (s or "").strip().lower()
+    s = re.sub(r"[\s_]+", "-", s)
+    s = re.sub(r"[^a-z0-9-]+", "", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = s.strip("-")[:32].strip("-")
+    return s
+
+def _handle_valid(h):
+    # Valid shape AND not a reserved app slug. Never raises on odd input.
+    return bool(re.fullmatch(r"[a-z0-9-]{2,32}", h or "")) and h not in RESERVED_HANDLES
+
+def _handle_available(h):
+    # Valid, not reserved, and no existing agent already owns it (case-insensitive
+    # on `code`). Fails CLOSED on any DB error -- the DB unique index is the real
+    # guarantee, so we never hand out a handle we could not verify.
+    if not _handle_valid(h):
+        return False
+    try:
+        existing = get_db().table("agents").select("id").ilike("code", h).limit(1).execute()
+    except Exception:
+        return False
+    return not existing.data
+
+def _handle_suggestions(base, name):
+    # Up to 4 AVAILABLE alternatives, skipping taken/invalid/reserved ones.
+    base = _slugify_handle(base) or "agent"
+    candidates = []
+    name_parts = _slugify_handle(name).split("-") if name else []
+    if name_parts:
+        last = name_parts[-1]
+        if last and last != base:
+            candidates.append(f"{base}-{last}")
+    candidates.append(f"{base}-sg")
+    candidates.append(f"{base}-property")
+    for n in range(2, 10):
+        candidates.append(f"{base}{n}")
+    out, seen = [], set()
+    for c in candidates:
+        c = _slugify_handle(c)
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        if _handle_available(c):
+            out.append(c)
+        if len(out) >= 4:
+            break
+    return out
+
+_handle_check_hits = {}
+
+@app.get("/api/public/handle-available/{handle}")
+def check_handle_available(handle: str, request: Request):
+    # Public + unauthenticated: rate-limit per IP and validate before any DB
+    # query. Never 500s -- worst case it reports "invalid"/"taken" with hints.
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if _rate_limited(_handle_check_hits, client_ip, limit=60, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Too many requests — please try again later")
+    h = (handle or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9-]{2,32}", h):
+        return {"available": False, "reason": "invalid", "suggestions": _handle_suggestions(_slugify_handle(handle), "")}
+    if h in RESERVED_HANDLES:
+        return {"available": False, "reason": "reserved", "suggestions": _handle_suggestions(h, "")}
+    if not _handle_available(h):
+        return {"available": False, "reason": "taken", "suggestions": _handle_suggestions(h, "")}
+    return {"available": True}
+
 @app.post("/api/register")
 def register(req: RegisterRequest):
     existing = get_db().table("agents").select("id").eq("email", req.email).execute()
     if existing.data:
         raise HTTPException(status_code=400, detail="Email already registered")
-    result = get_db().table("agents").insert({
-        "email": req.email,
-        "password_hash": hash_password(req.password),
-        "name": req.name,
-        "agency": req.agency,
-        "specialty": req.specialty,
-        "tone": "Warm & Conversational",
-        "emphasis": "Lifestyle & Prestige",
-        "signature": "Where your next chapter begins.",
-        "tier": "prestige"
-    }).execute()
+    # Assign the public handle at signup: use the chosen username, else a slug of
+    # the display name. App-level checks are UX; the DB unique index on lower(code)
+    # is the real guarantee (see the insert wrap below for the race).
+    handle = _slugify_handle(req.username) if req.username else _slugify_handle(req.name)
+    if not _handle_valid(handle) or not _handle_available(handle):
+        raise HTTPException(status_code=409, detail={
+            "detail": "That handle isn't available. Please pick another.",
+            "suggestions": _handle_suggestions(handle or _slugify_handle(req.name) or "agent", req.name),
+        })
+    try:
+        result = get_db().table("agents").insert({
+            "email": req.email,
+            "password_hash": hash_password(req.password),
+            "name": req.name,
+            "agency": req.agency,
+            "specialty": req.specialty,
+            "tone": "Warm & Conversational",
+            "emphasis": "Lifestyle & Prestige",
+            "signature": "Where your next chapter begins.",
+            "tier": "prestige",
+            "code": handle,
+        }).execute()
+    except Exception as e:
+        # A concurrent signup can grab the same handle (or email) between our
+        # check and this insert; the DB unique index rejects it. Convert that
+        # uniqueness error into a clean 409/400 instead of a 500.
+        msg = str(e).lower()
+        is_unique = "23505" in msg or "duplicate key" in msg or "unique constraint" in msg
+        if is_unique and "email" in msg:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        if is_unique:
+            raise HTTPException(status_code=409, detail={
+                "detail": "That handle was just taken. Please pick another.",
+                "suggestions": _handle_suggestions(handle, req.name),
+            })
+        raise
     agent = result.data[0]
     token = create_token(str(agent["id"]))
     return {"token": token, "agent": _agent_response(agent)}
