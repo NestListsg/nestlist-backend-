@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional
@@ -612,7 +613,10 @@ def register(req: RegisterRequest):
     # is the real guarantee (see the insert wrap below for the race).
     handle = _slugify_handle(req.username) if req.username else _slugify_handle(req.name)
     if not _handle_valid(handle) or not _handle_available(handle):
-        raise HTTPException(status_code=409, detail={
+        # Flat body ({detail, suggestions}) so the frontend can read data.detail
+        # (message) and data.suggestions (chips). A raised HTTPException would
+        # nest these under an outer "detail" key, breaking that contract.
+        return JSONResponse(status_code=409, content={
             "detail": "That handle isn't available. Please pick another.",
             "suggestions": _handle_suggestions(handle or _slugify_handle(req.name) or "agent", req.name),
         })
@@ -638,7 +642,7 @@ def register(req: RegisterRequest):
         if is_unique and "email" in msg:
             raise HTTPException(status_code=400, detail="Email already registered")
         if is_unique:
-            raise HTTPException(status_code=409, detail={
+            return JSONResponse(status_code=409, content={
                 "detail": "That handle was just taken. Please pick another.",
                 "suggestions": _handle_suggestions(handle, req.name),
             })
