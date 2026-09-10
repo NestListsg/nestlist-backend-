@@ -307,6 +307,9 @@ class EmailChangeRequest(BaseModel):
     new_email: str
     current_password: str
 
+class HandleClaimRequest(BaseModel):
+    username: str
+
 class TokenExchangeRequest(BaseModel):
     user_token: str
 
@@ -2466,6 +2469,40 @@ def change_email(req: EmailChangeRequest, agent=Depends(get_current_agent)):
     get_db().table("agents").update({"email": new_email}).eq("id", agent["id"]).execute()
     result = get_db().table("agents").select("*").eq("id", agent["id"]).execute()
     return _agent_response(result.data[0])
+
+@app.post("/api/agent/handle")
+def claim_handle(req: HandleClaimRequest, agent=Depends(get_current_agent)):
+    # Let an agent CLAIM (or change) their public handle after login -- chiefly
+    # for agents who registered before handles existed (code = NULL). This is an
+    # EXPLICIT choice, so we never auto-disambiguate: a taken/invalid handle 409s
+    # with suggestions, same flat {detail, suggestions} contract as register().
+    handle = _slugify_handle(req.username)
+    if not _handle_valid(handle):
+        return JSONResponse(status_code=409, content={
+            "detail": "That handle isn't valid. Use 2-32 letters, numbers or hyphens.",
+            "suggestions": _handle_suggestions(handle or _slugify_handle(agent.get("name")) or "agent", agent.get("name")),
+        })
+    # No-op if they're re-claiming the handle they already own (case-insensitive).
+    current_code = (agent.get("code") or "").strip().lower()
+    if handle != current_code and not _handle_available(handle):
+        return JSONResponse(status_code=409, content={
+            "detail": "That handle isn't available. Please pick another.",
+            "suggestions": _handle_suggestions(handle, agent.get("name")),
+        })
+    try:
+        get_db().table("agents").update({"code": handle}).eq("id", agent["id"]).execute()
+    except Exception as e:
+        # The lower(code) unique index enforces on UPDATE too; a concurrent claim
+        # of the same handle can land between our check and this update. Convert
+        # that race into a clean 409 instead of a 500.
+        if _is_unique_violation(e):
+            return JSONResponse(status_code=409, content={
+                "detail": "That handle was just taken. Please pick another.",
+                "suggestions": _handle_suggestions(handle, agent.get("name")),
+            })
+        raise
+    result = get_db().table("agents").select("*").eq("id", agent["id"]).execute()
+    return {"agent": _agent_response(result.data[0])}
 
 @app.post("/api/profile/photo")
 def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_agent)):
