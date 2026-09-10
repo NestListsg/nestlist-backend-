@@ -541,18 +541,27 @@ RESERVED_HANDLES = {
 }
 
 def _slugify_handle(s):
-    # lowercase; spaces/underscores -> single hyphen; keep only [a-z0-9-];
-    # collapse repeated hyphens; strip leading/trailing hyphens; cap at 32.
+    # lowercase; spaces/underscores -> hyphen; keep only [a-z0-9.-] (dots and
+    # hyphens are both allowed separators in a handle); collapse any run of
+    # separators (.. -- .- ) to a single hyphen; strip leading/trailing . and -;
+    # cap at 32.
     s = (s or "").strip().lower()
     s = re.sub(r"[\s_]+", "-", s)
-    s = re.sub(r"[^a-z0-9-]+", "", s)
-    s = re.sub(r"-{2,}", "-", s)
-    s = s.strip("-")[:32].strip("-")
+    s = re.sub(r"[^a-z0-9.-]+", "", s)
+    s = re.sub(r"[.-]{2,}", "-", s)
+    s = s.strip(".-")[:32].strip(".-")
     return s
 
 def _handle_valid(h):
-    # Valid shape AND not a reserved app slug. Never raises on odd input.
-    return bool(re.fullmatch(r"[a-z0-9-]{2,32}", h or "")) and h not in RESERVED_HANDLES
+    # Valid shape (letters/digits/./-), at least one alphanumeric so an
+    # all-separator handle like ".-" is rejected, AND not a reserved app slug.
+    # Never raises on odd input.
+    h = h or ""
+    return (
+        bool(re.fullmatch(r"[a-z0-9.-]{2,32}", h))
+        and bool(re.search(r"[a-z0-9]", h))
+        and h not in RESERVED_HANDLES
+    )
 
 def _handle_available(h):
     # Valid, not reserved, and no existing agent already owns it (case-insensitive
@@ -635,7 +644,7 @@ def check_handle_available(handle: str, request: Request):
     # would store. Checking the raw string let e.g. "-john" pass here while
     # register saved "john" -> a green check followed by a surprise 409.
     h = _slugify_handle(handle)
-    if not re.fullmatch(r"[a-z0-9-]{2,32}", h):
+    if not re.fullmatch(r"[a-z0-9.-]{2,32}", h):
         return {"available": False, "reason": "invalid", "suggestions": _handle_suggestions(h, "")}
     if h in RESERVED_HANDLES:
         return {"available": False, "reason": "reserved", "suggestions": _handle_suggestions(h, "")}
@@ -3196,13 +3205,16 @@ def get_public_listing_by_codes(agent_code: str, listing_code: str, request: Req
     if not agent_code_norm or not listing_code_norm:
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    # Strict allowlist BEFORE any DB query. Codes are alnum + hyphen only, so
-    # PostgREST wildcard syntax (`*` = SQL %) and any other pattern char can
-    # never reach .ilike(). Without this, /enquiry/*/* would resolve to
-    # `code ILIKE '%'` and hand an anonymous visitor a real listing -- the exact
-    # opposite of a discreet link. Anything else is an unknown code -> 404.
-    _code_ok = re.compile(r"[A-Za-z0-9-]{1,32}")
-    if not _code_ok.fullmatch(agent_code_norm) or not _code_ok.fullmatch(listing_code_norm):
+    # Strict allowlist BEFORE any DB query, so PostgREST wildcard syntax
+    # (`*` = SQL %, plus % and _) and any other pattern char can never reach
+    # .ilike(). Without this, /enquiry/*/* would resolve to `code ILIKE '%'` and
+    # hand an anonymous visitor a real listing -- the opposite of a discreet link.
+    # Agent code is the HANDLE, which allows dots (steven.tan); "." is a LITERAL
+    # in ilike so it's safe to permit. The listing code stays alnum + hyphen only.
+    # Anything outside these sets is an unknown code -> 404.
+    _agent_code_ok = re.compile(r"[A-Za-z0-9.-]{1,32}")
+    _listing_code_ok = re.compile(r"[A-Za-z0-9-]{1,32}")
+    if not _agent_code_ok.fullmatch(agent_code_norm) or not _listing_code_ok.fullmatch(listing_code_norm):
         raise HTTPException(status_code=404, detail="Listing not found")
 
     # Match the agent case-insensitively, filtered in the DB (never fetch-all).
