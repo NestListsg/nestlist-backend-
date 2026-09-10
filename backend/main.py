@@ -585,6 +585,37 @@ def _handle_suggestions(base, name):
             break
     return out
 
+def _disambiguated_handle(base, exclude=None):
+    # Pick an available numeric-suffixed variant of a DERIVED handle
+    # (base2, base3, ...), the same base+N logic _handle_suggestions uses.
+    # `exclude` skips handles already tried in an insert-race retry.
+    # ALWAYS returns a syntactically valid handle: if nothing probes available
+    # (all taken, or the DB can't be reached) it still returns a valid-shaped
+    # variant and lets the DB unique index + insert retry settle the collision.
+    exclude = exclude or set()
+    # Leave room for the numeric suffix so slugify's 32-char cap can't chop it.
+    base = (_slugify_handle(base)[:28]) or "agent"
+    for n in range(2, 100):
+        cand = _slugify_handle(f"{base}{n}")
+        if cand in exclude or not _handle_valid(cand):
+            continue
+        if _handle_available(cand):
+            return cand
+    for n in range(2, 100000):
+        cand = _slugify_handle(f"{base}{n}")
+        if cand not in exclude and _handle_valid(cand):
+            return cand
+    return _slugify_handle(f"{base}x2") or "agent"
+
+def _is_unique_violation(e):
+    # Postgres unique_violation. Prefer the structured code the client attaches
+    # (APIError.code == "23505"); fall back to matching the error text for
+    # clients/wrappers that don't surface .code.
+    if getattr(e, "code", "") == "23505":
+        return True
+    msg = str(e).lower()
+    return "23505" in msg or "duplicate key" in msg or "unique constraint" in msg
+
 _handle_check_hits = {}
 
 @app.get("/api/public/handle-available/{handle}")
@@ -592,11 +623,14 @@ def check_handle_available(handle: str, request: Request):
     # Public + unauthenticated: rate-limit per IP and validate before any DB
     # query. Never 500s -- worst case it reports "invalid"/"taken" with hints.
     client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
-    if _rate_limited(_handle_check_hits, client_ip, limit=60, window_seconds=3600):
+    if _rate_limited(_handle_check_hits, client_ip, limit=300, window_seconds=3600):
         raise HTTPException(status_code=429, detail="Too many requests — please try again later")
-    h = (handle or "").strip().lower()
+    # Slugify FIRST so the value we validate/check is exactly what register()
+    # would store. Checking the raw string let e.g. "-john" pass here while
+    # register saved "john" -> a green check followed by a surprise 409.
+    h = _slugify_handle(handle)
     if not re.fullmatch(r"[a-z0-9-]{2,32}", h):
-        return {"available": False, "reason": "invalid", "suggestions": _handle_suggestions(_slugify_handle(handle), "")}
+        return {"available": False, "reason": "invalid", "suggestions": _handle_suggestions(h, "")}
     if h in RESERVED_HANDLES:
         return {"available": False, "reason": "reserved", "suggestions": _handle_suggestions(h, "")}
     if not _handle_available(h):
@@ -608,45 +642,72 @@ def register(req: RegisterRequest):
     existing = get_db().table("agents").select("id").eq("email", req.email).execute()
     if existing.data:
         raise HTTPException(status_code=400, detail="Email already registered")
-    # Assign the public handle at signup: use the chosen username, else a slug of
-    # the display name. App-level checks are UX; the DB unique index on lower(code)
-    # is the real guarantee (see the insert wrap below for the race).
-    handle = _slugify_handle(req.username) if req.username else _slugify_handle(req.name)
-    if not _handle_valid(handle) or not _handle_available(handle):
-        # Flat body ({detail, suggestions}) so the frontend can read data.detail
-        # (message) and data.suggestions (chips). A raised HTTPException would
-        # nest these under an outer "detail" key, breaking that contract.
+    # Assign the public handle at signup. A handle the agent EXPLICITLY chose
+    # (username) must not be silently altered -- if it's taken/invalid we 409 so
+    # they can pick another. A DERIVED handle (slug of their name) is ours to
+    # disambiguate: two "David Lim"s should both succeed, the second as david-lim2.
+    # App-level checks are UX; the DB unique index on lower(code) is the real
+    # guarantee (see the insert-race retry below).
+    explicit = bool((req.username or "").strip())
+    base = _slugify_handle(req.username) if explicit else _slugify_handle(req.name)
+    if not base:
+        # Name/username slugged to nothing (all symbols) -- derive a safe base.
+        base = "agent"
+        explicit = False
+
+    if _handle_valid(base) and _handle_available(base):
+        handle = base
+    elif explicit:
+        # Explicitly chosen handle that's invalid or taken -> 409 with suggestions.
+        # Flat body ({detail, suggestions}) so the frontend reads data.detail
+        # (message) and data.suggestions (chips) directly.
         return JSONResponse(status_code=409, content={
             "detail": "That handle isn't available. Please pick another.",
-            "suggestions": _handle_suggestions(handle or _slugify_handle(req.name) or "agent", req.name),
+            "suggestions": _handle_suggestions(base, req.name),
         })
-    try:
-        result = get_db().table("agents").insert({
-            "email": req.email,
-            "password_hash": hash_password(req.password),
-            "name": req.name,
-            "agency": req.agency,
-            "specialty": req.specialty,
-            "tone": "Warm & Conversational",
-            "emphasis": "Lifestyle & Prestige",
-            "signature": "Where your next chapter begins.",
-            "tier": "prestige",
-            "code": handle,
-        }).execute()
-    except Exception as e:
-        # A concurrent signup can grab the same handle (or email) between our
-        # check and this insert; the DB unique index rejects it. Convert that
-        # uniqueness error into a clean 409/400 instead of a 500.
-        msg = str(e).lower()
-        is_unique = "23505" in msg or "duplicate key" in msg or "unique constraint" in msg
-        if is_unique and "email" in msg:
-            raise HTTPException(status_code=400, detail="Email already registered")
-        if is_unique:
-            return JSONResponse(status_code=409, content={
-                "detail": "That handle was just taken. Please pick another.",
-                "suggestions": _handle_suggestions(handle, req.name),
-            })
-        raise
+    else:
+        # Derived handle -> silently disambiguate; always ends with a valid handle.
+        handle = _disambiguated_handle(base)
+
+    insert_payload = {
+        "email": req.email,
+        "password_hash": hash_password(req.password),
+        "name": req.name,
+        "agency": req.agency,
+        "specialty": req.specialty,
+        "tone": "Warm & Conversational",
+        "emphasis": "Lifestyle & Prestige",
+        "signature": "Where your next chapter begins.",
+        "tier": "prestige",
+    }
+
+    # A concurrent signup can grab the same handle (or email) between our check
+    # and this insert; the DB unique index rejects it. Convert that into a clean
+    # response: email dup -> 400; explicit-handle dup -> 409; derived-handle dup
+    # -> retry with the next available variant (bounded) so the agent still gets in.
+    tried, result = {handle}, None
+    for _attempt in range(6):
+        try:
+            result = get_db().table("agents").insert({**insert_payload, "code": handle}).execute()
+            break
+        except Exception as e:
+            if not _is_unique_violation(e):
+                raise
+            if "email" in str(e).lower():
+                raise HTTPException(status_code=400, detail="Email already registered")
+            if explicit:
+                return JSONResponse(status_code=409, content={
+                    "detail": "That handle was just taken. Please pick another.",
+                    "suggestions": _handle_suggestions(base, req.name),
+                })
+            handle = _disambiguated_handle(base, exclude=tried)
+            tried.add(handle)
+    if result is None:
+        # Exhausted retries on a derived handle (extreme contention) -- last resort
+        # so we never 500: a random-ish valid suffix the unique index will accept.
+        fallback = _slugify_handle(f"{base[:24]}-{secrets.token_hex(3)}") or f"agent-{secrets.token_hex(3)}"
+        result = get_db().table("agents").insert({**insert_payload, "code": fallback}).execute()
+
     agent = result.data[0]
     token = create_token(str(agent["id"]))
     return {"token": token, "agent": _agent_response(agent)}
