@@ -275,6 +275,9 @@ class ListingRequest(BaseModel):
     storeys: float = 0
     site_coverage: float = 0
     sg_citizen: bool = False
+    # Optional agent-supplied override for the discreet buyer-link code
+    # (nestlist.sg/{handle}/{code}). Blank/omitted -> derived from `location`.
+    code: Optional[str] = None
 
 class ListingContentRequest(BaseModel):
     content: str
@@ -829,6 +832,97 @@ def _strip_house_number(location) -> str:
     return text.strip().strip(",").strip()
 
 
+# Generic road-type words folded out when building the discreet listing code:
+# they carry no distinctiveness on their own. Case-insensitive. NOTE: "Jalan" is
+# deliberately NOT here -- in Malay street names ("Jalan Kupang") it's part of
+# the distinctive name, so it counts as a distinctive word, not a road-type.
+_CODE_ROAD_TYPE_WORDS = {
+    "road", "street", "avenue", "ave", "lane", "close", "drive", "walk",
+    "crescent", "terrace", "rise", "green", "park", "place", "quay", "view",
+    "grove", "hill", "gardens", "garden", "boulevard", "way", "link", "loop", "path",
+}
+# Noise tokens ignored entirely (never contribute a letter). Pure-number tokens
+# are dropped separately, by having no alphabetic characters.
+_CODE_NOISE_WORDS = {"district", "freehold", "leasehold"}
+
+
+def _derive_listing_code(location) -> Optional[str]:
+    """The discreet per-agent listing code for nestlist.sg/{handle}/{code}.
+
+    Pure function: no DB, no exceptions escape (returns None on any trouble).
+    Rule (confirmed by Jane):
+      1. Street = text before the first comma of `location`, with leading
+         house/block numbers and #NN-NN unit tokens stripped.
+      2. Take the first letter of each DISTINCTIVE word, ignoring the generic
+         road-type word (road, street, avenue, ...) and noise words
+         (district, freehold, leasehold, pure-number tokens).
+      3. If that yields only ONE letter (single-word name), also fold in the
+         road-type word's initial, so the code is always >= 2 letters.
+      4. Caesar-shift each letter +2 (wrapping X->Z, Y->A, Z->B), uppercase.
+    Returns None when no letters can be derived (link falls back to /l/{id}).
+    Examples: "Woo Mon Chew Road"->YOE, "Pulasan Road"->RT, "Nassim Road"->PT,
+    "First Street"->HU, "Jalan Kupang"->LM, "St. Patrick's Road"->UR.
+    """
+    try:
+        text = str(location or "")
+        # Street only: everything before the first comma.
+        street = text.split(",", 1)[0]
+        # Strip unit tokens (#03-01) and a leading house/block number, exactly
+        # as the copy-facing display path does.
+        street = _UNIT_NUMBER_RE.sub(" ", street)
+        street = _HOUSE_NUMBER_PREFIX_RE.sub("", street)
+
+        distinctive = []
+        road_type_initials = []
+        for word in street.split():
+            # First alphabetic run of the token; leading punctuation, apostrophes
+            # and pure-number tokens ("12", "#03-01" leftovers) contribute none.
+            letters = re.sub(r"[^A-Za-z]", "", word)
+            if not letters:
+                continue
+            low = letters.lower()
+            if low in _CODE_NOISE_WORDS:
+                continue
+            initial = letters[0].upper()
+            if low in _CODE_ROAD_TYPE_WORDS:
+                road_type_initials.append(initial)
+                continue
+            distinctive.append(initial)
+
+        picked = list(distinctive)
+        # Single distinctive word -> also include the road-type initial (>= 2).
+        if len(picked) == 1 and road_type_initials:
+            picked.append(road_type_initials[0])
+        if not picked:
+            return None
+
+        return "".join(
+            chr((ord(ch) - ord("A") + 2) % 26 + ord("A")) for ch in picked
+        )
+    except Exception:
+        return None
+
+
+def _unique_listing_code(agent_id: str, base: str, exclude_id: Optional[str] = None) -> str:
+    """Make BASE unique among THIS agent's listings (case-insensitive), appending
+    2, 3, 4... until free (base, base2, base3...). One filtered query, resolved in
+    memory. Never raises -- on any error the plain base is returned unchanged."""
+    try:
+        query = get_db().table("listings").select("id, code").eq("agent_id", agent_id)
+        if exclude_id:
+            query = query.neq("id", exclude_id)
+        rows = query.execute().data or []
+        taken = {(r.get("code") or "").strip().lower() for r in rows if r.get("code")}
+        if base.lower() not in taken:
+            return base
+        suffix = 2
+        while f"{base}{suffix}".lower() in taken:
+            suffix += 1
+        return f"{base}{suffix}"
+    except Exception:
+        return base
+
+
 def _address_number_hits(text: str) -> list:
     """Matches of the address-anchored house-number pattern, false positives dropped."""
     hits = []
@@ -1109,7 +1203,24 @@ Write:
         listing_text, price=req.price, built_up=req.built_up, context=f"generate:{agent['id']}"
     )
 
-    saved = get_db().table("listings").insert({
+    # Discreet per-agent buyer-link code (nestlist.sg/{handle}/{code}). An
+    # agent-supplied override wins (validated); otherwise it's derived from the
+    # street name. Wrapped whole so it can NEVER break listing creation -- on any
+    # trouble the code stays null and the buyer link falls back to /l/{id}.
+    listing_code = None
+    try:
+        override = (req.code or "").strip()
+        if override:
+            if re.fullmatch(r"[A-Za-z0-9-]{1,32}", override):
+                listing_code = _unique_listing_code(agent["id"], override)
+        else:
+            base = _derive_listing_code(req.location)
+            if base:
+                listing_code = _unique_listing_code(agent["id"], base)
+    except Exception:
+        listing_code = None
+
+    insert_payload = {
         "agent_id": agent["id"],
         "location": req.location,
         "price": req.price,
@@ -1124,7 +1235,10 @@ Write:
         "storeys": req.storeys,
         "site_coverage": req.site_coverage,
         "features": req.features,
-    }).execute()
+    }
+    if listing_code:
+        insert_payload["code"] = listing_code
+    saved = get_db().table("listings").insert(insert_payload).execute()
 
     listing_row = saved.data[0]
     # `location` in the DB stays as the agent typed it; copy surfaces use this.
@@ -3403,10 +3517,10 @@ def delete_listing_permanently(listing_id: str, agent=Depends(get_current_agent)
 
 @app.patch("/api/listings/{listing_id}")
 def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_current_agent)):
-    existing = get_db().table("listings").select("id").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    existing = get_db().table("listings").select("id, code").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Listing not found")
-    updated = get_db().table("listings").update({
+    update_payload = {
         # Saving here always promotes the row to "active" -- this is the same
         # endpoint used both for editing an existing active listing (already
         # active, so this is a no-op) and for finishing a seller lead's
@@ -3425,7 +3539,27 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
         "plot_depth": req.plot_depth,
         "storeys": req.storeys,
         "site_coverage": req.site_coverage,
-    }).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    }
+    # Discreet buyer-link code. An override sets it; otherwise we only *fill in* a
+    # code when the listing has none yet -- an ordinary field edit must never
+    # clobber an existing code (e.g. the demo listing's YOE). Wrapped whole so it
+    # can never break the update.
+    try:
+        override = (req.code or "").strip()
+        if override:
+            if re.fullmatch(r"[A-Za-z0-9-]{1,32}", override):
+                update_payload["code"] = _unique_listing_code(
+                    agent["id"], override, exclude_id=listing_id
+                )
+        elif not (existing.data[0].get("code") or "").strip():
+            base = _derive_listing_code(req.location)
+            if base:
+                update_payload["code"] = _unique_listing_code(
+                    agent["id"], base, exclude_id=listing_id
+                )
+    except Exception:
+        pass
+    updated = get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
     return updated.data[0]
 
 MAX_LISTING_CONTENT_CHARS = 20000
