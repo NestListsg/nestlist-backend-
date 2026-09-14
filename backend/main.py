@@ -193,7 +193,7 @@ async def refresh_market_pulse_loop():
         try:
             stats = await ura_market_pulse.refresh_market_pulse()
             if stats:
-                db_execute(lambda db: db.table("market_pulse").upsert({"id": 1, **stats}), what="refresh_market_pulse_loop market_pulse upsert")
+                await db_execute_async(lambda db: db.table("market_pulse").upsert({"id": 1, **stats}), what="refresh_market_pulse_loop market_pulse upsert")
         except Exception as e:
             await send_telegram_alert_throttled("market_pulse_refresh_failed",
                 f"⚠️ <b>NestList Warning</b>\n\nMarket Pulse auto-refresh from URA failed: {e}\n\nThe panel will keep showing its last known values.")
@@ -260,27 +260,28 @@ def get_db():
 # Not every transport failure carries the same information, and the difference is
 # what makes retrying a WRITE safe or unsafe:
 #
-#   _DB_UNSENT_ERRORS  -- the connection was never established, so the query
-#                         provably never reached the database. Retrying cannot
-#                         duplicate anything, so even an INSERT is safe to retry.
-#   _DB_TRANSPORT_ERRORS -- the full set, including failures that happened after
-#                         the request went out (the GOAWAY case, read timeouts).
-#                         The database MIGHT have applied the query before the
-#                         connection died, so these are only safe to retry when
-#                         running the query twice has the same effect as once.
+#   _DB_UNSENT_ERRORS    -- the connection was never established, so the query
+#                           provably never reached the database. Retrying cannot
+#                           duplicate anything, so even an INSERT is safe to retry.
+#                           This drives the RETRY decision only, so it is kept
+#                           deliberately narrow and explicit.
+#   _DB_TRANSPORT_ERRORS -- httpx.TransportError, the common parent of every
+#                           transport failure. This drives the CATCH and
+#                           POOL-RESET decision, so it must be exhaustive: an
+#                           uncaught sibling would propagate without resetting the
+#                           poisoned pool and strand that worker, which is the
+#                           exact failure this whole helper exists to eliminate.
+#                           Listing children individually let httpx.WriteTimeout
+#                           (a TimeoutException, not a NetworkError -- reachable
+#                           when sending a long listing `content` or a 15-URL
+#                           `images` array) and httpx.ProxyError slip through.
 _DB_UNSENT_ERRORS = (
     httpx.ConnectError,      # TCP/TLS never established
     httpx.ConnectTimeout,    # ...and timed out trying
     httpx.PoolTimeout,       # never even got a connection out of the pool
 )
 
-_DB_TRANSPORT_ERRORS = _DB_UNSENT_ERRORS + (
-    httpx.RemoteProtocolError,  # the GOAWAY case that caused the 2026-09-14 outage
-    httpx.ReadError,
-    httpx.ReadTimeout,
-    httpx.WriteError,
-    httpx.NetworkError,
-)
+_DB_TRANSPORT_ERRORS = httpx.TransportError
 
 
 def _reset_db():
@@ -296,31 +297,35 @@ def _reset_db():
 
 
 def db_execute_tracked(build, attempts: int = 3, what: str = "query", idempotent: bool = True):
-    """db_execute, but also reports how many attempts it took: (result, attempts_used).
+    """db_execute, but also reports whether an earlier attempt might already have
+    been applied: returns (result, maybe_applied).
 
     Callers that treat an EMPTY result as 404 need this. If we retried a DELETE,
-    an empty result no longer means "the row never existed" -- it may mean our own
-    first attempt already deleted it. Those handlers check attempts_used to tell
-    the two apart instead of reporting a bogus 404 for work that succeeded."""
-    retry_unsafe_writes = not idempotent
+    an empty result no longer proves the row never existed -- our own first attempt
+    may have deleted it. `maybe_applied` is True only when a failed attempt could
+    actually have reached the database, so an attempt that failed UNSENT (and was
+    then retried) still allows an honest 404."""
+    maybe_applied = False
     delay = 0.1
     for attempt in range(1, attempts + 1):
         try:
-            return build(get_db()).execute(), attempt
+            return build(get_db()).execute(), maybe_applied
         except _DB_TRANSPORT_ERRORS as e:
             # The pool is poisoned either way, so always discard it -- even when we
             # are not going to retry, so the NEXT request on this worker is clean.
             unsent = isinstance(e, _DB_UNSENT_ERRORS)
+            if not unsent:
+                maybe_applied = True
             logger.warning(
                 "db transport error on %s (attempt %s/%s): %s: %s%s",
                 what, attempt, attempts, type(e).__name__, e,
-                "" if (unsent or not retry_unsafe_writes) else " [not retried: write may have landed]",
+                "" if (unsent or idempotent) else " [not retried: write may have landed]",
             )
             _reset_db()
             # A non-idempotent query (INSERT) is only retried when the request
             # provably never reached the database. Otherwise we would risk a
             # duplicate row, which is worse than a clean error the agent can retry.
-            if attempt == attempts or (retry_unsafe_writes and not unsent):
+            if attempt == attempts or (not idempotent and not unsent):
                 raise
             time.sleep(delay)
             delay *= 2
@@ -337,6 +342,9 @@ def db_execute(build, attempts: int = 3, what: str = "query", idempotent: bool =
     SELECT / UPDATE / DELETE / UPSERT in this codebase all set literal values or
     filter by id, so running them twice has the same effect as once.
 
+    BLOCKING -- both the PostgREST call and the backoff sleep. Never call this
+    from an `async def`; use db_execute_async instead (see why there).
+
     Retries are deliberately few and fast (0.1s, 0.2s): someone is waiting on the
     page, and a pool that is still dead after two fresh clients is a real outage,
     not a blip -- at that point the caller decides how to degrade.
@@ -345,6 +353,28 @@ def db_execute(build, attempts: int = 3, what: str = "query", idempotent: bool =
     transport error and still raises straight through, so genuine bugs stay visible."""
     result, _ = db_execute_tracked(build, attempts=attempts, what=what, idempotent=idempotent)
     return result
+
+
+async def db_execute_async(build, attempts: int = 3, what: str = "query", idempotent: bool = True):
+    """Event-loop-safe db_execute, for `async def` handlers.
+
+    db_execute blocks twice over: the PostgREST call itself is synchronous httpx,
+    and the retry backoff is a real time.sleep. Awaiting neither, a coroutine that
+    called db_execute directly would freeze its entire uvicorn worker -- and each
+    worker serves every route, so one poisoned auth lookup would stall the
+    buyer-facing listing pages too. Handing the whole thing to a worker thread
+    keeps the event loop free."""
+    return await asyncio.to_thread(
+        db_execute, build, attempts=attempts, what=what, idempotent=idempotent
+    )
+
+
+async def db_execute_tracked_async(build, attempts: int = 3, what: str = "query", idempotent: bool = True):
+    """Event-loop-safe db_execute_tracked -- see db_execute_async."""
+    return await asyncio.to_thread(
+        db_execute_tracked, build, attempts=attempts, what=what, idempotent=idempotent
+    )
+
 
 # ================================
 # MODELS
@@ -561,7 +591,7 @@ async def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(
         # Retried: this dependency gates EVERY authed endpoint, so a single stale
         # pooled connection here would 503 every agent action -- including the
         # write paths -- rather than just one request.
-        result = db_execute(
+        result = await db_execute_async(
             lambda db: db.table("agents").select("*").eq("id", agent_id),
             what="get_current_agent session lookup",
         )
@@ -847,12 +877,12 @@ async def request_password_reset(req: PasswordResetRequest, request: Request):
 
     generic_response = {"success": True, "message": "If that email is registered with NestList, a reset link has been sent."}
 
-    result = db_execute(lambda db: db.table("agents").select("id, email, name").eq("email", req.email), what="request_password_reset agents select")
+    result = await db_execute_async(lambda db: db.table("agents").select("id, email, name").eq("email", req.email), what="request_password_reset agents select")
     if not result.data:
         return generic_response  # never reveal whether an email is registered
     agent = result.data[0]
 
-    db_execute(
+    await db_execute_async(
         lambda db: db.table("password_resets").update({"used_at": datetime.utcnow().isoformat()})
         .eq("agent_id", agent["id"]).is_("used_at", "null"),
         what="request_password_reset invalidate prior tokens",
@@ -860,7 +890,7 @@ async def request_password_reset(req: PasswordResetRequest, request: Request):
 
     raw_token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-    db_execute(
+    await db_execute_async(
         lambda db: db.table("password_resets").insert({
             "agent_id": agent["id"],
             "token_hash": token_hash,
@@ -1362,7 +1392,7 @@ Write:
     }
     if listing_code:
         insert_payload["code"] = listing_code
-    saved = db_execute(lambda db: db.table("listings").insert(insert_payload), what="generate_listing listings insert", idempotent=False)
+    saved = await db_execute_async(lambda db: db.table("listings").insert(insert_payload), what="generate_listing listings insert", idempotent=False)
 
     listing_row = saved.data[0]
     # `location` in the DB stays as the agent typed it; copy surfaces use this.
@@ -1474,6 +1504,14 @@ def _cas_update_images(listing_id, agent_id, previous, new_images):
     for candidate in ("json", "array"):
         try:
             applied = _try_images_cas(listing_id, agent_id, previous, new_images, candidate)
+        except _DB_TRANSPORT_ERRORS:
+            # An unreachable database is not a verdict on the encoding. Swallowing
+            # it here would blame the filter, try the other candidate, fail that
+            # too, and silently downgrade this write to a NON-ATOMIC update -- the
+            # one thing the compare-and-swap exists to prevent. Propagate instead
+            # so the agent gets a clean error and can retry. (Same reasoning as
+            # the boot-time probe below.)
+            raise
         except Exception as exc:
             failures.append(f"{candidate}: {exc}")
             continue
@@ -1517,6 +1555,19 @@ def _probe_images_cas_encoding():
                 .filter("images", "eq", _encode_images_filter(["__probe__"], candidate)),
                 what=f"images cas encoding probe ({candidate})",
             )
+        except _DB_TRANSPORT_ERRORS as exc:
+            # Database unreachable at boot says nothing about the encoding.
+            # Recording it as a failure would log "photo writes will fall back to
+            # non-atomic updates" and flip photo_writes_atomic false on /api/health
+            # for a blip. Leave it undetermined -- the first real photo write
+            # settles it -- and say plainly that this is not an encoding verdict.
+            logger.warning(
+                "images cas encoding probe: database unreachable (%s: %s) -- encoding "
+                "left undetermined, the first real photo write will settle it. "
+                "This is NOT an encoding rejection.",
+                type(exc).__name__, exc,
+            )
+            return None
         except Exception as exc:
             failures.append(f"{candidate}: {exc}")
             continue
@@ -2557,7 +2608,7 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
 
 @app.post("/api/listings/{listing_id}/generate-video")
 async def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, agent=Depends(get_current_agent)):
-    result = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_video listings select")
+    result = await db_execute_async(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_video listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
@@ -2606,7 +2657,7 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
         if still_fresh:
             raise HTTPException(status_code=409, detail="A video is already being generated for this listing -- it should be ready in a minute or two.")
 
-    db_execute(
+    await db_execute_async(
         lambda db: db.table("listings").update({
             "video_status": "rendering",
             "video_error": None,
@@ -3165,7 +3216,7 @@ async def update_market_pulse(request: Request, agent=Depends(get_current_agent)
     body = await request.json()
     body["last_updated"] = date.today().strftime("%b %Y")
     body["source"] = "manual"
-    db_execute(lambda db: db.table("market_pulse").upsert({"id": 1, **body}), what="update_market_pulse market_pulse upsert")
+    await db_execute_async(lambda db: db.table("market_pulse").upsert({"id": 1, **body}), what="update_market_pulse market_pulse upsert")
     return {"success": True}
 
 @app.post("/api/market-pulse/refresh")
@@ -3177,7 +3228,7 @@ async def trigger_market_pulse_refresh(agent=Depends(get_current_agent)):
     stats = await ura_market_pulse.refresh_market_pulse()
     if not stats:
         raise HTTPException(status_code=502, detail="No qualifying GCB transactions found in the past 12 months, or the URA request failed")
-    db_execute(lambda db: db.table("market_pulse").upsert({"id": 1, **stats}), what="trigger_market_pulse_refresh market_pulse upsert")
+    await db_execute_async(lambda db: db.table("market_pulse").upsert({"id": 1, **stats}), what="trigger_market_pulse_refresh market_pulse upsert")
     return stats
 
 @app.post("/api/cma/generate")
@@ -3433,7 +3484,7 @@ async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
     if not _is_valid_uuid(req.listing_id):
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    listing_result = db_execute(lambda db: db.table("listings").select("id, agent_id, location, property_type, price").eq("id", req.listing_id), what="create_public_enquiry listings select")
+    listing_result = await db_execute_async(lambda db: db.table("listings").select("id, agent_id, location, property_type, price").eq("id", req.listing_id), what="create_public_enquiry listings select")
     if not listing_result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = listing_result.data[0]
@@ -3466,26 +3517,76 @@ Return only valid JSON, nothing else."""
         except Exception:
             pass
 
-    saved = db_execute(
-        lambda db: db.table("enquiries").insert({
-            "agent_id": listing["agent_id"],
-            "client_name": req.client_name,
-            "phone": req.phone,
-            "email": req.email,
-            "client_type": "Buyer",
-            "property_interest": f"{listing['property_type']} — {listing['location']}",
-            "notes": message,
-            "status": "Active",
-            "source": "Public Listing Page",
-            "listing_id": req.listing_id,
-            "message": message,
-            "lead_score": lead_score,
-            "ai_summary": ai_summary,
-        }),
-        what="create_public_enquiry save lead", idempotent=False,
-    )
+    enquiry_row = {
+        "agent_id": listing["agent_id"],
+        "client_name": req.client_name,
+        "phone": req.phone,
+        "email": req.email,
+        "client_type": "Buyer",
+        "property_interest": f"{listing['property_type']} — {listing['location']}",
+        "notes": message,
+        "status": "Active",
+        "source": "Public Listing Page",
+        "listing_id": req.listing_id,
+        "message": message,
+        "lead_score": lead_score,
+        "ai_summary": ai_summary,
+    }
 
-    agent_notif_result = db_execute(
+    # This INSERT still must not be blind-retried, but for a buyer lead the worst
+    # outcome is not a duplicate row -- it is a lead that exists in the database
+    # with no alert ever sent, because everything below (the agent's Telegram /
+    # WhatsApp notification) is skipped when the insert raises. A buyer told the
+    # form failed usually never fills it in again, so losing one is worse than
+    # storing one twice.
+    #
+    # So on a transport failure we resolve the ambiguity instead of guessing:
+    # look for this buyer's own row from the last minute.
+    #   found     -> the insert did land; carry on and send the alert.
+    #   not found -> it provably did not land, so inserting again cannot duplicate.
+    # The match is deliberately tight (listing + name + phone). A false negative
+    # costs a duplicate row, which is recoverable; a false positive would drop a
+    # real buyer, which is not.
+    try:
+        saved = await db_execute_async(
+            lambda db: db.table("enquiries").insert(enquiry_row),
+            what="create_public_enquiry save lead", idempotent=False,
+        )
+    except _DB_TRANSPORT_ERRORS as exc:
+        logger.warning(
+            "create_public_enquiry: lead insert failed in flight (%s: %s) -- checking whether it landed",
+            type(exc).__name__, exc,
+        )
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+
+        def _find_recent_lead(db):
+            q = (
+                db.table("enquiries").select("*")
+                .eq("listing_id", req.listing_id)
+                .eq("client_name", req.client_name)
+                .gte("created_at", cutoff)
+                .order("created_at", desc=True).limit(1)
+            )
+            # Only filter on phone when there is one -- PostgREST cannot express
+            # "= NULL" this way, and an empty string would match the wrong row.
+            return q.eq("phone", req.phone) if req.phone else q
+
+        saved = await db_execute_async(
+            _find_recent_lead, what="create_public_enquiry recover lead after transport failure",
+        )
+        if saved.data:
+            logger.warning(
+                "create_public_enquiry: lead %s did land despite the error -- continuing to the agent alert",
+                saved.data[0].get("id"),
+            )
+        else:
+            logger.warning("create_public_enquiry: lead was not stored -- re-inserting")
+            saved = await db_execute_async(
+                lambda db: db.table("enquiries").insert(enquiry_row),
+                what="create_public_enquiry re-save lead (confirmed not stored)", idempotent=False,
+            )
+
+    agent_notif_result = await db_execute_async(
         lambda db: db.table("agents").select(
             "telegram_chat_id, notification_channel, whatsapp_number"
         ).eq("id", listing["agent_id"]),
@@ -3524,9 +3625,9 @@ async def telegram_webhook(request: Request):
         if text.startswith("/start ") and chat_id:
             payload = text[len("/start "):].strip()
             if _is_valid_uuid(payload):
-                existing = db_execute(lambda db: db.table("agents").select("telegram_chat_id").eq("id", payload), what="telegram_webhook agents select")
+                existing = await db_execute_async(lambda db: db.table("agents").select("telegram_chat_id").eq("id", payload), what="telegram_webhook agents select")
                 old_chat_id = existing.data[0].get("telegram_chat_id") if existing.data else None
-                db_execute(lambda db: db.table("agents").update({"telegram_chat_id": chat_id}).eq("id", payload), what="telegram_webhook agents update")
+                await db_execute_async(lambda db: db.table("agents").update({"telegram_chat_id": chat_id}).eq("id", payload), what="telegram_webhook agents update")
                 if old_chat_id and old_chat_id != chat_id:
                     await send_telegram_alert(
                         "⚠️ <b>Telegram connection replaced</b>\n\nYour NestList lead alerts were just redirected to a different Telegram chat. If this wasn't you, contact support immediately.",
@@ -3552,22 +3653,24 @@ def get_enquiries(agent=Depends(get_current_agent)):
 async def create_enquiry(request: Request, agent=Depends(get_current_agent)):
     body = await request.json()
     body["agent_id"] = agent["id"]
-    result = db_execute(lambda db: db.table("enquiries").insert(body), what="create_enquiry enquiries insert", idempotent=False)
+    result = await db_execute_async(lambda db: db.table("enquiries").insert(body), what="create_enquiry enquiries insert", idempotent=False)
     return result.data[0]
 
 @app.put("/api/enquiries/{enquiry_id}")
 async def update_enquiry(enquiry_id: str, request: Request, agent=Depends(get_current_agent)):
     body = await request.json()
-    result = db_execute(lambda db: db.table("enquiries").update(body).eq("id", enquiry_id).eq("agent_id", agent["id"]), what="update_enquiry enquiries update")
+    result = await db_execute_async(lambda db: db.table("enquiries").update(body).eq("id", enquiry_id).eq("agent_id", agent["id"]), what="update_enquiry enquiries update")
     return result.data[0]
 
 @app.delete("/api/enquiries/{enquiry_id}")
 def delete_enquiry(enquiry_id: str, agent=Depends(get_current_agent)):
-    result, tries = db_execute_tracked(lambda db: db.table("enquiries").delete().eq("id", enquiry_id).eq("agent_id", agent["id"]), what="delete_enquiry enquiries delete")
-    if not result.data and tries == 1:
+    result, maybe_applied = db_execute_tracked(lambda db: db.table("enquiries").delete().eq("id", enquiry_id).eq("agent_id", agent["id"]), what="delete_enquiry enquiries delete")
+    if not result.data and not maybe_applied:
         # A retried DELETE finds nothing the second time, so an empty result only
-        # means "never existed" when we did NOT retry. Without this check a
-        # successful delete could report 404 and look like it failed.
+        # means "never existed" when no earlier attempt could have reached the
+        # database. Without this a successful delete could report 404 and look
+        # like it failed; with `tries == 1` instead, an attempt that failed
+        # UNSENT would have suppressed an honest 404.
         raise HTTPException(status_code=404, detail="Client record not found")
     return {"success": True}
 
@@ -4045,11 +4148,13 @@ def update_buyer(buyer_id: str, req: BuyerRequest, agent=Depends(get_current_age
 
 @app.delete("/api/buyers/{buyer_id}")
 def delete_buyer(buyer_id: str, agent=Depends(get_current_agent)):
-    result, tries = db_execute_tracked(lambda db: db.table("buyers").delete().eq("id", buyer_id).eq("agent_id", agent["id"]), what="delete_buyer buyers delete")
-    if not result.data and tries == 1:
+    result, maybe_applied = db_execute_tracked(lambda db: db.table("buyers").delete().eq("id", buyer_id).eq("agent_id", agent["id"]), what="delete_buyer buyers delete")
+    if not result.data and not maybe_applied:
         # A retried DELETE finds nothing the second time, so an empty result only
-        # means "never existed" when we did NOT retry. Without this check a
-        # successful delete could report 404 and look like it failed.
+        # means "never existed" when no earlier attempt could have reached the
+        # database. Without this a successful delete could report 404 and look
+        # like it failed; with `tries == 1` instead, an attempt that failed
+        # UNSENT would have suppressed an honest 404.
         raise HTTPException(status_code=404, detail="Buyer not found")
     return {"success": True}
 
@@ -4083,11 +4188,13 @@ def delete_buyer_property(buyer_id: str, property_id: str, agent=Depends(get_cur
     buyer_check = db_execute(lambda db: db.table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]), what="delete_buyer_property buyers select")
     if not buyer_check.data:
         raise HTTPException(status_code=404, detail="Buyer not found")
-    result, tries = db_execute_tracked(lambda db: db.table("buyer_properties").delete().eq("id", property_id).eq("buyer_id", buyer_id), what="delete_buyer_property buyer_properties delete")
-    if not result.data and tries == 1:
+    result, maybe_applied = db_execute_tracked(lambda db: db.table("buyer_properties").delete().eq("id", property_id).eq("buyer_id", buyer_id), what="delete_buyer_property buyer_properties delete")
+    if not result.data and not maybe_applied:
         # A retried DELETE finds nothing the second time, so an empty result only
-        # means "never existed" when we did NOT retry. Without this check a
-        # successful delete could report 404 and look like it failed.
+        # means "never existed" when no earlier attempt could have reached the
+        # database. Without this a successful delete could report 404 and look
+        # like it failed; with `tries == 1` instead, an attempt that failed
+        # UNSENT would have suppressed an honest 404.
         raise HTTPException(status_code=404, detail="Property entry not found")
     return {"success": True}
 
@@ -4253,11 +4360,13 @@ def update_seller(seller_id: str, req: SellerLeadRequest, agent=Depends(get_curr
 
 @app.delete("/api/sellers/{seller_id}")
 def delete_seller(seller_id: str, agent=Depends(get_current_agent)):
-    result, tries = db_execute_tracked(lambda db: db.table("listings").delete().eq("id", seller_id).eq("agent_id", agent["id"]).eq("status", "lead"), what="delete_seller listings delete")
-    if not result.data and tries == 1:
+    result, maybe_applied = db_execute_tracked(lambda db: db.table("listings").delete().eq("id", seller_id).eq("agent_id", agent["id"]).eq("status", "lead"), what="delete_seller listings delete")
+    if not result.data and not maybe_applied:
         # A retried DELETE finds nothing the second time, so an empty result only
-        # means "never existed" when we did NOT retry. Without this check a
-        # successful delete could report 404 and look like it failed.
+        # means "never existed" when no earlier attempt could have reached the
+        # database. Without this a successful delete could report 404 and look
+        # like it failed; with `tries == 1` instead, an attempt that failed
+        # UNSENT would have suppressed an honest 404.
         raise HTTPException(status_code=404, detail="Seller not found")
     return {"success": True}
 
