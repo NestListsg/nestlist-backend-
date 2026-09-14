@@ -234,6 +234,7 @@ security = HTTPBearer()
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_URL", "https://nestlist.sg").rstrip("/")
 
 _supabase = None
+_supabase_lock = threading.Lock()
 
 def get_db():
     global _supabase
@@ -242,6 +243,67 @@ def get_db():
         key = os.environ.get("SUPABASE_KEY", "")
         _supabase = create_client(url, key)
     return _supabase
+
+
+# Supabase/PostgREST sits behind an HTTP/2 proxy that periodically ends an idle
+# connection with a graceful GOAWAY. The supabase client caches one httpx
+# connection pool per uvicorn worker for the life of the process, so that dead
+# connection gets handed to the next query and raises RemoteProtocolError. With
+# `--workers 4` only the workers holding a poisoned pool fail, which is why this
+# showed up as buyer-facing listing pages 500-ing some of the time and not others.
+#
+# These are transport-level failures, not data-level ones: the query was never
+# answered, so the safe response is to throw the poisoned pool away and try again.
+# A real PostgREST error (bad filter, RLS denial, constraint violation) is NOT in
+# this tuple and still raises straight through, so genuine bugs stay visible.
+_DB_TRANSPORT_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.NetworkError,
+    httpx.PoolTimeout,
+)
+
+
+def _reset_db():
+    """Drop the cached client so the next get_db() builds a fresh connection pool.
+
+    The reference is dropped rather than closed: another thread in this worker may
+    still be inside .execute() on the old client, and closing its pool underneath
+    it would turn one transient error into several. Refcounting closes the old
+    pool as soon as the last thread lets go of it."""
+    global _supabase
+    with _supabase_lock:
+        _supabase = None
+
+
+def db_execute(build, attempts: int = 3, what: str = "query"):
+    """Run a PostgREST query with bounded retries on transport-level failures.
+
+    `build` takes the supabase client and returns a query ready to .execute(),
+    e.g. db_execute(lambda db: db.table("agents").select("*").eq("id", x)).
+    The query is rebuilt each attempt so the retry uses the fresh client.
+
+    Retries are deliberately few and fast (0.1s, 0.2s): a buyer is waiting on the
+    page, and a pool that is still dead after two fresh clients is a real outage,
+    not a blip -- at that point the caller decides how to degrade."""
+    delay = 0.1
+    for attempt in range(1, attempts + 1):
+        try:
+            return build(get_db()).execute()
+        except _DB_TRANSPORT_ERRORS as e:
+            logger.warning(
+                "db transport error on %s (attempt %s/%s): %s: %s",
+                what, attempt, attempts, type(e).__name__, e,
+            )
+            _reset_db()
+            if attempt == attempts:
+                raise
+            time.sleep(delay)
+            delay *= 2
 
 # ================================
 # MODELS
@@ -3130,8 +3192,20 @@ def _public_listing_payload(listing) -> dict:
     # Shared builder for the buyer-facing listing payload. Both the by-id public
     # endpoint and the memorable /enquiry/{agent_code}/{listing_code} endpoint
     # return this exact shape, so the public page renders identically either way.
-    agent_result = get_db().table("agents").select("name, agency, specialty").eq("id", listing["agent_id"]).execute()
-    agent_info = agent_result.data[0] if agent_result.data else {}
+    # Retried on transport errors (see db_execute). If the agent row is STILL
+    # unreachable, serve the property anyway with a blank agent block: a buyer
+    # looking at the home with the agent name missing is a far better outcome
+    # than "Listing Not Found" on a link the agent just shared.
+    try:
+        agent_result = db_execute(
+            lambda db: db.table("agents").select("name, agency, specialty").eq("id", listing["agent_id"]),
+            what="public listing agent lookup",
+        )
+        agent_info = agent_result.data[0] if agent_result.data else {}
+    except Exception as e:
+        logger.error("public listing %s: agent lookup failed, serving without agent details: %s",
+                     listing.get("id"), e)
+        agent_info = {}
     return {
         "id": listing["id"],
         "property_type": listing["property_type"],
@@ -3172,21 +3246,35 @@ def get_public_listing(listing_id: str, request: Request):
     # nestlist.sg/l/5cc93b41. Collisions across 8 hex chars are astronomically
     # unlikely; if several ever match, serve the first.
     code = (listing_id or "").strip().lower()
-    query = get_db().table("listings").select("*")
     if _is_valid_uuid(code):
-        result = query.eq("id", code).execute()
+        build = lambda db: db.table("listings").select("*").eq("id", code)
     elif re.fullmatch(r"[0-9a-f]{8}", code):
         # `id` is a uuid column, so LIKE won't work on it. The short code is the
         # first uuid group (8 hex chars); resolve it via a uuid range instead.
         lo = f"{code}-0000-0000-0000-000000000000"
         hi = f"{code}-ffff-ffff-ffff-ffffffffffff"
-        result = query.gte("id", lo).lte("id", hi).execute()
+        build = lambda db: db.table("listings").select("*").gte("id", lo).lte("id", hi)
     else:
         raise HTTPException(status_code=404, detail="Listing not found")
+
+    # Buyer-facing: a lookup that fails for infrastructure reasons must not be
+    # reported as "this listing does not exist", and must never escape as a bare
+    # 500. Unknown id -> 404; database unreachable -> 503 so the page can say
+    # "try again in a moment" instead of denying the property exists.
+    try:
+        result = db_execute(build, what=f"public listing {code}")
+    except Exception as e:
+        logger.error("public listing %s: lookup failed: %s", code, e)
+        raise HTTPException(status_code=503, detail="Listing temporarily unavailable — please try again in a moment")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
-    listing = result.data[0]
-    return _public_listing_payload(listing)
+    try:
+        return _public_listing_payload(result.data[0])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("public listing %s: payload build failed: %s", code, e)
+        raise HTTPException(status_code=503, detail="Listing temporarily unavailable — please try again in a moment")
 
 
 @app.get("/api/public/enquiry/{agent_code}/{listing_code}")
@@ -3218,26 +3306,36 @@ def get_public_listing_by_codes(agent_code: str, listing_code: str, request: Req
         raise HTTPException(status_code=404, detail="Listing not found")
 
     # Match the agent case-insensitively, filtered in the DB (never fetch-all).
-    agent_result = (
-        get_db().table("agents").select("id")
-        .ilike("code", _ilike_literal(agent_code_norm))
-        .limit(1).execute()
-    )
-    if not agent_result.data:
-        raise HTTPException(status_code=404, detail="Listing not found")
-    agent_id = agent_result.data[0]["id"]
+    # Same rule as the by-id route: unknown code -> 404, database unreachable ->
+    # 503, never a bare 500 in front of a buyer.
+    try:
+        agent_result = db_execute(
+            lambda db: db.table("agents").select("id")
+            .ilike("code", _ilike_literal(agent_code_norm))
+            .limit(1),
+            what="public enquiry agent lookup",
+        )
+        if not agent_result.data:
+            raise HTTPException(status_code=404, detail="Listing not found")
+        agent_id = agent_result.data[0]["id"]
 
-    # Among THAT agent's listings, match the listing code case-insensitively.
-    # If a code somehow repeats for one agent, newest wins — never error.
-    listing_result = (
-        get_db().table("listings").select("*")
-        .eq("agent_id", agent_id)
-        .ilike("code", _ilike_literal(listing_code_norm))
-        .order("created_at", desc=True).limit(1).execute()
-    )
-    if not listing_result.data:
-        raise HTTPException(status_code=404, detail="Listing not found")
-    return _public_listing_payload(listing_result.data[0])
+        # Among THAT agent's listings, match the listing code case-insensitively.
+        # If a code somehow repeats for one agent, newest wins — never error.
+        listing_result = db_execute(
+            lambda db: db.table("listings").select("*")
+            .eq("agent_id", agent_id)
+            .ilike("code", _ilike_literal(listing_code_norm))
+            .order("created_at", desc=True).limit(1),
+            what="public enquiry listing lookup",
+        )
+        if not listing_result.data:
+            raise HTTPException(status_code=404, detail="Listing not found")
+        return _public_listing_payload(listing_result.data[0])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("public enquiry %s/%s: lookup failed: %s", agent_code_norm, listing_code_norm, e)
+        raise HTTPException(status_code=503, detail="Listing temporarily unavailable — please try again in a moment")
 
 @app.post("/api/public/enquiries")
 async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
