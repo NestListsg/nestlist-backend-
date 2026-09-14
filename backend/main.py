@@ -193,7 +193,7 @@ async def refresh_market_pulse_loop():
         try:
             stats = await ura_market_pulse.refresh_market_pulse()
             if stats:
-                get_db().table("market_pulse").upsert({"id": 1, **stats}).execute()
+                db_execute(lambda db: db.table("market_pulse").upsert({"id": 1, **stats}), what="refresh_market_pulse_loop market_pulse upsert")
         except Exception as e:
             await send_telegram_alert_throttled("market_pulse_refresh_failed",
                 f"⚠️ <b>NestList Warning</b>\n\nMarket Pulse auto-refresh from URA failed: {e}\n\nThe panel will keep showing its last known values.")
@@ -256,15 +256,30 @@ def get_db():
 # answered, so the safe response is to throw the poisoned pool away and try again.
 # A real PostgREST error (bad filter, RLS denial, constraint violation) is NOT in
 # this tuple and still raises straight through, so genuine bugs stay visible.
-_DB_TRANSPORT_ERRORS = (
-    httpx.RemoteProtocolError,
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
+#
+# Not every transport failure carries the same information, and the difference is
+# what makes retrying a WRITE safe or unsafe:
+#
+#   _DB_UNSENT_ERRORS  -- the connection was never established, so the query
+#                         provably never reached the database. Retrying cannot
+#                         duplicate anything, so even an INSERT is safe to retry.
+#   _DB_TRANSPORT_ERRORS -- the full set, including failures that happened after
+#                         the request went out (the GOAWAY case, read timeouts).
+#                         The database MIGHT have applied the query before the
+#                         connection died, so these are only safe to retry when
+#                         running the query twice has the same effect as once.
+_DB_UNSENT_ERRORS = (
+    httpx.ConnectError,      # TCP/TLS never established
+    httpx.ConnectTimeout,    # ...and timed out trying
+    httpx.PoolTimeout,       # never even got a connection out of the pool
+)
+
+_DB_TRANSPORT_ERRORS = _DB_UNSENT_ERRORS + (
+    httpx.RemoteProtocolError,  # the GOAWAY case that caused the 2026-09-14 outage
     httpx.ReadError,
     httpx.ReadTimeout,
     httpx.WriteError,
     httpx.NetworkError,
-    httpx.PoolTimeout,
 )
 
 
@@ -280,30 +295,56 @@ def _reset_db():
         _supabase = None
 
 
-def db_execute(build, attempts: int = 3, what: str = "query"):
+def db_execute_tracked(build, attempts: int = 3, what: str = "query", idempotent: bool = True):
+    """db_execute, but also reports how many attempts it took: (result, attempts_used).
+
+    Callers that treat an EMPTY result as 404 need this. If we retried a DELETE,
+    an empty result no longer means "the row never existed" -- it may mean our own
+    first attempt already deleted it. Those handlers check attempts_used to tell
+    the two apart instead of reporting a bogus 404 for work that succeeded."""
+    retry_unsafe_writes = not idempotent
+    delay = 0.1
+    for attempt in range(1, attempts + 1):
+        try:
+            return build(get_db()).execute(), attempt
+        except _DB_TRANSPORT_ERRORS as e:
+            # The pool is poisoned either way, so always discard it -- even when we
+            # are not going to retry, so the NEXT request on this worker is clean.
+            unsent = isinstance(e, _DB_UNSENT_ERRORS)
+            logger.warning(
+                "db transport error on %s (attempt %s/%s): %s: %s%s",
+                what, attempt, attempts, type(e).__name__, e,
+                "" if (unsent or not retry_unsafe_writes) else " [not retried: write may have landed]",
+            )
+            _reset_db()
+            # A non-idempotent query (INSERT) is only retried when the request
+            # provably never reached the database. Otherwise we would risk a
+            # duplicate row, which is worse than a clean error the agent can retry.
+            if attempt == attempts or (retry_unsafe_writes and not unsent):
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
+def db_execute(build, attempts: int = 3, what: str = "query", idempotent: bool = True):
     """Run a PostgREST query with bounded retries on transport-level failures.
 
     `build` takes the supabase client and returns a query ready to .execute(),
     e.g. db_execute(lambda db: db.table("agents").select("*").eq("id", x)).
     The query is rebuilt each attempt so the retry uses the fresh client.
 
-    Retries are deliberately few and fast (0.1s, 0.2s): a buyer is waiting on the
+    `idempotent` MUST be False for INSERTs: running one twice creates two rows.
+    SELECT / UPDATE / DELETE / UPSERT in this codebase all set literal values or
+    filter by id, so running them twice has the same effect as once.
+
+    Retries are deliberately few and fast (0.1s, 0.2s): someone is waiting on the
     page, and a pool that is still dead after two fresh clients is a real outage,
-    not a blip -- at that point the caller decides how to degrade."""
-    delay = 0.1
-    for attempt in range(1, attempts + 1):
-        try:
-            return build(get_db()).execute()
-        except _DB_TRANSPORT_ERRORS as e:
-            logger.warning(
-                "db transport error on %s (attempt %s/%s): %s: %s",
-                what, attempt, attempts, type(e).__name__, e,
-            )
-            _reset_db()
-            if attempt == attempts:
-                raise
-            time.sleep(delay)
-            delay *= 2
+    not a blip -- at that point the caller decides how to degrade.
+
+    A real PostgREST error (bad filter, RLS denial, constraint violation) is not a
+    transport error and still raises straight through, so genuine bugs stay visible."""
+    result, _ = db_execute_tracked(build, attempts=attempts, what=what, idempotent=idempotent)
+    return result
 
 # ================================
 # MODELS
@@ -517,7 +558,13 @@ async def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(
 
     agent_id = payload["agent_id"]
     try:
-        result = get_db().table("agents").select("*").eq("id", agent_id).execute()
+        # Retried: this dependency gates EVERY authed endpoint, so a single stale
+        # pooled connection here would 503 every agent action -- including the
+        # write paths -- rather than just one request.
+        result = db_execute(
+            lambda db: db.table("agents").select("*").eq("id", agent_id),
+            what="get_current_agent session lookup",
+        )
     except Exception:
         await send_telegram_alert_throttled(
             "db_unreachable",
@@ -716,7 +763,7 @@ def check_handle_available(handle: str, request: Request):
 
 @app.post("/api/register")
 def register(req: RegisterRequest):
-    existing = get_db().table("agents").select("id").eq("email", req.email).execute()
+    existing = db_execute(lambda db: db.table("agents").select("id").eq("email", req.email), what="register agents select")
     if existing.data:
         raise HTTPException(status_code=400, detail="Email already registered")
     # Assign the public handle at signup. A handle the agent EXPLICITLY chose
@@ -765,7 +812,7 @@ def register(req: RegisterRequest):
     tried, result = {handle}, None
     for _attempt in range(6):
         try:
-            result = get_db().table("agents").insert({**insert_payload, "code": handle}).execute()
+            result = db_execute(lambda db: db.table("agents").insert({**insert_payload, "code": handle}), what="register agents insert", idempotent=False)
             break
         except Exception as e:
             if not _is_unique_violation(e):
@@ -783,7 +830,7 @@ def register(req: RegisterRequest):
         # Exhausted retries on a derived handle (extreme contention) -- last resort
         # so we never 500: a random-ish valid suffix the unique index will accept.
         fallback = _slugify_handle(f"{base[:24]}-{secrets.token_hex(3)}") or f"agent-{secrets.token_hex(3)}"
-        result = get_db().table("agents").insert({**insert_payload, "code": fallback}).execute()
+        result = db_execute(lambda db: db.table("agents").insert({**insert_payload, "code": fallback}), what="register agents insert", idempotent=False)
 
     agent = result.data[0]
     token = create_token(str(agent["id"]))
@@ -800,21 +847,27 @@ async def request_password_reset(req: PasswordResetRequest, request: Request):
 
     generic_response = {"success": True, "message": "If that email is registered with NestList, a reset link has been sent."}
 
-    result = get_db().table("agents").select("id, email, name").eq("email", req.email).execute()
+    result = db_execute(lambda db: db.table("agents").select("id, email, name").eq("email", req.email), what="request_password_reset agents select")
     if not result.data:
         return generic_response  # never reveal whether an email is registered
     agent = result.data[0]
 
-    get_db().table("password_resets").update({"used_at": datetime.utcnow().isoformat()}) \
-        .eq("agent_id", agent["id"]).is_("used_at", "null").execute()
+    db_execute(
+        lambda db: db.table("password_resets").update({"used_at": datetime.utcnow().isoformat()})
+        .eq("agent_id", agent["id"]).is_("used_at", "null"),
+        what="request_password_reset invalidate prior tokens",
+    )
 
     raw_token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-    get_db().table("password_resets").insert({
-        "agent_id": agent["id"],
-        "token_hash": token_hash,
-        "expires_at": (datetime.utcnow() + timedelta(hours=1)).isoformat(),
-    }).execute()
+    db_execute(
+        lambda db: db.table("password_resets").insert({
+            "agent_id": agent["id"],
+            "token_hash": token_hash,
+            "expires_at": (datetime.utcnow() + timedelta(hours=1)).isoformat(),
+        }),
+        what="request_password_reset issue token", idempotent=False,
+    )
 
     reset_link = f"https://nestlist.sg/reset-password?token={raw_token}"
     sent = await send_password_reset_email(agent["email"], agent.get("name", ""), reset_link)
@@ -833,7 +886,7 @@ def confirm_password_reset(req: PasswordResetConfirm):
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
     token_hash = hashlib.sha256(req.token.encode()).hexdigest()
-    result = get_db().table("password_resets").select("*").eq("token_hash", token_hash).execute()
+    result = db_execute(lambda db: db.table("password_resets").select("*").eq("token_hash", token_hash), what="confirm_password_reset password_resets select")
     if not result.data:
         raise HTTPException(status_code=400, detail="This reset link is invalid or has expired. Please request a new one.")
     reset_row = result.data[0]
@@ -845,8 +898,8 @@ def confirm_password_reset(req: PasswordResetConfirm):
     if datetime.utcnow() > expires_at:
         raise HTTPException(status_code=400, detail="This reset link has expired. Please request a new one.")
 
-    get_db().table("agents").update({"password_hash": hash_password(req.new_password)}).eq("id", reset_row["agent_id"]).execute()
-    get_db().table("password_resets").update({"used_at": datetime.utcnow().isoformat()}).eq("id", reset_row["id"]).execute()
+    db_execute(lambda db: db.table("agents").update({"password_hash": hash_password(req.new_password)}).eq("id", reset_row["agent_id"]), what="confirm_password_reset agents update")
+    db_execute(lambda db: db.table("password_resets").update({"used_at": datetime.utcnow().isoformat()}).eq("id", reset_row["id"]), what="confirm_password_reset password_resets update")
 
     return {"success": True}
 
@@ -1309,7 +1362,7 @@ Write:
     }
     if listing_code:
         insert_payload["code"] = listing_code
-    saved = get_db().table("listings").insert(insert_payload).execute()
+    saved = db_execute(lambda db: db.table("listings").insert(insert_payload), what="generate_listing listings insert", idempotent=False)
 
     listing_row = saved.data[0]
     # `location` in the DB stays as the agent typed it; copy surfaces use this.
@@ -1385,22 +1438,28 @@ def _encode_images_filter(previous: list, encoding: str) -> str:
     return "{" + ",".join(escaped) + "}"
 
 
-def _try_images_cas(supabase, listing_id, agent_id, previous, new_images, encoding) -> bool:
+def _try_images_cas(listing_id, agent_id, previous, new_images, encoding) -> bool:
     """One compare-and-swap attempt with one encoding. True if the row was
     updated, False if the array had already moved on. Raises if PostgREST
-    rejects the filter (wrong encoding) or the database is unreachable."""
-    resp = (
-        supabase.table("listings")
+    rejects the filter (wrong encoding) or the database is unreachable.
+
+    Safe to retry on a transport error even though it is an UPDATE: the filter
+    pins the PREVIOUS array, so if our first attempt actually landed the retry
+    matches nothing and reports False ("someone got there first"). The caller
+    then re-reads and the mutator's attempt-aware logic takes over -- which is
+    the same path a genuinely concurrent write already takes."""
+    resp = db_execute(
+        lambda db: db.table("listings")
         .update({"images": new_images})
         .eq("id", listing_id)
         .eq("agent_id", agent_id)
-        .filter("images", "eq", _encode_images_filter(previous, encoding))
-        .execute()
+        .filter("images", "eq", _encode_images_filter(previous, encoding)),
+        what="images compare-and-swap",
     )
     return bool(resp.data)
 
 
-def _cas_update_images(supabase, listing_id, agent_id, previous, new_images):
+def _cas_update_images(listing_id, agent_id, previous, new_images):
     """True = applied, False = someone else got there first, None = this table
     will not accept a compare-and-swap filter at all (caller falls back)."""
     global _IMAGES_CAS_ENCODING
@@ -1409,12 +1468,12 @@ def _cas_update_images(supabase, listing_id, agent_id, previous, new_images):
     if encoding:
         # Known-good encoding: let real database errors propagate to the caller
         # instead of mistaking them for an encoding problem.
-        return _try_images_cas(supabase, listing_id, agent_id, previous, new_images, encoding)
+        return _try_images_cas(listing_id, agent_id, previous, new_images, encoding)
 
     failures = []
     for candidate in ("json", "array"):
         try:
-            applied = _try_images_cas(supabase, listing_id, agent_id, previous, new_images, candidate)
+            applied = _try_images_cas(listing_id, agent_id, previous, new_images, candidate)
         except Exception as exc:
             failures.append(f"{candidate}: {exc}")
             continue
@@ -1445,16 +1504,18 @@ def _probe_images_cas_encoding():
     if _IMAGES_CAS_ENCODING:
         return _IMAGES_CAS_ENCODING
 
-    supabase = get_db()
     failures = []
     for candidate in ("json", "array"):
         try:
-            (
-                supabase.table("listings")
+            # Retried: a transport blip here would otherwise be misread as "this
+            # encoding is rejected" and leave the worker on non-atomic photo
+            # writes for its whole life.
+            db_execute(
+                lambda db: db.table("listings")
                 .select("id")
                 .eq("id", "00000000-0000-0000-0000-000000000000")
-                .filter("images", "eq", _encode_images_filter(["__probe__"], candidate))
-                .execute()
+                .filter("images", "eq", _encode_images_filter(["__probe__"], candidate)),
+                what=f"images cas encoding probe ({candidate})",
             )
         except Exception as exc:
             failures.append(f"{candidate}: {exc}")
@@ -1487,17 +1548,16 @@ def _mutate_listing_images(listing_id: str, agent_id: str, mutate) -> list:
     if the response is lost, and we would then re-apply the change to an array
     that already contains it.
     """
-    supabase = get_db()
     delay = _IMAGES_CAS_BASE_BACKOFF
 
     with _listing_image_lock(listing_id):
         for attempt in range(_IMAGES_CAS_MAX_ATTEMPTS):
-            result = (
-                supabase.table("listings")
+            result = db_execute(
+                lambda db: db.table("listings")
                 .select("images")
                 .eq("id", listing_id)
-                .eq("agent_id", agent_id)
-                .execute()
+                .eq("agent_id", agent_id),
+                what="images read for compare-and-swap",
             )
             if not result.data:
                 raise HTTPException(status_code=404, detail="Listing not found")
@@ -1507,19 +1567,19 @@ def _mutate_listing_images(listing_id: str, agent_id: str, mutate) -> list:
             if new_images is None:
                 return list(previous)
 
-            applied = _cas_update_images(supabase, listing_id, agent_id, previous, new_images)
+            applied = _cas_update_images(listing_id, agent_id, previous, new_images)
             if applied:
                 return new_images
             if applied is None:
                 # No compare-and-swap available: do what the code did before
                 # (plain update, in-process lock only) rather than refusing to
                 # save the agent's change at all. Logged loudly above.
-                (
-                    supabase.table("listings")
+                db_execute(
+                    lambda db: db.table("listings")
                     .update({"images": new_images})
                     .eq("id", listing_id)
-                    .eq("agent_id", agent_id)
-                    .execute()
+                    .eq("agent_id", agent_id),
+                    what="images non-atomic fallback update",
                 )
                 return new_images
 
@@ -2099,7 +2159,7 @@ def post_to_facebook(listing_id: str, req: FacebookPostRequest, agent=Depends(ge
     if not _can_use_facebook_beta(agent):
         raise HTTPException(status_code=403, detail="Facebook posting is not yet available on your account")
 
-    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="post_to_facebook listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
@@ -2115,11 +2175,14 @@ def post_to_facebook(listing_id: str, req: FacebookPostRequest, agent=Depends(ge
     caption = req.caption[:2000]
 
     def _clear_facebook_connection():
-        get_db().table("agents").update({
-            "fb_user_access_token": None, "fb_page_id": None, "fb_page_access_token": None,
-            "fb_page_name": None, "instagram_business_account_id": None,
-            "instagram_username": None, "instagram_connected_at": None,
-        }).eq("id", agent["id"]).execute()
+        db_execute(
+            lambda db: db.table("agents").update({
+                "fb_user_access_token": None, "fb_page_id": None, "fb_page_access_token": None,
+                "fb_page_name": None, "instagram_business_account_id": None,
+                "instagram_username": None, "instagram_connected_at": None,
+            }).eq("id", agent["id"]),
+            what="post_to_facebook clear expired connection",
+        )
 
     response = requests.post(
         f"https://graph.facebook.com/v25.0/{fb_page_id}/photos",
@@ -2139,7 +2202,7 @@ def post_to_linkedin(listing_id: str, req: LinkedInPostRequest, agent=Depends(ge
     if not _can_use_linkedin_beta(agent):
         raise HTTPException(status_code=403, detail="LinkedIn posting is not yet available on your account")
 
-    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="post_to_linkedin listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
@@ -2158,10 +2221,13 @@ def post_to_linkedin(listing_id: str, req: LinkedInPostRequest, agent=Depends(ge
     }
 
     def _clear_linkedin_connection():
-        get_db().table("agents").update({
-            "linkedin_access_token": None, "linkedin_refresh_token": None,
-            "linkedin_person_urn": None, "linkedin_name": None, "linkedin_connected_at": None,
-        }).eq("id", agent["id"]).execute()
+        db_execute(
+            lambda db: db.table("agents").update({
+                "linkedin_access_token": None, "linkedin_refresh_token": None,
+                "linkedin_person_urn": None, "linkedin_name": None, "linkedin_connected_at": None,
+            }).eq("id", agent["id"]),
+            what="post_to_linkedin clear expired connection",
+        )
 
     # Attach the poster if there is one -- LinkedIn requires a real 2-step upload (register,
     # then PUT the bytes) rather than Facebook's "give me a URL" shortcut. A failed upload
@@ -2273,7 +2339,7 @@ def get_poster_templates(agent=Depends(get_current_agent)):
 
 @app.post("/api/listings/{listing_id}/generate-poster")
 def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = None, agent=Depends(get_current_agent)):
-    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_poster listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
@@ -2347,7 +2413,7 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     update_payload = {"poster_url": poster_url, "poster_photo_url": images[photo_index]}
     if template_id:
         update_payload["poster_template_id"] = template_id
-    get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_poster listings update")
 
     return {"poster_url": poster_url, "poster_template_id": chosen_template_id}
 
@@ -2405,7 +2471,7 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
         # one extra select per render. If the re-read fails (DB blip), fall back to the
         # snapshot rather than losing the render entirely.
         try:
-            fresh = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+            fresh = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="_render_video_job listings select")
             if fresh.data:
                 listing = fresh.data[0]
         except Exception as e:
@@ -2476,19 +2542,22 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
         update_payload = {"video_url": video_url, "video_status": "done", "video_error": None}
         if persist_video_template_id:
             update_payload["video_template_id"] = chosen_video_template_id
-        get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+        db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="_render_video_job listings update")
     except Exception as e:
         try:
-            get_db().table("listings").update({
-                "video_status": "failed",
-                "video_error": str(e)[:500],
-            }).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+            db_execute(
+                lambda db: db.table("listings").update({
+                    "video_status": "failed",
+                    "video_error": str(e)[:500],
+                }).eq("id", listing_id).eq("agent_id", agent["id"]),
+                what="_render_video_job mark failed",
+            )
         except Exception:
             pass  # DB unreachable too -- the stale-lock timeout lets the agent retry
 
 @app.post("/api/listings/{listing_id}/generate-video")
 async def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, agent=Depends(get_current_agent)):
-    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_video listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
@@ -2537,11 +2606,14 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
         if still_fresh:
             raise HTTPException(status_code=409, detail="A video is already being generated for this listing -- it should be ready in a minute or two.")
 
-    get_db().table("listings").update({
-        "video_status": "rendering",
-        "video_error": None,
-        "video_render_started_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    db_execute(
+        lambda db: db.table("listings").update({
+            "video_status": "rendering",
+            "video_error": None,
+            "video_render_started_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="generate_video claim render lock",
+    )
 
     task = asyncio.create_task(asyncio.to_thread(
         _render_video_job, listing_id, agent, listing,
@@ -2573,7 +2645,7 @@ def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(
     if not _can_use_instagram_beta(agent):
         raise HTTPException(status_code=403, detail="Instagram posting is not yet available on your account")
 
-    result = get_db().table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="post_to_instagram listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
@@ -2589,11 +2661,14 @@ def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(
     caption = req.caption[:2200]
 
     def _clear_instagram_connection():
-        get_db().table("agents").update({
-            "fb_user_access_token": None, "fb_page_id": None, "fb_page_access_token": None,
-            "fb_page_name": None, "instagram_business_account_id": None,
-            "instagram_username": None, "instagram_connected_at": None,
-        }).eq("id", agent["id"]).execute()
+        db_execute(
+            lambda db: db.table("agents").update({
+                "fb_user_access_token": None, "fb_page_id": None, "fb_page_access_token": None,
+                "fb_page_name": None, "instagram_business_account_id": None,
+                "instagram_username": None, "instagram_connected_at": None,
+            }).eq("id", agent["id"]),
+            what="post_to_instagram clear expired connection",
+        )
 
     r1 = requests.post(f"https://graph.facebook.com/v25.0/{ig_user_id}/media", data={
         "image_url": listing["poster_url"], "caption": caption, "access_token": page_token,
@@ -2630,8 +2705,8 @@ def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(
 def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
     if req.notification_channel not in ("telegram", "whatsapp", "both"):
         raise HTTPException(status_code=400, detail="Invalid notification channel")
-    get_db().table("agents").update(req.dict()).eq("id", agent["id"]).execute()
-    result = get_db().table("agents").select("*").eq("id", agent["id"]).execute()
+    db_execute(lambda db: db.table("agents").update(req.dict()).eq("id", agent["id"]), what="update_profile agents update")
+    result = db_execute(lambda db: db.table("agents").select("*").eq("id", agent["id"]), what="update_profile agents select")
     agent = result.data[0]
     return _agent_response(agent)
 
@@ -2648,11 +2723,11 @@ def change_email(req: EmailChangeRequest, agent=Depends(get_current_agent)):
         raise HTTPException(status_code=400, detail="Enter a valid email address")
     if new_email == agent["email"]:
         raise HTTPException(status_code=400, detail="That's already your current email")
-    existing = get_db().table("agents").select("id").eq("email", new_email).execute()
+    existing = db_execute(lambda db: db.table("agents").select("id").eq("email", new_email), what="change_email agents select")
     if existing.data:
         raise HTTPException(status_code=400, detail="That email is already in use")
-    get_db().table("agents").update({"email": new_email}).eq("id", agent["id"]).execute()
-    result = get_db().table("agents").select("*").eq("id", agent["id"]).execute()
+    db_execute(lambda db: db.table("agents").update({"email": new_email}).eq("id", agent["id"]), what="change_email agents update")
+    result = db_execute(lambda db: db.table("agents").select("*").eq("id", agent["id"]), what="change_email agents select")
     return _agent_response(result.data[0])
 
 @app.post("/api/agent/handle")
@@ -2675,7 +2750,7 @@ def claim_handle(req: HandleClaimRequest, agent=Depends(get_current_agent)):
             "suggestions": _handle_suggestions(handle, agent.get("name")),
         })
     try:
-        get_db().table("agents").update({"code": handle}).eq("id", agent["id"]).execute()
+        db_execute(lambda db: db.table("agents").update({"code": handle}).eq("id", agent["id"]), what="claim_handle agents update")
     except Exception as e:
         # The lower(code) unique index enforces on UPDATE too; a concurrent claim
         # of the same handle can land between our check and this update. Convert
@@ -2686,7 +2761,7 @@ def claim_handle(req: HandleClaimRequest, agent=Depends(get_current_agent)):
                 "suggestions": _handle_suggestions(handle, agent.get("name")),
             })
         raise
-    result = get_db().table("agents").select("*").eq("id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("agents").select("*").eq("id", agent["id"]), what="claim_handle agents select")
     return {"agent": _agent_response(result.data[0])}
 
 @app.post("/api/profile/photo")
@@ -2710,7 +2785,10 @@ def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_age
         )
         photo_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
 
-        supabase.table("agents").update({"photo_url": photo_url}).eq("id", agent["id"]).execute()
+        db_execute(
+            lambda db: db.table("agents").update({"photo_url": photo_url}).eq("id", agent["id"]),
+            what="upload_profile_photo agents update",
+        )
 
         return {"photo_url": photo_url}
     except Exception:
@@ -2747,7 +2825,7 @@ def instagram_oauth_callback(req: InstagramOAuthCallbackRequest):
     if not _is_valid_uuid(req.state):
         raise HTTPException(status_code=400, detail="Invalid connect request")
 
-    agent_result = get_db().table("agents").select("id, email").eq("id", req.state).execute()
+    agent_result = db_execute(lambda db: db.table("agents").select("id, email").eq("id", req.state), what="instagram_oauth_callback agents select")
     if not agent_result.data:
         raise HTTPException(status_code=404, detail="Agent not found")
     agent = agent_result.data[0]
@@ -2796,15 +2874,18 @@ def instagram_oauth_callback(req: InstagramOAuthCallbackRequest):
     }, timeout=15)
     ig_username = r5.json().get("username", "")
 
-    get_db().table("agents").update({
-        "fb_user_access_token": long_lived_user_token,
-        "fb_page_id": page_id,
-        "fb_page_access_token": page_token,
-        "fb_page_name": page_name,
-        "instagram_business_account_id": ig_user_id,
-        "instagram_username": ig_username,
-        "instagram_connected_at": datetime.utcnow().isoformat(),
-    }).eq("id", agent["id"]).execute()
+    db_execute(
+        lambda db: db.table("agents").update({
+            "fb_user_access_token": long_lived_user_token,
+            "fb_page_id": page_id,
+            "fb_page_access_token": page_token,
+            "fb_page_name": page_name,
+            "instagram_business_account_id": ig_user_id,
+            "instagram_username": ig_username,
+            "instagram_connected_at": datetime.utcnow().isoformat(),
+        }).eq("id", agent["id"]),
+        what="instagram_oauth_callback store connection",
+    )
 
     return {"success": True, "instagram_username": ig_username, "page_name": page_name}
 
@@ -2834,7 +2915,7 @@ def facebook_oauth_callback(req: FacebookOAuthCallbackRequest):
     if not _is_valid_uuid(req.state):
         raise HTTPException(status_code=400, detail="Invalid connect request")
 
-    agent_result = get_db().table("agents").select("id, email").eq("id", req.state).execute()
+    agent_result = db_execute(lambda db: db.table("agents").select("id, email").eq("id", req.state), what="facebook_oauth_callback agents select")
     if not agent_result.data:
         raise HTTPException(status_code=404, detail="Agent not found")
     agent = agent_result.data[0]
@@ -2892,7 +2973,7 @@ def facebook_oauth_callback(req: FacebookOAuthCallbackRequest):
         update_payload["instagram_username"] = r5.json().get("username", "")
         update_payload["instagram_connected_at"] = datetime.utcnow().isoformat()
 
-    get_db().table("agents").update(update_payload).eq("id", agent["id"]).execute()
+    db_execute(lambda db: db.table("agents").update(update_payload).eq("id", agent["id"]), what="facebook_oauth_callback agents update")
 
     return {"success": True, "page_name": page_name}
 
@@ -2919,7 +3000,7 @@ def linkedin_oauth_callback(req: LinkedInOAuthCallbackRequest):
     if not _is_valid_uuid(req.state):
         raise HTTPException(status_code=400, detail="Invalid connect request")
 
-    agent_result = get_db().table("agents").select("id, email").eq("id", req.state).execute()
+    agent_result = db_execute(lambda db: db.table("agents").select("id, email").eq("id", req.state), what="linkedin_oauth_callback agents select")
     if not agent_result.data:
         raise HTTPException(status_code=404, detail="Agent not found")
     agent = agent_result.data[0]
@@ -2952,13 +3033,16 @@ def linkedin_oauth_callback(req: LinkedInOAuthCallbackRequest):
     person_urn = f"urn:li:person:{person_sub}"
     member_name = d2.get("name", "")
 
-    get_db().table("agents").update({
-        "linkedin_access_token": access_token,
-        "linkedin_refresh_token": refresh_token,
-        "linkedin_person_urn": person_urn,
-        "linkedin_name": member_name,
-        "linkedin_connected_at": datetime.utcnow().isoformat(),
-    }).eq("id", agent["id"]).execute()
+    db_execute(
+        lambda db: db.table("agents").update({
+            "linkedin_access_token": access_token,
+            "linkedin_refresh_token": refresh_token,
+            "linkedin_person_urn": person_urn,
+            "linkedin_name": member_name,
+            "linkedin_connected_at": datetime.utcnow().isoformat(),
+        }).eq("id", agent["id"]),
+        what="linkedin_oauth_callback store connection",
+    )
 
     return {"success": True, "name": member_name}
 
@@ -3081,7 +3165,7 @@ async def update_market_pulse(request: Request, agent=Depends(get_current_agent)
     body = await request.json()
     body["last_updated"] = date.today().strftime("%b %Y")
     body["source"] = "manual"
-    get_db().table("market_pulse").upsert({"id": 1, **body}).execute()
+    db_execute(lambda db: db.table("market_pulse").upsert({"id": 1, **body}), what="update_market_pulse market_pulse upsert")
     return {"success": True}
 
 @app.post("/api/market-pulse/refresh")
@@ -3093,7 +3177,7 @@ async def trigger_market_pulse_refresh(agent=Depends(get_current_agent)):
     stats = await ura_market_pulse.refresh_market_pulse()
     if not stats:
         raise HTTPException(status_code=502, detail="No qualifying GCB transactions found in the past 12 months, or the URA request failed")
-    get_db().table("market_pulse").upsert({"id": 1, **stats}).execute()
+    db_execute(lambda db: db.table("market_pulse").upsert({"id": 1, **stats}), what="trigger_market_pulse_refresh market_pulse upsert")
     return stats
 
 @app.post("/api/cma/generate")
@@ -3349,7 +3433,7 @@ async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
     if not _is_valid_uuid(req.listing_id):
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    listing_result = get_db().table("listings").select("id, agent_id, location, property_type, price").eq("id", req.listing_id).execute()
+    listing_result = db_execute(lambda db: db.table("listings").select("id, agent_id, location, property_type, price").eq("id", req.listing_id), what="create_public_enquiry listings select")
     if not listing_result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = listing_result.data[0]
@@ -3382,25 +3466,31 @@ Return only valid JSON, nothing else."""
         except Exception:
             pass
 
-    saved = get_db().table("enquiries").insert({
-        "agent_id": listing["agent_id"],
-        "client_name": req.client_name,
-        "phone": req.phone,
-        "email": req.email,
-        "client_type": "Buyer",
-        "property_interest": f"{listing['property_type']} — {listing['location']}",
-        "notes": message,
-        "status": "Active",
-        "source": "Public Listing Page",
-        "listing_id": req.listing_id,
-        "message": message,
-        "lead_score": lead_score,
-        "ai_summary": ai_summary,
-    }).execute()
+    saved = db_execute(
+        lambda db: db.table("enquiries").insert({
+            "agent_id": listing["agent_id"],
+            "client_name": req.client_name,
+            "phone": req.phone,
+            "email": req.email,
+            "client_type": "Buyer",
+            "property_interest": f"{listing['property_type']} — {listing['location']}",
+            "notes": message,
+            "status": "Active",
+            "source": "Public Listing Page",
+            "listing_id": req.listing_id,
+            "message": message,
+            "lead_score": lead_score,
+            "ai_summary": ai_summary,
+        }),
+        what="create_public_enquiry save lead", idempotent=False,
+    )
 
-    agent_notif_result = get_db().table("agents").select(
-        "telegram_chat_id, notification_channel, whatsapp_number"
-    ).eq("id", listing["agent_id"]).execute()
+    agent_notif_result = db_execute(
+        lambda db: db.table("agents").select(
+            "telegram_chat_id, notification_channel, whatsapp_number"
+        ).eq("id", listing["agent_id"]),
+        what="create_public_enquiry agent notification prefs",
+    )
     agent_notif = agent_notif_result.data[0] if agent_notif_result.data else {}
     agent_chat_id = agent_notif.get("telegram_chat_id")
     notification_channel = agent_notif.get("notification_channel") or "telegram"
@@ -3434,9 +3524,9 @@ async def telegram_webhook(request: Request):
         if text.startswith("/start ") and chat_id:
             payload = text[len("/start "):].strip()
             if _is_valid_uuid(payload):
-                existing = get_db().table("agents").select("telegram_chat_id").eq("id", payload).execute()
+                existing = db_execute(lambda db: db.table("agents").select("telegram_chat_id").eq("id", payload), what="telegram_webhook agents select")
                 old_chat_id = existing.data[0].get("telegram_chat_id") if existing.data else None
-                get_db().table("agents").update({"telegram_chat_id": chat_id}).eq("id", payload).execute()
+                db_execute(lambda db: db.table("agents").update({"telegram_chat_id": chat_id}).eq("id", payload), what="telegram_webhook agents update")
                 if old_chat_id and old_chat_id != chat_id:
                     await send_telegram_alert(
                         "⚠️ <b>Telegram connection replaced</b>\n\nYour NestList lead alerts were just redirected to a different Telegram chat. If this wasn't you, contact support immediately.",
@@ -3462,19 +3552,22 @@ def get_enquiries(agent=Depends(get_current_agent)):
 async def create_enquiry(request: Request, agent=Depends(get_current_agent)):
     body = await request.json()
     body["agent_id"] = agent["id"]
-    result = get_db().table("enquiries").insert(body).execute()
+    result = db_execute(lambda db: db.table("enquiries").insert(body), what="create_enquiry enquiries insert", idempotent=False)
     return result.data[0]
 
 @app.put("/api/enquiries/{enquiry_id}")
 async def update_enquiry(enquiry_id: str, request: Request, agent=Depends(get_current_agent)):
     body = await request.json()
-    result = get_db().table("enquiries").update(body).eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("enquiries").update(body).eq("id", enquiry_id).eq("agent_id", agent["id"]), what="update_enquiry enquiries update")
     return result.data[0]
 
 @app.delete("/api/enquiries/{enquiry_id}")
 def delete_enquiry(enquiry_id: str, agent=Depends(get_current_agent)):
-    result = get_db().table("enquiries").delete().eq("id", enquiry_id).eq("agent_id", agent["id"]).execute()
-    if not result.data:
+    result, tries = db_execute_tracked(lambda db: db.table("enquiries").delete().eq("id", enquiry_id).eq("agent_id", agent["id"]), what="delete_enquiry enquiries delete")
+    if not result.data and tries == 1:
+        # A retried DELETE finds nothing the second time, so an empty result only
+        # means "never existed" when we did NOT retry. Without this check a
+        # successful delete could report 404 and look like it failed.
         raise HTTPException(status_code=404, detail="Client record not found")
     return {"success": True}
 
@@ -3587,23 +3680,29 @@ Do NOT mention any price, budget, or dollar figure. Return ONLY the message text
 
 @app.delete("/api/listings/{listing_id}")
 def delete_listing(listing_id: str, agent=Depends(get_current_agent)):
-    result = get_db().table("listings").update({"status": "archived"}) \
-        .eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(
+        lambda db: db.table("listings").update({"status": "archived"})
+        .eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="delete_listing archive",
+    )
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     return {"success": True}
 
 @app.post("/api/listings/{listing_id}/restore")
 def restore_listing(listing_id: str, agent=Depends(get_current_agent)):
-    result = get_db().table("listings").update({"status": "active"}) \
-        .eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(
+        lambda db: db.table("listings").update({"status": "active"})
+        .eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="restore_listing unarchive",
+    )
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     return {"success": True}
 
 @app.delete("/api/listings/{listing_id}/permanent")
 def delete_listing_permanently(listing_id: str, agent=Depends(get_current_agent)):
-    result = get_db().table("listings").select("id, status").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("listings").select("id, status").eq("id", listing_id).eq("agent_id", agent["id"]), what="delete_listing_permanently listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     if result.data[0].get("status") != "archived":
@@ -3622,12 +3721,12 @@ def delete_listing_permanently(listing_id: str, agent=Depends(get_current_agent)
     except Exception:
         pass
 
-    get_db().table("listings").delete().eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    db_execute(lambda db: db.table("listings").delete().eq("id", listing_id).eq("agent_id", agent["id"]), what="delete_listing_permanently listings delete")
     return {"success": True}
 
 @app.patch("/api/listings/{listing_id}")
 def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_current_agent)):
-    existing = get_db().table("listings").select("id, code").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    existing = db_execute(lambda db: db.table("listings").select("id, code").eq("id", listing_id).eq("agent_id", agent["id"]), what="update_listing listings select")
     if not existing.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     update_payload = {
@@ -3669,7 +3768,7 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
                 )
     except Exception:
         pass
-    updated = get_db().table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    updated = db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="update_listing listings update")
     return updated.data[0]
 
 MAX_LISTING_CONTENT_CHARS = 20000
@@ -3688,12 +3787,15 @@ def update_listing_content(listing_id: str, req: ListingContentRequest, agent=De
             detail=f"Write-up is too long (max {MAX_LISTING_CONTENT_CHARS} characters)"
         )
 
-    existing = get_db().table("listings").select("id").eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    existing = db_execute(lambda db: db.table("listings").select("id").eq("id", listing_id).eq("agent_id", agent["id"]), what="update_listing_content listings select")
     if not existing.data:
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    updated = get_db().table("listings").update({"content": content}) \
-        .eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    updated = db_execute(
+        lambda db: db.table("listings").update({"content": content})
+        .eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="update_listing_content listings update",
+    )
     if not updated.data:
         raise HTTPException(status_code=404, detail="Listing not found")
 
@@ -3917,7 +4019,7 @@ def create_buyer(req: BuyerRequest, agent=Depends(get_current_agent)):
     payload = req.dict()
     payload["agent_id"] = agent["id"]
     payload["contact_date"] = _none_if_empty(payload["contact_date"])
-    result = get_db().table("buyers").insert(payload).execute()
+    result = db_execute(lambda db: db.table("buyers").insert(payload), what="create_buyer buyers insert", idempotent=False)
     return result.data[0]
 
 @app.get("/api/buyers/{buyer_id}")
@@ -3932,54 +4034,60 @@ def get_buyer(buyer_id: str, agent=Depends(get_current_agent)):
 
 @app.patch("/api/buyers/{buyer_id}")
 def update_buyer(buyer_id: str, req: BuyerRequest, agent=Depends(get_current_agent)):
-    existing = get_db().table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    existing = db_execute(lambda db: db.table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]), what="update_buyer buyers select")
     if not existing.data:
         raise HTTPException(status_code=404, detail="Buyer not found")
     payload = req.dict()
     payload["contact_date"] = _none_if_empty(payload["contact_date"])
     payload["updated_at"] = datetime.utcnow().isoformat()
-    result = get_db().table("buyers").update(payload).eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("buyers").update(payload).eq("id", buyer_id).eq("agent_id", agent["id"]), what="update_buyer buyers update")
     return result.data[0]
 
 @app.delete("/api/buyers/{buyer_id}")
 def delete_buyer(buyer_id: str, agent=Depends(get_current_agent)):
-    result = get_db().table("buyers").delete().eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
-    if not result.data:
+    result, tries = db_execute_tracked(lambda db: db.table("buyers").delete().eq("id", buyer_id).eq("agent_id", agent["id"]), what="delete_buyer buyers delete")
+    if not result.data and tries == 1:
+        # A retried DELETE finds nothing the second time, so an empty result only
+        # means "never existed" when we did NOT retry. Without this check a
+        # successful delete could report 404 and look like it failed.
         raise HTTPException(status_code=404, detail="Buyer not found")
     return {"success": True}
 
 @app.post("/api/buyers/{buyer_id}/properties")
 def add_buyer_property(buyer_id: str, req: BuyerPropertyRequest, agent=Depends(get_current_agent)):
-    buyer_check = get_db().table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    buyer_check = db_execute(lambda db: db.table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]), what="add_buyer_property buyers select")
     if not buyer_check.data:
         raise HTTPException(status_code=404, detail="Buyer not found")
     payload = req.dict()
     payload["buyer_id"] = buyer_id
     payload["listing_id"] = _none_if_empty(payload["listing_id"])
     payload["date"] = _none_if_empty(payload["date"])
-    result = get_db().table("buyer_properties").insert(payload).execute()
+    result = db_execute(lambda db: db.table("buyer_properties").insert(payload), what="add_buyer_property buyer_properties insert", idempotent=False)
     return result.data[0]
 
 @app.patch("/api/buyers/{buyer_id}/properties/{property_id}")
 def update_buyer_property(buyer_id: str, property_id: str, req: BuyerPropertyRequest, agent=Depends(get_current_agent)):
-    buyer_check = get_db().table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    buyer_check = db_execute(lambda db: db.table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]), what="update_buyer_property buyers select")
     if not buyer_check.data:
         raise HTTPException(status_code=404, detail="Buyer not found")
     payload = req.dict()
     payload["listing_id"] = _none_if_empty(payload["listing_id"])
     payload["date"] = _none_if_empty(payload["date"])
-    result = get_db().table("buyer_properties").update(payload).eq("id", property_id).eq("buyer_id", buyer_id).execute()
+    result = db_execute(lambda db: db.table("buyer_properties").update(payload).eq("id", property_id).eq("buyer_id", buyer_id), what="update_buyer_property buyer_properties update")
     if not result.data:
         raise HTTPException(status_code=404, detail="Property entry not found")
     return result.data[0]
 
 @app.delete("/api/buyers/{buyer_id}/properties/{property_id}")
 def delete_buyer_property(buyer_id: str, property_id: str, agent=Depends(get_current_agent)):
-    buyer_check = get_db().table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]).execute()
+    buyer_check = db_execute(lambda db: db.table("buyers").select("id").eq("id", buyer_id).eq("agent_id", agent["id"]), what="delete_buyer_property buyers select")
     if not buyer_check.data:
         raise HTTPException(status_code=404, detail="Buyer not found")
-    result = get_db().table("buyer_properties").delete().eq("id", property_id).eq("buyer_id", buyer_id).execute()
-    if not result.data:
+    result, tries = db_execute_tracked(lambda db: db.table("buyer_properties").delete().eq("id", property_id).eq("buyer_id", buyer_id), what="delete_buyer_property buyer_properties delete")
+    if not result.data and tries == 1:
+        # A retried DELETE finds nothing the second time, so an empty result only
+        # means "never existed" when we did NOT retry. Without this check a
+        # successful delete could report 404 and look like it failed.
         raise HTTPException(status_code=404, detail="Property entry not found")
     return {"success": True}
 
@@ -4122,7 +4230,7 @@ def get_sellers(agent=Depends(get_current_agent)):
 
 @app.post("/api/sellers")
 def create_seller(req: SellerLeadRequest, agent=Depends(get_current_agent)):
-    result = get_db().table("listings").insert(_seller_lead_payload(req, agent["id"])).execute()
+    result = db_execute(lambda db: db.table("listings").insert(_seller_lead_payload(req, agent["id"])), what="create_seller listings insert", idempotent=False)
     return result.data[0]
 
 @app.get("/api/sellers/{seller_id}")
@@ -4134,19 +4242,22 @@ def get_seller(seller_id: str, agent=Depends(get_current_agent)):
 
 @app.patch("/api/sellers/{seller_id}")
 def update_seller(seller_id: str, req: SellerLeadRequest, agent=Depends(get_current_agent)):
-    existing = get_db().table("listings").select("id").eq("id", seller_id).eq("agent_id", agent["id"]).eq("status", "lead").execute()
+    existing = db_execute(lambda db: db.table("listings").select("id").eq("id", seller_id).eq("agent_id", agent["id"]).eq("status", "lead"), what="update_seller listings select")
     if not existing.data:
         raise HTTPException(status_code=404, detail="Seller not found")
     payload = _seller_lead_payload(req, agent["id"])
     payload.pop("agent_id")
     payload.pop("status")
-    result = get_db().table("listings").update(payload).eq("id", seller_id).eq("agent_id", agent["id"]).execute()
+    result = db_execute(lambda db: db.table("listings").update(payload).eq("id", seller_id).eq("agent_id", agent["id"]), what="update_seller listings update")
     return result.data[0]
 
 @app.delete("/api/sellers/{seller_id}")
 def delete_seller(seller_id: str, agent=Depends(get_current_agent)):
-    result = get_db().table("listings").delete().eq("id", seller_id).eq("agent_id", agent["id"]).eq("status", "lead").execute()
-    if not result.data:
+    result, tries = db_execute_tracked(lambda db: db.table("listings").delete().eq("id", seller_id).eq("agent_id", agent["id"]).eq("status", "lead"), what="delete_seller listings delete")
+    if not result.data and tries == 1:
+        # A retried DELETE finds nothing the second time, so an empty result only
+        # means "never existed" when we did NOT retry. Without this check a
+        # successful delete could report 404 and look like it failed.
         raise HTTPException(status_code=404, detail="Seller not found")
     return {"success": True}
 
