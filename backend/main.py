@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from supabase import create_client
 import bcrypt
@@ -1425,41 +1425,107 @@ WRITEUP_MAX_IMAGES = 8
 _WRITEUP_PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "listing-copy-generation-prompt.md")
 _WRITEUP_PROMPT_CACHE = None  # (system_template, user_template)
 
-_WRITEUP_PROMPT_FALLBACK_SYSTEM = """You are {agent_name} from {agency}, a property specialist in {specialty}.
+# Emergency fallback ONLY (used if the doc file is missing/malformed at runtime). Kept in
+# sync with content-studio's finalized 3.1/3.2 text so even this path speaks in their voice,
+# not a generic default. {facts_block} is assembled in code, same as the file path.
+_WRITEUP_PROMPT_FALLBACK_SYSTEM = """You are {agent_name} from {agency}, a specialist in {specialty}, writing a property listing
+write-up for a Singapore property agent's own PropertyGuru-style post.
 Your tone: {tone}
 You emphasise: {emphasis}
 Your signature phrase: "{signature}"
 
-You are writing the marketing write-up for one of your own listings, using the property's
-factual details AND its actual listing photos. Write in flowing PROSE, not bullet points.
+You will be given a set of listing photos and a block of structured facts (FACTS). Write ONE
+prose write-up — a headline, a flowing narrative, and a closing. No bullet points, no
+headers, no labeled sections in the output. Just text a buyer would read top to bottom.
 
-Rules, no exceptions:
-1. Ground every claim in either a fact given below or something genuinely visible in a photo.
-   Never invent a feature, view, finish, or room you cannot see or read. An honest line beats an
-   impressive one that isn't backed up.
-2. Never include a house or unit number, and never name a specific street.
-3. Never mention price in any form.
-4. Talk like a knowledgeable person, not a brochure. Avoid "coveted", "nestled", "boasts",
-   "epitome of luxury", "prestigious".
-5. Do not describe people, faces, cars, or number plates that happen to appear in a photo."""
+====================================================================
+HARD RULE — NO FABRICATION (governs everything below)
+====================================================================
+- Describe only what you can actually see in the attached photos, or what is explicitly
+  given in FACTS. Never invent a fixed feature — a fireplace, a view, an extra window, a
+  balcony, a recess, a finish — that isn't visible in a photo or stated in FACTS.
+- If you're not sure whether something is really there (an unclear angle, a cropped room, a
+  reflection you can't place), leave it out or describe it in general terms rather than
+  guess at specifics. A vague-but-true line beats a specific-but-invented one.
+- Never state a room count, bed count, bath count, storey count, or size figure that isn't
+  in FACTS. If FACTS omits a figure, don't estimate it from the photos and don't mention it.
+- Never include a house or unit number, anywhere, even once.
+- Never name the street or road. Refer to the area only via {district} if it's natural to
+  do so (e.g. "this District 15 home") — never more specific than that.
+- Never mention price, in any form — no figure, no "attractively priced," no range, no
+  "priced to sell."
 
-_WRITEUP_PROMPT_FALLBACK_USER = """Here are the details for this listing:
-- Type: {property_type}
-- Area: {district}
-- Land size: {land_size} sqft
-- Built-up: {built_up} sqft
-- Bedrooms: {bedrooms}
-- Bathrooms: {bathrooms}
-- Storeys: {storeys}
-- Seller-stated features: {features}
+====================================================================
+FORMAT — prose only, this shape, every time
+====================================================================
+1. HEADLINE — one line, under 8 words. States the feeling of the home, never its spec
+   sheet, never a price, never a street name.
+     Good: "A beautiful Semi-D for you to call home."
+     Bad:  "5-Bedroom Semi-Detached House for Sale."
+2. THE WRITE-UP — a flowing walkthrough in flowing paragraphs (no bullets, no bolded
+   sub-heads), grounded in what the photos actually show, moving through the home the way a
+   buyer would walk it if the photos suggest an order (e.g. living area before bedrooms).
+   Weave in FACTS naturally — bed/bath count, size, storeys — as part of sentences, not as a
+   recited list.
+3. CLOSING — exact shape, only the middle line changes:
+     ***Your Vision. Your Legacy.*** {one line specific to this home}. {call to view}.
+     Please contact me at {agent_phone} ({agent_name}).
 
-The listing photos are attached above this message.
+====================================================================
+TONE — warm, natural, light-hearted; never presumptuous
+====================================================================
+Write the way a knowledgeable friend would describe a home they just walked through, not the
+way a brochure does. Some flourish and light warmth are welcome — this shouldn't read flat or
+robotic — but hold back before it tips into either "written copy" or a joke that assumes
+something about the buyer.
 
-Write the write-up now: a compelling headline (no number, no price), three short warm paragraphs
-grounded in the facts and what the photos actually show, and a warm call to action (no price).
-End with: {agent_name} | {agency} Specialist
+KEEP DOING:
+- Concrete, ordinary images grounded in what's actually in a photo. ("A family area by the
+  staircase" — only if a photo actually shows one.)
+- One light, general touch of warmth per section at most, e.g. "room to grow into," "a
+  comfortable place to come home to." Warmth that could apply to any household, not a
+  specific one.
+- Plain, earned adjectives over stacked intensifiers. If a sentence has three ("breathtaking,"
+  "soaring," "sanctuary") in one breath, cut two.
 
-Return only the write-up prose -- no preamble, no markdown headers, no explanation."""
+AVOID — hard rules, not style preferences:
+- Do NOT write "the hard work is already done" or close variants of it — Jane has flagged
+  this as a cliché opener; do not use it as a headline, hook, or anywhere else.
+- Do NOT make jokes or asides that assume facts about the buyer's specific family, relationships,
+  or lifestyle — e.g. nothing in the register of "friends who stay a little too long," "perfect
+  for keeping the kids close (but not too close)," or similar. We don't know who's buying this
+  home or who they live with; warmth should stay general, never presumptuous.
+- Do NOT compare the home to something outside it — no films, celebrities, brands. If a
+  sentence needs an external reference to land, the plain image underneath is usually
+  stronger on its own.
+- Do NOT use a rhetorical question as a recurring device across sections.
+- Do NOT output any bullet list, numbered list, markdown header, or section label. Prose
+  only, from headline straight through to the closing.
+
+====================================================================
+SELF-CHECK — run silently before returning your answer
+====================================================================
+  [ ] Every specific feature named is visible in an attached photo or stated in FACTS
+  [ ] No bed/bath/storey/size figure appears that wasn't given in FACTS
+  [ ] No house/unit number, no street name, no price anywhere
+  [ ] No bullet points, headers, or labeled sections — prose only
+  [ ] Reads warm and natural, not written or robotic; no more than one light touch of
+      warmth per section, nothing presumptuous about the buyer's family or lifestyle
+  [ ] Neither "the hard work is already done" nor a family-presumptuous joke appears
+  [ ] No external comparison (film, celebrity, brand)
+  [ ] Closing follows the exact shape: "Your Vision. Your Legacy." + one specific line +
+      call to view + "Please contact me at {agent_phone} ({agent_name})"
+If any line fails, revise silently and re-check before returning your answer. Never show
+this checklist or mention that you ran it."""
+
+_WRITEUP_PROMPT_FALLBACK_USER = """Here are the listing photos for this property, followed by the known facts. Write the
+write-up now, following the system instructions exactly.
+
+{facts_block}
+
+The photos follow this message. Describe only what they actually show, plus the facts above
+— nothing else. Return only the headline, the prose write-up, and the closing, in that order,
+with no labels, no bullets, and no extra commentary before or after."""
 
 
 def _load_writeup_prompt():
@@ -1500,6 +1566,58 @@ def _fill_placeholders(template: str, subs: dict) -> str:
     return out
 
 
+def _fmt_writeup_num(v):
+    """Thousands-separated, dropping a trailing .0 (storeys 2.0 -> "2")."""
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return f"{int(n):,}" if n == int(n) else f"{n:,}"
+
+
+# Property types for which land size is meaningless -- the FACTS block drops the land-size
+# line for these (a strata unit has no land plot), per content-studio's omit rule.
+_WRITEUP_NON_LANDED_KEYWORDS = (
+    "condo", "apartment", "apt", "flat", "hdb", "penthouse", "walk-up", "walkup",
+)
+
+
+def _build_writeup_facts_block(req, district_str: str) -> str:
+    """Assemble content-studio's FACTS block, applying its per-line omit rules so the model
+    never sees an empty, fact-shaped gap it might feel invited to fill:
+      - bathrooms / storeys / built-up / land-size: dropped when blank or 0
+      - land-size: additionally always dropped for a non-landed (strata) property type
+      - features: dropped entirely when blank
+    District is always included (area context only, never the street). Only lines with a
+    real value are emitted."""
+    ptype = (req.property_type or "").strip()
+    is_non_landed = any(kw in ptype.lower() for kw in _WRITEUP_NON_LANDED_KEYWORDS)
+
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    lines = ["FACTS:"]
+    if ptype:
+        lines.append(f"- Property type: {ptype}")
+    lines.append(f"- District (area context only — never name the street): {district_str}")
+    if (req.bedrooms or "").strip():
+        lines.append(f"- Bedrooms: {req.bedrooms.strip()}")
+    if (req.bathrooms or "").strip():
+        lines.append(f"- Bathrooms: {req.bathrooms.strip()}")
+    if _num(req.storeys) > 0:
+        lines.append(f"- Storeys: {_fmt_writeup_num(req.storeys)}")
+    if _num(req.built_up) > 0:
+        lines.append(f"- Built-up size: {_fmt_writeup_num(req.built_up)} sqft")
+    if _num(req.land_size) > 0 and not is_non_landed:
+        lines.append(f"- Land size: {_fmt_writeup_num(req.land_size)} sqft")
+    if (req.features or "").strip():
+        lines.append(f"- Agent-noted features: {req.features.strip()}")
+    return "\n".join(lines)
+
+
 # Belt-and-braces: no street is ever fed into this prompt (we pass only a district
 # token), so a real street name in the output means the model free-associated one.
 # Tight suffix set on purpose -- excludes "Terrace"/"Park"/"Grove"/"Walk" etc. that
@@ -1530,32 +1648,43 @@ class WriteupRequest(BaseModel):
     # The frontend sends the same listing fields it collects on New Listing plus the
     # already-uploaded Cloudinary photo URLs. No listing_id: the listing may not be
     # saved yet. Agent-profile fields and the district are resolved server-side.
-    property_type: str = ""
-    location: str = ""
+    # Free-text and list bounds are cost-abuse guards -- an oversized field is rejected
+    # by pydantic as a clean 422, never parsed into a giant (expensive) prompt.
+    property_type: str = Field(default="", max_length=100)
+    location: str = Field(default="", max_length=300)
     land_size: int = 0
     built_up: int = 0
-    bedrooms: str = ""
-    bathrooms: str = ""
+    bedrooms: str = Field(default="", max_length=50)
+    bathrooms: str = Field(default="", max_length=50)
     storeys: float = 0
-    features: str = ""
+    features: str = Field(default="", max_length=5000)
     sg_citizen: bool = False
     plot_width: float = 0
     plot_depth: float = 0
     site_coverage: float = 0
-    photo_urls: list[str] = []
+    # Bounds the raw parse; we still slice to WRITEUP_MAX_IMAGES below.
+    photo_urls: list[str] = Field(default_factory=list, max_length=60)
 
 
-# One Opus-5 vision call per request -- rate-limited per agent like the other Claude
-# endpoints. 30/hour is generous for real listing creation while capping the blast
-# radius of a runaway client or an abusive account under the 50-agent load target.
+# One Opus-5 vision call per request -- rate-limited per agent. This dict is PER WORKER, and
+# Railway runs ~4 workers, so the effective per-agent ceiling is ~4x this number: 8/worker
+# lands at ~32/hour overall, the intended budget. (A shared Supabase/Redis counter would be
+# exact but isn't warranted yet.) A timestamp is recorded only after a SUCCESSFUL generation,
+# so an Anthropic outage or a rejected request never burns an agent's quota on failures.
 _generate_writeup_hits = {}
+WRITEUP_HOURLY_LIMIT_PER_WORKER = 8
 
 WRITEUP_UNAVAILABLE_DETAIL = "Couldn't generate a write-up right now -- please try again."
 
 
 @app.post("/api/listings/generate-writeup")
 async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)):
-    if _rate_limited(_generate_writeup_hits, agent["id"], limit=30, window_seconds=3600):
+    # Check-without-recording: we only append a timestamp on success (below), so failed
+    # attempts don't count against the agent. Concurrent requests on one worker may
+    # slightly over-admit, which is harmless at this ceiling.
+    _now = datetime.utcnow()
+    _recent = [t for t in _generate_writeup_hits.get(agent["id"], []) if (_now - t).total_seconds() < 3600]
+    if len(_recent) >= WRITEUP_HOURLY_LIMIT_PER_WORKER:
         raise HTTPException(
             status_code=429,
             detail="You've hit the hourly limit for write-ups -- please try again in a bit.",
@@ -1577,13 +1706,11 @@ async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)
     m = re.fullmatch(r"D(\d+)", district_token or "")
     district_str = f"District {m.group(1)}" if m else "Singapore"
 
-    def _fmt_num(v):
-        try:
-            n = float(v)
-        except (TypeError, ValueError):
-            return str(v)
-        return f"{int(n):,}" if n == int(n) else f"{n:,}"
-
+    # Persona + district placeholders used by content-studio's SYSTEM text (and any the
+    # USER text uses besides {facts_block}). {agent_phone} is the agent's PUBLIC-FACING
+    # contact field ("contact") -- the same field the poster/video outros already print --
+    # not an internal column. The FACTS lines are NOT placeholders here; they're built
+    # conditionally and injected last (below).
     subs = {
         "agent_name": agent.get("name", ""),
         "agency": agent.get("agency", ""),
@@ -1591,27 +1718,19 @@ async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)
         "tone": agent.get("tone", "Warm & Conversational"),
         "emphasis": agent.get("emphasis", "Lifestyle & Prestige"),
         "signature": agent.get("signature", "Where your next chapter begins."),
-        "agent_phone": agent.get("phone", ""),
-        "property_type": req.property_type or "",
-        # Bound to the district token too, so even a doc that still says {location}
-        # can never receive a street-level value.
+        "agent_phone": agent.get("contact", ""),
+        # Defensive: if a future doc revision reintroduces {location}, it still only ever
+        # receives the district token, never a street-level string.
         "location": district_str,
         "district": district_str,
-        "land_size": _fmt_num(req.land_size),
-        "built_up": _fmt_num(req.built_up),
-        "bedrooms": req.bedrooms or "",
-        "bathrooms": req.bathrooms or "",
-        "storeys": _fmt_num(req.storeys),
-        "plot_width": _fmt_num(req.plot_width),
-        "plot_depth": _fmt_num(req.plot_depth),
-        "site_coverage": _fmt_num(req.site_coverage),
-        "features": req.features or "",
-        "sg_citizen": "Yes" if req.sg_citizen else "No",
     }
 
     system_tmpl, user_tmpl = _load_writeup_prompt()
     system_prompt = _fill_placeholders(system_tmpl, subs)
-    user_text = _fill_placeholders(user_tmpl, subs)
+    # Assemble the FACTS block (with the omit rules) and inject it LAST -- not through the
+    # subs loop -- so agent-typed features text can never be rescanned as a placeholder.
+    facts_block = _build_writeup_facts_block(req, district_str)
+    user_text = _fill_placeholders(user_tmpl, subs).replace("{facts_block}", facts_block)
 
     image_blocks = [{"type": "image", "source": {"type": "url", "url": u}} for u in photo_urls]
     user_content = image_blocks + [{"type": "text", "text": user_text}]
@@ -1619,16 +1738,16 @@ async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)
     try:
         response = await create_claude_message(
             model="claude-opus-5",
-            max_tokens=4000,  # ample room for adaptive thinking + a short prose write-up
-            # Quality-critical creative copy, but an agent is watching a spinner --
-            # medium effort keeps Opus 5's adaptive thinking latency in check. Sent via
-            # extra_body so it rides the JSON request body regardless of whether this
-            # pinned SDK build exposes output_config as a named parameter.
-            extra_body={"output_config": {"effort": "medium"}},
+            max_tokens=4000,  # room for Opus 5's default adaptive thinking + a short write-up
+            # Deliberately NO output_config/effort or thinking override: on Opus 5, omitting
+            # `thinking` already runs adaptive thinking, and keeping the request to plain,
+            # proven-accessible params -- this same model + system + image blocks is exactly
+            # what the live chatbot endpoint uses -- avoids a 400 on an unaccepted param that
+            # our except-block would otherwise mask as a friendly 502 on 100% of calls.
             system=system_prompt,
             messages=[{"role": "user", "content": user_content}],
             # SDK default is 10 minutes -- far too long for a live click. Fail fast
-            # and let the agent retry. Streaming isn't needed at this token budget.
+            # and let the agent retry.
             timeout=90.0,
         )
     except Exception as e:
@@ -1645,7 +1764,9 @@ async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)
     writeup = "".join(
         block.text for block in response.content if getattr(block, "type", None) == "text"
     ).strip()
-    writeup = writeup.replace("**", "").replace("---", "").replace("# ", "").strip()
+    # NOTE: deliberately no markdown stripping here. content-studio's closing is
+    # "***Your Vision. Your Legacy.***" -- stripping ** would mangle it -- and the prompt
+    # already forbids stray headers/bullets, so there's nothing to clean.
 
     if not writeup:
         logger.warning("generate-writeup came back empty for agent %s", agent["id"])
@@ -1656,6 +1777,12 @@ async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)
     # then the stray-street backstop.
     writeup = apply_listing_copy_guards(writeup, price=None, built_up=req.built_up, context=f"writeup:{agent['id']}")
     writeup = _strip_stray_street_names(writeup, context=f"writeup:{agent['id']}")
+
+    # Record a successful generation against the per-worker hourly quota (see F2/F3
+    # rationale on _generate_writeup_hits). Only successes count.
+    _hits = [t for t in _generate_writeup_hits.get(agent["id"], []) if (datetime.utcnow() - t).total_seconds() < 3600]
+    _hits.append(datetime.utcnow())
+    _generate_writeup_hits[agent["id"]] = _hits
 
     return {"writeup": writeup}
 
