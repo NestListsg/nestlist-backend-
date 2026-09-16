@@ -1403,6 +1403,262 @@ Write:
         "listing": listing_row
     }
 
+
+# ================================
+# GENERATE WRITE-UP FROM PHOTOS (multimodal) -- additive to /generate above.
+# The agent has uploaded photos + filled the New Listing fields but the listing is
+# NOT saved yet, so this takes photo_urls directly and returns prose only; it never
+# writes to the DB. Vision-driven: Claude sees the actual Cloudinary photos and the
+# facts, and is forbidden (by the prompt + the guards below) from inventing anything.
+# ================================
+
+# Max photos we hand to Claude in one request. Vision requests get slower and
+# pricier per image; 8 covers a full listing's hero shots without letting a 40-photo
+# upload blow up latency or token cost under load.
+WRITEUP_MAX_IMAGES = 8
+
+# Loaded from docs/listing-copy-generation-prompt.md (content-studio owns the wording)
+# once per process, then cached. The file is a git artifact, so an edit ships via a
+# Railway redeploy -> fresh process -> re-read. If the file is ever missing or
+# malformed, we fall back to the embedded default below so the feature never 500s
+# just because the doc moved.
+_WRITEUP_PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "listing-copy-generation-prompt.md")
+_WRITEUP_PROMPT_CACHE = None  # (system_template, user_template)
+
+_WRITEUP_PROMPT_FALLBACK_SYSTEM = """You are {agent_name} from {agency}, a property specialist in {specialty}.
+Your tone: {tone}
+You emphasise: {emphasis}
+Your signature phrase: "{signature}"
+
+You are writing the marketing write-up for one of your own listings, using the property's
+factual details AND its actual listing photos. Write in flowing PROSE, not bullet points.
+
+Rules, no exceptions:
+1. Ground every claim in either a fact given below or something genuinely visible in a photo.
+   Never invent a feature, view, finish, or room you cannot see or read. An honest line beats an
+   impressive one that isn't backed up.
+2. Never include a house or unit number, and never name a specific street.
+3. Never mention price in any form.
+4. Talk like a knowledgeable person, not a brochure. Avoid "coveted", "nestled", "boasts",
+   "epitome of luxury", "prestigious".
+5. Do not describe people, faces, cars, or number plates that happen to appear in a photo."""
+
+_WRITEUP_PROMPT_FALLBACK_USER = """Here are the details for this listing:
+- Type: {property_type}
+- Area: {district}
+- Land size: {land_size} sqft
+- Built-up: {built_up} sqft
+- Bedrooms: {bedrooms}
+- Bathrooms: {bathrooms}
+- Storeys: {storeys}
+- Seller-stated features: {features}
+
+The listing photos are attached above this message.
+
+Write the write-up now: a compelling headline (no number, no price), three short warm paragraphs
+grounded in the facts and what the photos actually show, and a warm call to action (no price).
+End with: {agent_name} | {agency} Specialist
+
+Return only the write-up prose -- no preamble, no markdown headers, no explanation."""
+
+
+def _load_writeup_prompt():
+    """Return (system_template, user_template). Cached after first read. Tolerant:
+    any read/parse failure falls back to the embedded default so a missing or
+    reshaped doc can never take the endpoint down."""
+    global _WRITEUP_PROMPT_CACHE
+    if _WRITEUP_PROMPT_CACHE is not None:
+        return _WRITEUP_PROMPT_CACHE
+    system_tmpl, user_tmpl = _WRITEUP_PROMPT_FALLBACK_SYSTEM, _WRITEUP_PROMPT_FALLBACK_USER
+    try:
+        with open(_WRITEUP_PROMPT_PATH, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+        # Strip the leading HTML comment (author notes) if present.
+        raw = re.sub(r"<!--.*?-->", "", raw, count=1, flags=re.DOTALL)
+        if "<<<SYSTEM>>>" in raw and "<<<USER>>>" in raw:
+            after_system = raw.split("<<<SYSTEM>>>", 1)[1]
+            sys_part, user_part = after_system.split("<<<USER>>>", 1)
+            if sys_part.strip() and user_part.strip():
+                system_tmpl, user_tmpl = sys_part.strip(), user_part.strip()
+        else:
+            logger.warning("writeup prompt doc missing <<<SYSTEM>>>/<<<USER>>> markers; using fallback")
+    except FileNotFoundError:
+        logger.warning("writeup prompt doc not found at %s; using embedded fallback", _WRITEUP_PROMPT_PATH)
+    except Exception as e:
+        logger.error("failed to load writeup prompt doc, using fallback: %s", e)
+    _WRITEUP_PROMPT_CACHE = (system_tmpl, user_tmpl)
+    return _WRITEUP_PROMPT_CACHE
+
+
+def _fill_placeholders(template: str, subs: dict) -> str:
+    """Literal {key} substitution. Uses str.replace (not str.format) so stray braces
+    in the prose -- or a {placeholder} the doc adds that we don't supply -- can never
+    raise; an unknown token simply survives verbatim."""
+    out = template
+    for key, val in subs.items():
+        out = out.replace("{" + key + "}", str(val))
+    return out
+
+
+# Belt-and-braces: no street is ever fed into this prompt (we pass only a district
+# token), so a real street name in the output means the model free-associated one.
+# Tight suffix set on purpose -- excludes "Terrace"/"Park"/"Grove"/"Walk" etc. that
+# collide with property types and generic feature words -- so this only fires on an
+# obvious "Propername Road/Avenue/..." construction.
+_STRAY_STREET_RE = re.compile(r"\b[A-Z][a-z]{2,}\s+(?:Road|Avenue|Street|Lane|Close|Crescent|Boulevard)\b")
+
+
+def _strip_stray_street_names(text: str, context: str = "writeup") -> str:
+    """Redacts an invented street name from the copy. Never raises, never empties."""
+    if not text:
+        return text
+    try:
+        hits = _STRAY_STREET_RE.findall(text)
+        if not hits:
+            return text
+        cleaned = _STRAY_STREET_RE.sub("", text)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;])", r"\1", cleaned)
+        logger.warning("copy guard [%s]: stripped stray street name(s) %s", context, hits)
+        return cleaned.strip() if cleaned.strip() else text
+    except Exception as e:
+        logger.error("stray-street guard [%s] failed, returning ungated text: %s", context, e)
+        return text
+
+
+class WriteupRequest(BaseModel):
+    # The frontend sends the same listing fields it collects on New Listing plus the
+    # already-uploaded Cloudinary photo URLs. No listing_id: the listing may not be
+    # saved yet. Agent-profile fields and the district are resolved server-side.
+    property_type: str = ""
+    location: str = ""
+    land_size: int = 0
+    built_up: int = 0
+    bedrooms: str = ""
+    bathrooms: str = ""
+    storeys: float = 0
+    features: str = ""
+    sg_citizen: bool = False
+    plot_width: float = 0
+    plot_depth: float = 0
+    site_coverage: float = 0
+    photo_urls: list[str] = []
+
+
+# One Opus-5 vision call per request -- rate-limited per agent like the other Claude
+# endpoints. 30/hour is generous for real listing creation while capping the blast
+# radius of a runaway client or an abusive account under the 50-agent load target.
+_generate_writeup_hits = {}
+
+WRITEUP_UNAVAILABLE_DETAIL = "Couldn't generate a write-up right now -- please try again."
+
+
+@app.post("/api/listings/generate-writeup")
+async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)):
+    if _rate_limited(_generate_writeup_hits, agent["id"], limit=30, window_seconds=3600):
+        raise HTTPException(
+            status_code=429,
+            detail="You've hit the hourly limit for write-ups -- please try again in a bit.",
+        )
+
+    # Only keep well-formed http(s) image URLs, first WRITEUP_MAX_IMAGES of them. A
+    # malformed entry is skipped rather than failing the whole request. Zero valid
+    # photos is allowed -- the prompt tells Claude to lean on the facts -- so the
+    # agent still gets copy instead of an error.
+    photo_urls = [
+        u.strip() for u in (req.photo_urls or [])
+        if isinstance(u, str) and u.strip().lower().startswith(("http://", "https://"))
+    ][:WRITEUP_MAX_IMAGES]
+
+    # District only -- NEVER the street-level location. _extract_district_token yields
+    # "D15" or "" for a street address; normalise to readable prose and fall back to a
+    # neutral area label so an address-only location can't leak a street into the copy.
+    district_token = _extract_district_token(req.location)
+    m = re.fullmatch(r"D(\d+)", district_token or "")
+    district_str = f"District {m.group(1)}" if m else "Singapore"
+
+    def _fmt_num(v):
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        return f"{int(n):,}" if n == int(n) else f"{n:,}"
+
+    subs = {
+        "agent_name": agent.get("name", ""),
+        "agency": agent.get("agency", ""),
+        "specialty": agent.get("specialty", ""),
+        "tone": agent.get("tone", "Warm & Conversational"),
+        "emphasis": agent.get("emphasis", "Lifestyle & Prestige"),
+        "signature": agent.get("signature", "Where your next chapter begins."),
+        "agent_phone": agent.get("phone", ""),
+        "property_type": req.property_type or "",
+        # Bound to the district token too, so even a doc that still says {location}
+        # can never receive a street-level value.
+        "location": district_str,
+        "district": district_str,
+        "land_size": _fmt_num(req.land_size),
+        "built_up": _fmt_num(req.built_up),
+        "bedrooms": req.bedrooms or "",
+        "bathrooms": req.bathrooms or "",
+        "storeys": _fmt_num(req.storeys),
+        "plot_width": _fmt_num(req.plot_width),
+        "plot_depth": _fmt_num(req.plot_depth),
+        "site_coverage": _fmt_num(req.site_coverage),
+        "features": req.features or "",
+        "sg_citizen": "Yes" if req.sg_citizen else "No",
+    }
+
+    system_tmpl, user_tmpl = _load_writeup_prompt()
+    system_prompt = _fill_placeholders(system_tmpl, subs)
+    user_text = _fill_placeholders(user_tmpl, subs)
+
+    image_blocks = [{"type": "image", "source": {"type": "url", "url": u}} for u in photo_urls]
+    user_content = image_blocks + [{"type": "text", "text": user_text}]
+
+    try:
+        response = await create_claude_message(
+            model="claude-opus-5",
+            max_tokens=4000,  # ample room for adaptive thinking + a short prose write-up
+            # Quality-critical creative copy, but an agent is watching a spinner --
+            # medium effort keeps Opus 5's adaptive thinking latency in check. Sent via
+            # extra_body so it rides the JSON request body regardless of whether this
+            # pinned SDK build exposes output_config as a named parameter.
+            extra_body={"output_config": {"effort": "medium"}},
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_content}],
+            # SDK default is 10 minutes -- far too long for a live click. Fail fast
+            # and let the agent retry. Streaming isn't needed at this token budget.
+            timeout=90.0,
+        )
+    except Exception as e:
+        # Covers timeouts, auth/key failure (after the helper's backup-key attempt),
+        # rate limits from Anthropic, bad image URLs Anthropic can't fetch, 5xx, etc.
+        # Never surfaces as an unhandled 500.
+        logger.error("generate-writeup failed for agent %s: %s", agent["id"], e)
+        raise HTTPException(status_code=502, detail=WRITEUP_UNAVAILABLE_DETAIL)
+
+    if getattr(response, "stop_reason", None) == "refusal":
+        logger.warning("generate-writeup refused for agent %s", agent["id"])
+        raise HTTPException(status_code=502, detail=WRITEUP_UNAVAILABLE_DETAIL)
+
+    writeup = "".join(
+        block.text for block in response.content if getattr(block, "type", None) == "text"
+    ).strip()
+    writeup = writeup.replace("**", "").replace("---", "").replace("# ", "").strip()
+
+    if not writeup:
+        logger.warning("generate-writeup came back empty for agent %s", agent["id"])
+        raise HTTPException(status_code=502, detail=WRITEUP_UNAVAILABLE_DETAIL)
+
+    # Same guards the saved-listing path uses: strip any house/unit number the model
+    # echoed (price=None -> price guard is a no-op, there's no price in this request),
+    # then the stray-street backstop.
+    writeup = apply_listing_copy_guards(writeup, price=None, built_up=req.built_up, context=f"writeup:{agent['id']}")
+    writeup = _strip_stray_street_names(writeup, context=f"writeup:{agent['id']}")
+
+    return {"writeup": writeup}
+
 MAX_LISTING_PHOTOS = 15  # per listing, not per request -- see _process_and_upload_images
 
 # Every photo-array change is a read-modify-write: SELECT images -> change the
