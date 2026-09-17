@@ -203,6 +203,8 @@ async def refresh_market_pulse_loop():
 async def startup_event():
     asyncio.create_task(monitor_api_key())
     asyncio.create_task(refresh_market_pulse_loop())
+    # Reclaims abandoned staged photos (reference-aware; never touches a live listing).
+    asyncio.create_task(sweep_staging_loop())
     # Backgrounded so a slow database can't hold up the port binding.
     asyncio.create_task(asyncio.to_thread(_probe_images_cas_encoding))
     await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
@@ -2451,6 +2453,31 @@ async def extract_pdf_photos(request: Request, agent=Depends(get_current_agent))
     }
 
 
+# --- stage-photos payload guards (reliability audit findings 2 & 3) ------------
+# F2: byte caps enforced BEFORE decoding, so a huge upload can't buffer into memory
+# and OOM a worker (taking unrelated requests on it down with it). base64 inflates the
+# wire size ~33%, so these caps are on the base64 payload.
+MAX_STAGE_REQUEST_BYTES = 30 * 1024 * 1024   # whole batch (~22MB of actual image bytes)
+MAX_STAGE_IMAGE_B64 = 12 * 1024 * 1024        # one image (~9MB decoded)
+# F3: bound how many staging requests do heavy PIL/upload work at once, so staging can't
+# saturate the default thread pool it shares with enhance/poster/video under load.
+_STAGING_CONCURRENCY = asyncio.Semaphore(4)
+_STAGE_TOO_LARGE = "Those photos are too large to upload at once -- please upload fewer or smaller photos."
+
+
+async def _read_capped_body(request: Request, cap: int) -> bytes:
+    """Read the request body but ABORT as soon as `cap` bytes are exceeded -- so an
+    oversized (or Content-Length-lying) payload is rejected without buffering it all."""
+    total = 0
+    chunks = []
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > cap:
+            raise HTTPException(status_code=413, detail=_STAGE_TOO_LARGE)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _stage_photos(agent_id: str, images: list) -> list:
     """Upload listing photos to the shared bucket BEFORE any listing exists, returning
     their public URLs. Same processing as _process_and_upload_images (resize to <=1920px,
@@ -2489,15 +2516,35 @@ async def stage_photos(request: Request, agent=Depends(get_current_agent)):
     "Upload Property Photos" box). Body: {"images": [{"image_data": "<base64>"}, ...]}.
     Returns {"photo_urls": [...]} -- the frontend passes these to POST /api/listings/generate
     as `photo_urls`. Staging is STATELESS: for a large set that would exceed the ~10MB edge
-    body limit, call this several times and concatenate the returned photo_urls arrays."""
+    body limit, call this several times and concatenate the returned photo_urls arrays.
+    Abandoned staged photos are reclaimed by the reference-aware sweep below."""
     try:
-        body = await request.json()
-        images = body.get("images", [])
+        # F2: reject an oversized body BEFORE parsing/decoding. Fast path on the declared
+        # Content-Length, then a hard cap while actually reading the stream (in case it lies).
+        cl = request.headers.get("content-length")
+        if cl and cl.isdigit() and int(cl) > MAX_STAGE_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail=_STAGE_TOO_LARGE)
+        raw = await _read_capped_body(request, MAX_STAGE_REQUEST_BYTES)
+        try:
+            body = json.loads(raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid request body")
+        images = body.get("images", []) if isinstance(body, dict) else []
         if not isinstance(images, list) or not images:
             raise HTTPException(status_code=400, detail="No images provided")
         if len(images) > MAX_LISTING_PHOTOS:
             images = images[:MAX_LISTING_PHOTOS]
-        urls = await asyncio.to_thread(_stage_photos, agent["id"], images)
+        # F2: per-image cap -- reject a single oversized photo cleanly instead of feeding a
+        # huge decode into the worker thread.
+        for img in images:
+            d = (img or {}).get("image_data") or ""
+            if not isinstance(d, str):
+                raise HTTPException(status_code=400, detail="Invalid image data")
+            if len(d) > MAX_STAGE_IMAGE_B64:
+                raise HTTPException(status_code=413, detail="One of those photos is too large -- please downscale it and try again.")
+        # F3: bound concurrent heavy staging work so it can't starve the shared pool.
+        async with _STAGING_CONCURRENCY:
+            urls = await asyncio.to_thread(_stage_photos, agent["id"], images)
         if not urls:
             raise HTTPException(status_code=400, detail="Couldn't read any of those images -- please try different photos")
         return {"photo_urls": urls}
@@ -2506,6 +2553,114 @@ async def stage_photos(request: Request, agent=Depends(get_current_agent)):
     except Exception:
         logger.exception("Photo staging failed for agent %s", agent["id"])
         raise HTTPException(status_code=500, detail="Something went wrong uploading these photos -- please try again")
+
+
+# --- stage-photos cleanup (reliability audit finding 1) ------------------------
+# Staged photos live under staging/{agent}/{token}/. On the happy path the created listing
+# references those staging URLs DIRECTLY (photos aren't moved into a listing folder), so a
+# blanket "delete everything under staging/" sweep would wipe LIVE listings' photos. This
+# sweep is therefore REFERENCE-AWARE: a staged file is deleted only when it is BOTH older
+# than the TTL AND not referenced by any listing's `images`. Abandoned photos (form closed,
+# tab closed, or a compliance-gate rejection that happens after staging) are reclaimed;
+# claimed photos are never touched, however old. On any uncertainty the sweep KEEPS files.
+STAGING_TTL_SECONDS = 24 * 3600
+STAGING_SWEEP_INTERVAL_SECONDS = 6 * 3600
+
+
+def _parse_supabase_ts(value):
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+
+def _list_all_storage(bucket, path):
+    """Paginated storage listing (Supabase .list caps at 100 per call), so agents/tokens
+    that have grown past 100 are still fully swept."""
+    out = []
+    offset = 0
+    while True:
+        try:
+            page = bucket.list(path, {"limit": 100, "offset": offset}) or []
+        except Exception:
+            break
+        out.extend(page)
+        if len(page) < 100:
+            break
+        offset += 100
+        if offset > 100000:  # sanity stop
+            break
+    return out
+
+
+def _sweep_staging_once():
+    """One reference-aware TTL sweep of staging/. Blocking (storage + DB); runs in a
+    thread. Best-effort and fail-safe: if the reference set can't be built it skips the
+    run entirely rather than risk deleting a live listing's photo."""
+    supabase = get_db()
+    bucket = supabase.storage.from_("listings-images")
+
+    # 1. Every staging path a listing currently points at -- CLAIMED, never delete.
+    referenced = set()
+    try:
+        rows = (supabase.table("listings").select("images").execute().data) or []
+    except Exception:
+        logger.exception("staging sweep: could not load listing images; skipping (never delete blind)")
+        return
+    for r in rows:
+        for url in (r.get("images") or []):
+            if not isinstance(url, str):
+                continue
+            idx = url.find("/staging/")
+            if idx != -1:
+                referenced.add(url[idx + 1:].split("?")[0])  # "staging/{agent}/{token}/{file}"
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=STAGING_TTL_SECONDS)
+    deleted = 0
+    for a in _list_all_storage(bucket, "staging"):
+        aname = a.get("name")
+        if not aname:
+            continue
+        for tk in _list_all_storage(bucket, f"staging/{aname}"):
+            tname = tk.get("name")
+            if not tname:
+                continue
+            prefix = f"staging/{aname}/{tname}"
+            to_delete = []
+            for f in _list_all_storage(bucket, prefix):
+                fname = f.get("name")
+                if not fname:
+                    continue
+                path = f"{prefix}/{fname}"
+                if path in referenced:
+                    continue  # claimed by a live listing
+                ts = _parse_supabase_ts(f.get("created_at") or f.get("updated_at"))
+                if ts is None:
+                    continue  # unknown age -> keep (safety over completeness)
+                if ts < cutoff:
+                    to_delete.append(path)
+            if to_delete:
+                try:
+                    bucket.remove(to_delete)
+                    deleted += len(to_delete)
+                except Exception:
+                    logger.exception("staging sweep: could not remove files under %s", prefix)
+    if deleted:
+        logger.info("staging sweep: reclaimed %s abandoned staged photo(s)", deleted)
+
+
+async def sweep_staging_loop():
+    # Delay the first run so it doesn't contend with boot, then run every interval.
+    await asyncio.sleep(600)
+    while True:
+        try:
+            await asyncio.to_thread(_sweep_staging_once)
+        except Exception:
+            logger.exception("staging sweep loop error")
+        await asyncio.sleep(STAGING_SWEEP_INTERVAL_SECONDS)
 
 
 @app.post("/api/listings/{listing_id}/upload-images")
