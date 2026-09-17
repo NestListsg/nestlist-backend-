@@ -411,6 +411,11 @@ class ListingRequest(BaseModel):
     # Optional agent-supplied override for the discreet buyer-link code
     # (nestlist.sg/{handle}/{code}). Blank/omitted -> derived from `location`.
     code: Optional[str] = None
+    # OPTIONAL, backward-compatible: already-uploaded property photo URLs (from
+    # POST /api/listings/stage-photos). When present, the write-up is generated
+    # MULTIMODALLY (fields + photos) and the photos are saved on the new listing.
+    # When absent/empty, generation is text-only -- EXACTLY the original behavior.
+    photo_urls: list[str] = Field(default_factory=list, max_length=60)
 
 class ListingContentRequest(BaseModel):
     content: str
@@ -1226,6 +1231,95 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
         row["agent_code"] = owner_code
     return rows
 
+
+async def _generate_listing_text_only(agent, req, display_location: str) -> str:
+    """The ORIGINAL text-only listing copy path, extracted verbatim so it can be
+    reused (a) as the default when no photos are sent and (b) as the graceful
+    fallback if the multimodal write-up fails. Behavior is unchanged from before."""
+    prompt = f"""You are {agent['name']} from {agent['agency']}, a specialist in {agent['specialty']}.
+Your tone: {agent.get('tone', 'Warm & Conversational')}
+You emphasise: {agent.get('emphasis', 'Lifestyle & Prestige')}
+Your signature phrase: "{agent.get('signature', 'Where your next chapter begins.')}"
+
+Write a property listing for:
+- Type: {req.property_type}
+- Location: {display_location}
+- Land size: {req.land_size:,} sqft
+- Built-up: {req.built_up:,} sqft
+- Bedrooms: {req.bedrooms}
+- Bathrooms: {req.bathrooms}
+- Features: {req.features}
+
+Follow these rules with no exceptions:
+
+1. NEVER include a house or unit number. If Location contains one (e.g. "22G Tembeling Road",
+   "#03-04 Amber Road", "12A Jalan Sempadan"), drop it and refer only to the street or area name
+   ("Tembeling Road"). Do not invent a substitute number, and do not restate the number even once
+   for "colour."
+
+2. Write the way a knowledgeable person would actually talk to a buyer, not the way a brochure
+   does. Avoid stock real-estate phrases — "coveted", "established enclave", "prestigious address",
+   "epitome of luxury", "nestled in", "boasts", "sprawling". If a plain word says it, use the plain
+   word. Elegant is fine; inflated is not.
+
+3. Every descriptive claim must be traceable to something in the facts above. Do not call the
+   street "sought-after," "prestigious," or "coveted" unless a fact above actually supports it. If
+   you're reaching for a superlative and can't point to what earns it, describe what's concretely
+   there instead — the layout, the orientation, the space, the light — rather than a status claim.
+   A modest, honest line beats an impressive-sounding one that isn't backed up.
+
+4. Do NOT mention price anywhere, in any form — no figure, no "attractively priced," no "priced to
+   sell," no range. Price is shown to buyers separately; leave it out of the write-up entirely.
+
+Write:
+1. A compelling headline (no house/unit number, no price)
+2. Three short paragraphs in your personal voice — grounded, specific to the facts given, warm
+   rather than formal
+3. A warm call to action (no price)
+4. End with: {agent['name']} | {agent['agency']} Specialist"""
+
+    response = await create_claude_message(
+        model="claude-sonnet-4-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    listing_text = response.content[0].text.strip().replace('**', '').replace('---', '').replace('# ', '').strip()
+    # Layer 2 + price guard: catches anything the model reconstructed on its own.
+    listing_text = apply_listing_copy_guards(
+        listing_text, price=req.price, built_up=req.built_up, context=f"generate:{agent['id']}"
+    )
+    return listing_text
+
+
+def _basic_listing_fallback(agent, req, display_location: str) -> str:
+    """Last-resort copy if BOTH the multimodal and the text-only Claude calls fail
+    (e.g. a full Anthropic outage). Deliberately plain and built only from the given
+    facts -- no price, no house number -- so the agent still gets a usable listing
+    instead of losing it. They can regenerate or hand-edit later."""
+    ptype = (req.property_type or "property").strip()
+    loc = (display_location or "").strip()
+    where = f" in {loc}" if loc else ""
+    bits = []
+    if (req.bedrooms or "").strip():
+        bits.append(f"{req.bedrooms.strip()} bedrooms")
+    if (req.bathrooms or "").strip():
+        bits.append(f"{req.bathrooms.strip()} bathrooms")
+    if req.built_up:
+        bits.append(f"{req.built_up:,} sqft built-up")
+    spec = (" It offers " + ", ".join(bits) + ".") if bits else ""
+    feat = ""
+    if (req.features or "").strip():
+        feat = f" {req.features.strip()}"
+    name = agent.get("name", "")
+    agency = agent.get("agency", "")
+    return (
+        f"{ptype}{where}\n\n"
+        f"A {ptype.lower()}{where}.{spec}{feat}\n\n"
+        f"Reach out to arrange a viewing.\n\n"
+        f"{name} | {agency} Specialist"
+    ).strip()
+
+
 @app.post("/api/listings/generate")
 async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)):
     gcb_zones = [
@@ -1304,58 +1398,38 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     # given. The rule text below is belt; this is braces.
     display_location = _strip_house_number(req.location)
 
-    prompt = f"""You are {agent['name']} from {agent['agency']}, a specialist in {agent['specialty']}.
-Your tone: {agent.get('tone', 'Warm & Conversational')}
-You emphasise: {agent.get('emphasis', 'Lifestyle & Prestige')}
-Your signature phrase: "{agent.get('signature', 'Where your next chapter begins.')}"
+    # Photo-aware, backward-compatible. photo_urls is OPTIONAL: when the agent uploaded
+    # listing photos (staged via /api/listings/stage-photos), the write-up is generated
+    # MULTIMODALLY from the fields AND the photos using content-studio's finalized
+    # listing-copy prompt, and the photos are saved onto the new listing. When no photos
+    # are sent, this is the ORIGINAL text-only path, unchanged.
+    photo_urls = [
+        u.strip() for u in (req.photo_urls or [])
+        if isinstance(u, str) and u.strip().lower().startswith(("http://", "https://"))
+    ]
+    listing_images = photo_urls[:MAX_LISTING_PHOTOS]   # saved on the listing (all of them, capped)
+    vision_urls = photo_urls[:WRITEUP_MAX_IMAGES]      # subset actually sent to the vision model
 
-Write a property listing for:
-- Type: {req.property_type}
-- Location: {display_location}
-- Land size: {req.land_size:,} sqft
-- Built-up: {req.built_up:,} sqft
-- Bedrooms: {req.bedrooms}
-- Bathrooms: {req.bathrooms}
-- Features: {req.features}
-
-Follow these rules with no exceptions:
-
-1. NEVER include a house or unit number. If Location contains one (e.g. "22G Tembeling Road",
-   "#03-04 Amber Road", "12A Jalan Sempadan"), drop it and refer only to the street or area name
-   ("Tembeling Road"). Do not invent a substitute number, and do not restate the number even once
-   for "colour."
-
-2. Write the way a knowledgeable person would actually talk to a buyer, not the way a brochure
-   does. Avoid stock real-estate phrases — "coveted", "established enclave", "prestigious address",
-   "epitome of luxury", "nestled in", "boasts", "sprawling". If a plain word says it, use the plain
-   word. Elegant is fine; inflated is not.
-
-3. Every descriptive claim must be traceable to something in the facts above. Do not call the
-   street "sought-after," "prestigious," or "coveted" unless a fact above actually supports it. If
-   you're reaching for a superlative and can't point to what earns it, describe what's concretely
-   there instead — the layout, the orientation, the space, the light — rather than a status claim.
-   A modest, honest line beats an impressive-sounding one that isn't backed up.
-
-4. Do NOT mention price anywhere, in any form — no figure, no "attractively priced," no "priced to
-   sell," no range. Price is shown to buyers separately; leave it out of the write-up entirely.
-
-Write:
-1. A compelling headline (no house/unit number, no price)
-2. Three short paragraphs in your personal voice — grounded, specific to the facts given, warm
-   rather than formal
-3. A warm call to action (no price)
-4. End with: {agent['name']} | {agent['agency']} Specialist"""
-
-    response = await create_claude_message(
-        model="claude-sonnet-4-5",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    listing_text = response.content[0].text.strip().replace('**', '').replace('---', '').replace('# ', '').strip()
-    # Layer 2 + price guard: catches anything the model reconstructed on its own.
-    listing_text = apply_listing_copy_guards(
-        listing_text, price=req.price, built_up=req.built_up, context=f"generate:{agent['id']}"
-    )
+    if listing_images:
+        district_str = _writeup_district_str(req.location)
+        try:
+            listing_text = await _generate_writeup_from_photos(
+                agent, req, vision_urls, district_str,
+                context=f"generate:{agent['id']}", price=req.price,
+            )
+        except Exception as e:
+            # Never lose the agent's listing over a copy failure. Degrade: multimodal ->
+            # text-only write-up -> plain fact-based template. The listing is still
+            # created with real, price-free, house-number-free copy either way.
+            logger.error("multimodal write-up failed for agent %s, falling back to text-only: %s", agent["id"], e)
+            try:
+                listing_text = await _generate_listing_text_only(agent, req, display_location)
+            except Exception as e2:
+                logger.error("text-only fallback ALSO failed for agent %s, using basic template: %s", agent["id"], e2)
+                listing_text = _basic_listing_fallback(agent, req, display_location)
+    else:
+        # Original text-only behavior, exactly as before (no photos sent).
+        listing_text = await _generate_listing_text_only(agent, req, display_location)
 
     # Discreet per-agent buyer-link code (nestlist.sg/{handle}/{code}). An
     # agent-supplied override wins (validated); otherwise it's derived from the
@@ -1392,6 +1466,10 @@ Write:
     }
     if listing_code:
         insert_payload["code"] = listing_code
+    # Save the staged photos onto the listing in the SAME insert -- atomic, so there's
+    # no window where the listing exists without its photos (no half-created listing).
+    if listing_images:
+        insert_payload["images"] = listing_images
     saved = await db_execute_async(lambda db: db.table("listings").insert(insert_payload), what="generate_listing listings insert", idempotent=False)
 
     listing_row = saved.data[0]
@@ -1644,9 +1722,66 @@ def _strip_stray_street_names(text: str, context: str = "writeup") -> str:
         return text
 
 
+def _writeup_district_str(location: str) -> str:
+    """District-only area label for the write-up prompt -- NEVER the street. Yields
+    "District 15" when the location carries a district, else a neutral "Singapore"."""
+    token = _extract_district_token(location)
+    m = re.fullmatch(r"D(\d+)", token or "")
+    return f"District {m.group(1)}" if m else "Singapore"
+
+
+async def _generate_writeup_from_photos(agent, req, vision_urls, district_str, context, price=None):
+    """Shared multimodal write-up used by BOTH the standalone /generate-writeup endpoint
+    and the photo-aware /generate flow: content-studio's finalized prompt (system + the
+    conditionally-built FACTS block) plus the photos as image blocks -> Opus 5 vision ->
+    guarded prose. Raises on refusal / empty / API error so each caller decides how to
+    degrade (the standalone endpoint -> friendly 502; /generate -> text-only fallback)."""
+    subs = {
+        "agent_name": agent.get("name", ""),
+        "agency": agent.get("agency", ""),
+        "specialty": agent.get("specialty", ""),
+        "tone": agent.get("tone", "Warm & Conversational"),
+        "emphasis": agent.get("emphasis", "Lifestyle & Prestige"),
+        "signature": agent.get("signature", "Where your next chapter begins."),
+        "agent_phone": agent.get("contact", ""),
+        # Defensive: only ever the district token, never a street-level string.
+        "location": district_str,
+        "district": district_str,
+    }
+    system_tmpl, user_tmpl = _load_writeup_prompt()
+    system_prompt = _fill_placeholders(system_tmpl, subs)
+    facts_block = _build_writeup_facts_block(req, district_str)
+    user_text = _fill_placeholders(user_tmpl, subs).replace("{facts_block}", facts_block)
+
+    image_blocks = [{"type": "image", "source": {"type": "url", "url": u}} for u in (vision_urls or [])]
+    user_content = image_blocks + [{"type": "text", "text": user_text}]
+
+    response = await create_claude_message(
+        model="claude-opus-5",
+        max_tokens=4000,  # room for Opus 5's default adaptive thinking + a short write-up
+        # Plain, proven-accessible params only (no output_config/effort) -- same shape as
+        # the live chatbot endpoint -- so there's no unaccepted-param 400 risk.
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_content}],
+        timeout=90.0,  # fail fast rather than hang on a live click
+    )
+    if getattr(response, "stop_reason", None) == "refusal":
+        raise RuntimeError("write-up refused")
+    writeup = "".join(
+        block.text for block in response.content if getattr(block, "type", None) == "text"
+    ).strip()
+    # No markdown stripping: content-studio's "***Your Vision. Your Legacy.***" closing
+    # must survive, and the prompt forbids stray headers/bullets.
+    if not writeup:
+        raise RuntimeError("write-up came back empty")
+    writeup = apply_listing_copy_guards(writeup, price=price, built_up=req.built_up, context=context)
+    writeup = _strip_stray_street_names(writeup, context=context)
+    return writeup
+
+
 class WriteupRequest(BaseModel):
     # The frontend sends the same listing fields it collects on New Listing plus the
-    # already-uploaded Cloudinary photo URLs. No listing_id: the listing may not be
+    # already-uploaded photo URLs. No listing_id: the listing may not be
     # saved yet. Agent-profile fields and the district are resolved server-side.
     # Free-text and list bounds are cost-abuse guards -- an oversized field is rejected
     # by pydantic as a clean 422, never parsed into a giant (expensive) prompt.
@@ -1699,84 +1834,18 @@ async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)
         if isinstance(u, str) and u.strip().lower().startswith(("http://", "https://"))
     ][:WRITEUP_MAX_IMAGES]
 
-    # District only -- NEVER the street-level location. _extract_district_token yields
-    # "D15" or "" for a street address; normalise to readable prose and fall back to a
-    # neutral area label so an address-only location can't leak a street into the copy.
-    district_token = _extract_district_token(req.location)
-    m = re.fullmatch(r"D(\d+)", district_token or "")
-    district_str = f"District {m.group(1)}" if m else "Singapore"
-
-    # Persona + district placeholders used by content-studio's SYSTEM text (and any the
-    # USER text uses besides {facts_block}). {agent_phone} is the agent's PUBLIC-FACING
-    # contact field ("contact") -- the same field the poster/video outros already print --
-    # not an internal column. The FACTS lines are NOT placeholders here; they're built
-    # conditionally and injected last (below).
-    subs = {
-        "agent_name": agent.get("name", ""),
-        "agency": agent.get("agency", ""),
-        "specialty": agent.get("specialty", ""),
-        "tone": agent.get("tone", "Warm & Conversational"),
-        "emphasis": agent.get("emphasis", "Lifestyle & Prestige"),
-        "signature": agent.get("signature", "Where your next chapter begins."),
-        "agent_phone": agent.get("contact", ""),
-        # Defensive: if a future doc revision reintroduces {location}, it still only ever
-        # receives the district token, never a street-level string.
-        "location": district_str,
-        "district": district_str,
-    }
-
-    system_tmpl, user_tmpl = _load_writeup_prompt()
-    system_prompt = _fill_placeholders(system_tmpl, subs)
-    # Assemble the FACTS block (with the omit rules) and inject it LAST -- not through the
-    # subs loop -- so agent-typed features text can never be rescanned as a placeholder.
-    facts_block = _build_writeup_facts_block(req, district_str)
-    user_text = _fill_placeholders(user_tmpl, subs).replace("{facts_block}", facts_block)
-
-    image_blocks = [{"type": "image", "source": {"type": "url", "url": u}} for u in photo_urls]
-    user_content = image_blocks + [{"type": "text", "text": user_text}]
+    district_str = _writeup_district_str(req.location)
 
     try:
-        response = await create_claude_message(
-            model="claude-opus-5",
-            max_tokens=4000,  # room for Opus 5's default adaptive thinking + a short write-up
-            # Deliberately NO output_config/effort or thinking override: on Opus 5, omitting
-            # `thinking` already runs adaptive thinking, and keeping the request to plain,
-            # proven-accessible params -- this same model + system + image blocks is exactly
-            # what the live chatbot endpoint uses -- avoids a 400 on an unaccepted param that
-            # our except-block would otherwise mask as a friendly 502 on 100% of calls.
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}],
-            # SDK default is 10 minutes -- far too long for a live click. Fail fast
-            # and let the agent retry.
-            timeout=90.0,
+        writeup = await _generate_writeup_from_photos(
+            agent, req, photo_urls, district_str,
+            context=f"writeup:{agent['id']}", price=None,  # WriteupRequest carries no price
         )
     except Exception as e:
         # Covers timeouts, auth/key failure (after the helper's backup-key attempt),
-        # rate limits from Anthropic, bad image URLs Anthropic can't fetch, 5xx, etc.
-        # Never surfaces as an unhandled 500.
+        # Anthropic rate limits, bad image URLs, refusal, empty, 5xx. Never a raw 500.
         logger.error("generate-writeup failed for agent %s: %s", agent["id"], e)
         raise HTTPException(status_code=502, detail=WRITEUP_UNAVAILABLE_DETAIL)
-
-    if getattr(response, "stop_reason", None) == "refusal":
-        logger.warning("generate-writeup refused for agent %s", agent["id"])
-        raise HTTPException(status_code=502, detail=WRITEUP_UNAVAILABLE_DETAIL)
-
-    writeup = "".join(
-        block.text for block in response.content if getattr(block, "type", None) == "text"
-    ).strip()
-    # NOTE: deliberately no markdown stripping here. content-studio's closing is
-    # "***Your Vision. Your Legacy.***" -- stripping ** would mangle it -- and the prompt
-    # already forbids stray headers/bullets, so there's nothing to clean.
-
-    if not writeup:
-        logger.warning("generate-writeup came back empty for agent %s", agent["id"])
-        raise HTTPException(status_code=502, detail=WRITEUP_UNAVAILABLE_DETAIL)
-
-    # Same guards the saved-listing path uses: strip any house/unit number the model
-    # echoed (price=None -> price guard is a no-op, there's no price in this request),
-    # then the stray-street backstop.
-    writeup = apply_listing_copy_guards(writeup, price=None, built_up=req.built_up, context=f"writeup:{agent['id']}")
-    writeup = _strip_stray_street_names(writeup, context=f"writeup:{agent['id']}")
 
     # Record a successful generation against the per-worker hourly quota (see F2/F3
     # rationale on _generate_writeup_hits). Only successes count.
@@ -2380,6 +2449,63 @@ async def extract_pdf_photos(request: Request, agent=Depends(get_current_agent))
         "skipped_graphics": extracted["skipped_graphics"],
         "skipped_duplicates": extracted["skipped_duplicates"],
     }
+
+
+def _stage_photos(agent_id: str, images: list) -> list:
+    """Upload listing photos to the shared bucket BEFORE any listing exists, returning
+    their public URLs. Same processing as _process_and_upload_images (resize to <=1920px,
+    JPEG q80) but under a listing-less `staging/{agent}/{token}/` path. The URLs are handed
+    back to the frontend and later saved onto the listing by POST /api/listings/generate.
+    Runs in a worker thread (see the endpoint) so PIL/network work never blocks the loop.
+    A photo that can't be decoded is skipped rather than failing the whole batch."""
+    supabase = get_db()
+    token = uuid.uuid4().hex
+    urls = []
+    for i, img in enumerate(images[:MAX_LISTING_PHOTOS]):
+        image_data = (img or {}).get("image_data")
+        if not image_data:
+            continue
+        try:
+            img_bytes = base64.b64decode(image_data)
+            pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+            pil_img.thumbnail((1920, 1920))
+            buffer = io.BytesIO()
+            pil_img.save(buffer, format="JPEG", quality=80)
+            buffer.seek(0)
+            filename = f"staging/{agent_id}/{token}/{i}_{uuid.uuid4().hex[:8]}.jpg"
+            supabase.storage.from_("listings-images").upload(
+                filename, buffer.read(), {"content-type": "image/jpeg", "upsert": "true"}
+            )
+            urls.append(supabase.storage.from_("listings-images").get_public_url(filename))
+        except Exception:
+            logger.exception("Could not stage one photo for agent %s (index %s) -- skipping it", agent_id, i)
+            continue
+    return urls
+
+
+@app.post("/api/listings/stage-photos")
+async def stage_photos(request: Request, agent=Depends(get_current_agent)):
+    """Upload property photos BEFORE the listing exists (the New Listing page's new
+    "Upload Property Photos" box). Body: {"images": [{"image_data": "<base64>"}, ...]}.
+    Returns {"photo_urls": [...]} -- the frontend passes these to POST /api/listings/generate
+    as `photo_urls`. Staging is STATELESS: for a large set that would exceed the ~10MB edge
+    body limit, call this several times and concatenate the returned photo_urls arrays."""
+    try:
+        body = await request.json()
+        images = body.get("images", [])
+        if not isinstance(images, list) or not images:
+            raise HTTPException(status_code=400, detail="No images provided")
+        if len(images) > MAX_LISTING_PHOTOS:
+            images = images[:MAX_LISTING_PHOTOS]
+        urls = await asyncio.to_thread(_stage_photos, agent["id"], images)
+        if not urls:
+            raise HTTPException(status_code=400, detail="Couldn't read any of those images -- please try different photos")
+        return {"photo_urls": urls}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Photo staging failed for agent %s", agent["id"])
+        raise HTTPException(status_code=500, detail="Something went wrong uploading these photos -- please try again")
 
 
 @app.post("/api/listings/{listing_id}/upload-images")
