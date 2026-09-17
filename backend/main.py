@@ -2457,8 +2457,11 @@ async def extract_pdf_photos(request: Request, agent=Depends(get_current_agent))
 # F2: byte caps enforced BEFORE decoding, so a huge upload can't buffer into memory
 # and OOM a worker (taking unrelated requests on it down with it). base64 inflates the
 # wire size ~33%, so these caps are on the base64 payload.
-MAX_STAGE_REQUEST_BYTES = 30 * 1024 * 1024   # whole batch (~22MB of actual image bytes)
-MAX_STAGE_IMAGE_B64 = 12 * 1024 * 1024        # one image (~9MB decoded)
+MAX_STAGE_REQUEST_BYTES = 10 * 1024 * 1024   # whole batch; kept near the edge proxy's own
+                                             # ~10MB body limit so the app returns a clean 413
+                                             # for anything that slips through, and worst-case
+                                             # per-request buffering stays ~10MB under load.
+MAX_STAGE_IMAGE_B64 = 8 * 1024 * 1024         # one image (~6MB decoded)
 # F3: bound how many staging requests do heavy PIL/upload work at once, so staging can't
 # saturate the default thread pool it shares with enhance/poster/video under load.
 _STAGING_CONCURRENCY = asyncio.Semaphore(4)
