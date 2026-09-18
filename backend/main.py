@@ -418,6 +418,12 @@ class ListingRequest(BaseModel):
     # MULTIMODALLY (fields + photos) and the photos are saved on the new listing.
     # When absent/empty, generation is text-only -- EXACTLY the original behavior.
     photo_urls: list[str] = Field(default_factory=list, max_length=60)
+    # OPTIONAL, backward-compatible: the Singapore postal district as a string number
+    # ("15"), from the New Listing District dropdown. When present it TAKES PRECEDENCE
+    # over the location-derived token for the write-up's {district} placeholder. Absent/
+    # empty -> falls back to _extract_district_token(location) exactly as before. We never
+    # guess the district from the street, so a blank here yields "Singapore", not a guess.
+    district: str = Field(default="", max_length=8)
 
 class ListingContentRequest(BaseModel):
     content: str
@@ -1413,7 +1419,8 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     vision_urls = photo_urls[:WRITEUP_MAX_IMAGES]      # subset actually sent to the vision model
 
     if listing_images:
-        district_str = _writeup_district_str(req.location)
+        # Precedence: explicit agent-selected district (1-28) > location-derived token > "Singapore".
+        district_str = _resolve_writeup_district(req.district, req.location)
         try:
             listing_text = await _generate_writeup_from_photos(
                 agent, req, vision_urls, district_str,
@@ -1724,12 +1731,36 @@ def _strip_stray_street_names(text: str, context: str = "writeup") -> str:
         return text
 
 
+def _normalize_district(value) -> str:
+    """Coerce a district value to a canonical string number in Singapore's 1-28 range,
+    or "" if it isn't a valid district. Accepts "15", "D15", "District 15", 15, etc.
+    Anything out of range or unparseable -> "" (never a guess, never out-of-range)."""
+    if value is None:
+        return ""
+    m = re.search(r"\d{1,2}", str(value))
+    if not m:
+        return ""
+    n = int(m.group(0))
+    return str(n) if 1 <= n <= 28 else ""
+
+
 def _writeup_district_str(location: str) -> str:
     """District-only area label for the write-up prompt -- NEVER the street. Yields
     "District 15" when the location carries a district, else a neutral "Singapore"."""
     token = _extract_district_token(location)
     m = re.fullmatch(r"D(\d+)", token or "")
     return f"District {m.group(1)}" if m else "Singapore"
+
+
+def _resolve_writeup_district(explicit_district, location: str) -> str:
+    """Precedence for the write-up's {district}: an explicit, valid agent-selected
+    district (1-28) WINS; otherwise fall back to the location-derived token (which yields
+    "District N" only if the location literally says so, else "Singapore"). We never
+    derive the district from a street name -- a wrong district would be a misrepresentation."""
+    d = _normalize_district(explicit_district)
+    if d:
+        return f"District {d}"
+    return _writeup_district_str(location)
 
 
 async def _generate_writeup_from_photos(agent, req, vision_urls, district_str, context, price=None):
@@ -3836,9 +3867,11 @@ async def extract_listing_image(request: Request):
   "plot_width": number in metres or 0,
   "plot_depth": number in metres or 0,
   "storeys": number or 0,
-  "site_coverage": number as percentage or 0
+  "site_coverage": number as percentage or 0,
+  "district": "Singapore postal district as a plain number 1-28, e.g. 15, or \"\" if not shown"
 }
 Do not guess or estimate any value that is not clearly shown or stated in the images. If a field cannot be determined from the images, use "" for text fields and 0 for number fields.
+For district specifically: return the Singapore postal district ONLY as a bare number 1-28 (e.g. "15"), and ONLY when the screenshot explicitly shows it -- e.g. a "District 15" label, a "D15" tag, or a postal-district field. Do NOT infer or guess the district from the street name, area/neighbourhood name, or postal code; a wrong district is a misrepresentation of the property, so if no district is explicitly shown, return "" and leave it for the agent to select.
 For property_type specifically: if any image contains an explicit official/source "Property Type" field or code, use that over your own inference from the general description — e.g. "CT" means Corner Terrace, "IT" or "ITR" means Inter-Terrace, "SD" means Semi-Detached, "DB" means Detached/Bungalow, "GCB" means Good Class Bungalow (GCB), "PH" means Penthouse. Inter-Terrace and Corner Terrace are frequently confused — an explicit source field always wins over inferring from land size or description text. If no image states or clearly implies a specific property type at all (no field, code, or explicit description), return "" for property_type rather than guessing from land size, price, or general impression — Corner Terrace, Inter-Terrace, and Semi-Detached can have very similar land sizes and are not reliably distinguishable from size alone, so leaving this blank for the agent to confirm is strongly preferred over a wrong guess.
 For land_size and built_up specifically: these must be the raw size figure shown directly in or immediately after the "Land Size" / "Built-Up Size" (or "Estm. Land Size" / "Estm. Build-Up Size") field itself, typically followed by a unit like "sqft". Many source screenshots also show a separate small badge or chip positioned near that same field labeled "PSF" (price per square foot, e.g. "3,157 PSF") — this PSF number is a completely different figure and must NEVER be used as land_size or built_up, even when it sits close to, overlapping, or immediately beside the size number. For example, if a screenshot shows "Estm. Land Size (SQFT): 3003" next to a badge reading "3,157 PSF", land_size is 3003, not 3157 — read the digits under the size label, not the digits under or next to the PSF badge. Before finalizing, sanity-check that price divided by land_size (or built_up) is a plausible PSF for the property type and location shown — if it looks off by roughly an order of magnitude, or if land_size/built_up looks suspiciously close to a PSF figure visible elsewhere in the image, re-read the image and correct it rather than outputting the PSF value by mistake.
 Return only valid JSON, nothing else."""
@@ -3853,6 +3886,10 @@ Return only valid JSON, nothing else."""
         text = message.content[0].text.strip()
         clean = text.replace("```json", "").replace("```", "").strip()
         extracted = json.loads(clean)
+        # Normalize district to a clean string number 1-28 (or "") so the frontend's
+        # District dropdown gets a predictable value and never an out-of-range guess.
+        # Always present in the response, even if the model omitted it.
+        extracted["district"] = _normalize_district(extracted.get("district"))
         return extracted
 
     except Exception as e:
