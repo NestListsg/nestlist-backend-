@@ -207,6 +207,8 @@ async def startup_event():
     asyncio.create_task(sweep_staging_loop())
     # Backgrounded so a slow database can't hold up the port binding.
     asyncio.create_task(asyncio.to_thread(_probe_images_cas_encoding))
+    # Detect whether the optional `district` column exists (gates district persistence).
+    asyncio.create_task(asyncio.to_thread(_probe_district_column))
     await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
     await register_telegram_webhook()
 
@@ -1479,6 +1481,12 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     # no window where the listing exists without its photos (no half-created listing).
     if listing_images:
         insert_payload["images"] = listing_images
+    # Persist the agent-selected district (drives the outward district_label). Guarded on the
+    # column probe so a not-yet-migrated DB can never break the (non-idempotent) insert.
+    if _district_column_supported:
+        _d = _normalize_district(req.district)
+        if _d:
+            insert_payload["district"] = _d
     saved = await db_execute_async(lambda db: db.table("listings").insert(insert_payload), what="generate_listing listings insert", idempotent=False)
 
     listing_row = saved.data[0]
@@ -1761,6 +1769,42 @@ def _resolve_writeup_district(explicit_district, location: str) -> str:
     if d:
         return f"District {d}"
     return _writeup_district_str(location)
+
+
+def _listing_district_label(listing) -> str:
+    """The ONLY location signal any OUTWARD / buyer-facing surface may show. Precedence:
+    stored `district` (the New Listing dropdown, "1".."28") -> _extract_district_token(location)
+    -> "" (empty -> show nothing). NEVER the street or house number: the road stays private
+    to the authed agent, and a district guessed from a street would misrepresent the property.
+    (Distinct from _writeup_district_str, whose final fallback is the neutral word "Singapore";
+    outward *location* surfaces fall back to empty instead, so nothing stands in for the road.)"""
+    src = listing if isinstance(listing, dict) else {}
+    d = _normalize_district(src.get("district"))
+    if d:
+        return f"District {d}"
+    token = _extract_district_token(src.get("location"))
+    m = re.fullmatch(r"D(\d+)", token or "")
+    return f"District {m.group(1)}" if m else ""
+
+
+# Whether the listings table has the new `district` column (the New Listing dropdown value).
+# Probed once at startup; until it is confirmed present we simply do NOT write district, so a
+# missing column can never break the (non-idempotent) listing insert. Once the column is added
+# -- ALTER TABLE listings ADD COLUMN IF NOT EXISTS district text; -- a redeploy/restart flips
+# this to True and district persistence turns on with no further code change.
+_district_column_supported = False
+
+
+def _probe_district_column():
+    global _district_column_supported
+    try:
+        get_db().table("listings").select("district").limit(1).execute()
+        _district_column_supported = True
+        logger.info("listings.district column present -- district persistence enabled")
+    except Exception:
+        _district_column_supported = False
+        logger.warning("listings.district column NOT present -- district not persisted yet "
+                       "(add it: ALTER TABLE listings ADD COLUMN IF NOT EXISTS district text;)")
 
 
 async def _generate_writeup_from_photos(agent, req, vision_urls, district_str, context, price=None):
@@ -3113,13 +3157,12 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
     bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
 
-    # Posters/videos only ever draw the district token ("DISTRICT 15"), never the
-    # street line -- but the location is sanitized first anyway so a house number
-    # can never reach on-image text if this ever starts drawing more of it.
-    poster_location = _strip_house_number(listing.get("location"))
-    district_match = re.search(r"district\s*\d+", poster_location, re.IGNORECASE)
+    # Posters only ever draw the DISTRICT ("DISTRICT 15"), never the street line. Uses the
+    # stored district (or the location token), never any part of the road -- same
+    # hide-the-road rule as the public page; empty when there's no district.
+    district_label = _listing_district_label(listing)
     property_type_text = (listing.get("property_type") or "").upper()
-    district_text = district_match.group(0).upper() if district_match else ""
+    district_text = district_label.upper() if district_label else ""
 
     stats = [
         f"{bedrooms_val} Rooms" if bedrooms_val else "",
@@ -3242,12 +3285,11 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
         bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
         bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
 
-        # Same as the poster path: only the district token is drawn, but the
-        # location is sanitized before it is read so no house number can leak.
-        video_location = _strip_house_number(listing.get("location"))
-        district_match = re.search(r"district\s*\d+", video_location, re.IGNORECASE)
+        # Same as the poster path: only the DISTRICT is drawn, never the street. Uses the
+        # stored district (or the location token), never any part of the road.
+        district_label = _listing_district_label(listing)
         property_type_text = (listing.get("property_type") or "").upper()
-        district_text = district_match.group(0).upper() if district_match else ""
+        district_text = district_label.upper() if district_label else ""
 
         stats = [
             f"{bedrooms_val} Rooms" if bedrooms_val else "",
@@ -4045,13 +4087,19 @@ def _public_listing_payload(listing) -> dict:
         logger.error("public listing %s: agent lookup failed, serving without agent details: %s",
                      listing.get("id"), e)
         agent_info = {}
+    # PRIVACY (hide-the-road): a buyer-facing / unauthenticated response must NEVER carry
+    # the street or house number in any field. The only outward location signal is the
+    # district label ("District 15" or ""). We overwrite BOTH `location` and
+    # `display_location` with that label -- not the raw/house-number-free street -- so a
+    # competitor reading this JSON can never recover the road, regardless of which field a
+    # client reads. The full street stays only on the AUTHED agent endpoints.
+    district_label = _listing_district_label(listing)
     return {
         "id": listing["id"],
         "property_type": listing["property_type"],
-        "location": listing["location"],
-        # Buyer-facing surface: the public page should render this, not `location`.
-        # `location` is kept in the payload so nothing that already reads it breaks.
-        "display_location": _strip_house_number(listing.get("location")),
+        "district_label": district_label,
+        "location": district_label,
+        "display_location": district_label,
         "price": listing["price"],
         "content": apply_listing_copy_guards(
             listing.get("content"),
@@ -4406,10 +4454,10 @@ async def generate_enquiry_auto_reply(enquiry_id: str, agent=Depends(get_current
             logger.warning("auto-reply: listing fetch failed for %s: %s", listing_id, e)
 
     property_type = listing.get("property_type") or "the property"
-    location = listing.get("location") or ""
-    district = _extract_district_token(location)
-    # Prefer the district token ("D15"), else a house-number-free location, else neutral.
-    area_phrase = district or (_strip_house_number(location) if location else "") or "the area"
+    # Buyer-facing reply text: district-only, NEVER the street (hide-the-road). Falls back
+    # to a neutral phrase when there's no district -- never the road, not even without the
+    # house number.
+    area_phrase = _listing_district_label(listing) or "the area"
 
     buyer_name = enquiry.get("client_name") or ""
     first_name = (buyer_name.strip().split() or ["there"])[0]
@@ -4556,6 +4604,9 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
         "storeys": req.storeys,
         "site_coverage": req.site_coverage,
     }
+    # Persist the agent-selected district (guarded on the column probe, as in create).
+    if _district_column_supported:
+        update_payload["district"] = _normalize_district(req.district)
     # Discreet buyer-link code. An override sets it; otherwise we only *fill in* a
     # code when the listing has none yet -- an ordinary field edit must never
     # clobber an existing code (e.g. the demo listing's YOE). Wrapped whole so it
