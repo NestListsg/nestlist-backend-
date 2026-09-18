@@ -17,22 +17,112 @@ BROWSER_HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 }
 
-# The 39 URA-gazetted Good Class Bungalow Areas. Compound entries ("First
-# Avenue / Third Avenue") are split into individual street-name tokens so
-# each can be matched independently against a transaction's "street" field.
-GCB_AREA_TOKENS = [
-    "Belmont Park", "Cornwall Gardens", "Leedon Park", "Bin Tong Park",
-    "Dalvey Estate", "Maryland Estate", "Binjai Park", "Eng Neo Avenue",
-    "Nassim Road", "Brizay Park", "Ewart Park", "Oei Tiong Ham Park",
-    "Bukit Sedap", "First Avenue", "Third Avenue", "Queen Astrid Park",
-    "Bukit Tunggal", "Ford Avenue", "Raffles Park", "Caldecott Hill Estate",
-    "Fourth Avenue", "Sixth Avenue", "Rebecca Park", "Camden Park",
-    "Gallop Road", "Woollerton Park", "Ridley Park", "Chatsworth Park",
-    "Garlick Avenue", "Ridout Park", "Chee Hoon Avenue", "Holland Park",
-    "Swiss Club Road", "Chestnut Avenue", "Holland Rise", "Victoria Park",
-    "Cluny Hill", "Kilburn Estate", "Windsor Park", "Cluny Park",
-    "King Albert Park", "White House Park",
+# The 39 URA-gazetted Good Class Bungalow Areas mapped to their CONSTITUENT
+# STREET NAMES (not just the headline area name). This fixes the systematic
+# under-count where a sale on a street *inside* a GCBA whose name differs from
+# the area name -- e.g. "Coronation Road West" inside Queen Astrid Park, or
+# "Andrew Road" inside Caldecott Hill Estate -- was silently missed.
+#
+# ACCURACY POSTURE (a false positive misrepresents the market on a trust-
+# branded panel, so it is worse than a small under-count):
+#   * Matching is EXACT on the full street name (normalised), never substring,
+#     so "Belmont Road" can't be matched by an unrelated longer street.
+#   * A district guard (GCB_DISTRICTS below) additionally requires the txn to
+#     be in one of the five districts that contain any GCBA, which neutralises
+#     any same-name street elsewhere in Singapore.
+#   * The Detached + Land type filter (applied by the callers) already excludes
+#     every strata unit (condos/apartments), so an arterial road only risks
+#     adding a *detached-on-land* house sitting just outside the gazetted line.
+#   * Even so, arterial / mixed roads that plausibly carry non-GCBA landed
+#     stock are DELIBERATELY EXCLUDED pending authoritative confirmation
+#     (see _GCB_STREETS_EXCLUDED_PENDING_CONFIRMATION) -- they under-count
+#     rather than risk a false positive.
+#
+# Source for constituent streets: goodclassbungalows.com.sg area maps, cross-
+# checked against URA's 39-area list (area names match exactly) and against the
+# actual URA transaction "street" universe. Confidence is HIGH for streets that
+# also appear (correctly) in the live URA data; streets with no recent
+# transactions are best-effort and simply won't match until one occurs.
+GCBA_STREETS = {
+    # ---- District 10 ----
+    "Belmont Park": ["Belmont Road", "Morley Road"],
+    "Bin Tong Park": ["Bin Tong Park", "Rebecca Road"],
+    "Binjai Park": ["Binjai Hill", "Binjai Park", "Binjai Rise", "Binjai Walk"],
+    "Brizay Park": ["Brizay Park", "Wilby Road"],  # Holland Road excluded (arterial)
+    "Bukit Sedap": ["Bukit Sedap Road"],
+    "Chatsworth Park": ["Bishopsgate", "Cable Road", "Chatsworth Avenue",
+                        "Chatsworth Park", "Chatsworth Road", "Mount Echo Park",
+                        "Rochalie Drive"],
+    "Cluny Hill": ["Cluny Hill", "Cluny Park", "Lermit Road"],
+    "Cornwall Gardens": ["Belmont Road", "Cornwall Gardens", "Leedon Road"],
+    "Dalvey Estate": ["Dalvey Estate", "Dalvey Road", "Lewis Road"],
+    "Ewart Park": ["Ewart Park"],
+    "First/Third Avenue": ["First Avenue", "Third Avenue", "Namly Avenue",
+                           "Namly Close", "Namly Hill"],
+    "Ford Avenue": ["Ford Avenue"],
+    "Fourth/Sixth Avenue": ["Fourth Avenue", "Fifth Avenue", "Sixth Avenue"],
+    "Gallop Road/Woollerton Park": ["Gallop Road", "Gallop Park Road",
+                                    "Woollerton Drive", "Woollerton Park"],
+    "Garlick Avenue": ["Garlick Avenue", "Old Holland Road"],
+    "Holland Park": ["Holland Park"],  # Holland Road excluded (arterial)
+    "Holland Rise": ["East Sussex Lane", "Holland Rise"],
+    "Leedon Park": ["Leedon Park", "Leedon Road"],
+    "Maryland Estate": ["Maryland Drive"],
+    "Nassim Road": ["Nassim Road", "Ladyhill Road"],  # Fernhill Road excluded (mixed/arterial)
+    "Oei Tiong Ham Park": ["Oei Tiong Ham Park", "Jalan Harum", "Jalan Pelangi",
+                           "Jalan Sampurna"],
+    "Queen Astrid Park": ["Queen Astrid Park", "Queen Astrid Gardens",
+                          "Astrid Hill", "Coronation Road West"],
+    "Rebecca Park": ["Rebecca Road"],
+    "Ridley Park": ["Pierce Road", "Ridley Park", "Tanglin Hill"],
+    "Ridout Park": ["Peel Road", "Ridout Road", "Swettenham Road"],
+    "Victoria Park": ["Kingsmead Road", "Victoria Park", "Victoria Park Close"],
+    "White House Park": ["Dalvey Road", "Margoliouth Road", "White House Park"],
+    # ---- District 11 ----
+    "Bukit Tunggal": ["Bukit Tunggal Road"],
+    "Caldecott Hill Estate": ["Andrew Road", "Jalan Piala", "John Road",
+                              "Olive Road"],  # Lornie Road excluded (arterial)
+    "Camden Park": ["Camden Park"],
+    "Chee Hoon Avenue": ["Chee Hoon Avenue", "Dunearn Close", "Jalan Asuhan",
+                         "Ross Avenue", "University Road"],
+    "Eng Neo Avenue": ["Eng Neo Avenue"],
+    "Raffles Park": ["Ash Grove", "Cassia Drive", "Linden Drive",
+                     "Oriole Crescent", "Pinewalk", "Sunset Avenue"],
+    "Swiss Club Road": ["Ascot Rise", "Jalan Kampong Chantek", "Jalan Senandong",
+                        "Swiss Club Avenue", "Swiss Club Road"],
+    # ---- District 20 ----
+    "Windsor Park": ["Windsor Park Road"],
+    # ---- District 21 ----
+    "Kilburn Estate": ["Denham Close", "Wilmonar Avenue", "Yarwood Avenue"],
+    "King Albert Park": ["King Albert Park"],
+    # ---- District 23 ----
+    "Chestnut Avenue": ["Chestnut Avenue", "Chestnut Close", "Chestnut Crescent",
+                        "Chestnut Drive"],
+}
+
+# Streets that a source lists under a GCBA but which are arterial / mixed roads
+# with non-GCBA landed stock -- excluded to avoid false positives. Revisit if an
+# authoritative URA boundary confirms the detached-on-land plots on them are all
+# within the gazette. (Recorded so the exclusion is explicit, not accidental.)
+_GCB_STREETS_EXCLUDED_PENDING_CONFIRMATION = [
+    "Holland Road",   # major arterial, many non-GCB frontages
+    "Fernhill Road",  # near Orchard; mixed GCB / non-GCB
+    "Lornie Road",    # arterial
 ]
+
+# The five postal districts that contain any gazetted GCBA. Used as a guard so a
+# same-named street in another district can never be counted as GCB.
+GCB_DISTRICTS = {"10", "11", "20", "21", "23"}
+
+
+def _norm_street(s: str) -> str:
+    return " ".join((s or "").upper().split())
+
+# {normalised street name -> GCBA name}. Exact-match lookup.
+_GCB_STREET_TO_AREA = {}
+for _area, _streets in GCBA_STREETS.items():
+    for _s in _streets:
+        _GCB_STREET_TO_AREA.setdefault(_norm_street(_s), _area)
 
 NASSIM_ROAD_TOKEN = "nassim road"
 
@@ -126,9 +216,22 @@ async def fetch_all_transactions(access_key: str, token: str):
     return all_projects, batch_report
 
 
-def _matches_gcb_area(street: str) -> bool:
-    street_lower = (street or "").lower()
-    return any(token.lower() in street_lower for token in GCB_AREA_TOKENS)
+def _gcb_area_for(street: str, district: str = "") -> str:
+    """Return the gazetted GCBA name a transaction belongs to, or "" if none.
+    Exact (normalised) street match AND, when a district is provided, the txn
+    must be in one of the five GCBA districts -- so a same-named street in
+    another district is never miscounted."""
+    area = _GCB_STREET_TO_AREA.get(_norm_street(street), "")
+    if not area:
+        return ""
+    d = (district or "").strip().lstrip("D").lstrip("d").zfill(2) if district else ""
+    if d and d not in GCB_DISTRICTS:
+        return ""
+    return area
+
+def _street_in_gcb_whitelist(street: str) -> bool:
+    """Street-only membership (ignores district) -- for diagnostics display."""
+    return _norm_street(street) in _GCB_STREET_TO_AREA
 
 
 def survey_detached_land_streets(projects: list, window_months: int = 24) -> list:
@@ -159,7 +262,8 @@ def survey_detached_land_streets(projects: list, window_months: int = 24) -> lis
             row = agg.setdefault(street, {
                 "street": street, "count": 0,
                 "district": txn.get("district", ""),
-                "gcb_match": _matches_gcb_area(street),
+                "gcb_match": _street_in_gcb_whitelist(street),
+                "gcb_area": _GCB_STREET_TO_AREA.get(_norm_street(street), ""),
             })
             row["count"] += 1
     return sorted(agg.values(), key=lambda r: (not r["gcb_match"], -r["count"], r["street"]))
@@ -195,12 +299,18 @@ def _extract_gcb_transactions(projects: list, window_months: int = 12) -> list:
     records = []
     for project in projects:
         street = project.get("street", "")
-        if not _matches_gcb_area(street):
+        # Cheap street-level prefilter; the authoritative check (with the
+        # district guard) happens per-transaction below, since district lives
+        # on the transaction, not the project.
+        if not _street_in_gcb_whitelist(street):
             continue
         for txn in project.get("transaction", []):
             if txn.get("propertyType") != "Detached":
                 continue
             if txn.get("typeOfArea") != "Land":
+                continue
+            area = _gcb_area_for(street, txn.get("district", ""))
+            if not area:  # street matched but wrong district -> not this GCBA
                 continue
             parsed = _parse_contract_date(txn.get("contractDate", ""))
             if not parsed or not within_window(*parsed):
@@ -213,7 +323,7 @@ def _extract_gcb_transactions(projects: list, window_months: int = 12) -> list:
             if price <= 0 or area_sqm <= 0:
                 continue
             psf = price / (area_sqm * SQM_TO_SQFT)
-            records.append({"street": street, "price": price, "psf": psf})
+            records.append({"street": street, "gcb_area": area, "price": price, "psf": psf})
     return records
 
 
