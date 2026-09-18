@@ -1242,10 +1242,11 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
     return rows
 
 
-async def _generate_listing_text_only(agent, req, display_location: str) -> str:
-    """The ORIGINAL text-only listing copy path, extracted verbatim so it can be
-    reused (a) as the default when no photos are sent and (b) as the graceful
-    fallback if the multimodal write-up fails. Behavior is unchanged from before."""
+async def _generate_listing_text_only(agent, req, district_str: str) -> str:
+    """The text-only listing copy path: default when no photos are sent, and the graceful
+    fallback if the multimodal write-up fails. DISTRICT-ONLY -- it is given only the district
+    (never the street), and the rules forbid naming any road/area, so the generated prose is
+    street-free (hide-the-road)."""
     prompt = f"""You are {agent['name']} from {agent['agency']}, a specialist in {agent['specialty']}.
 Your tone: {agent.get('tone', 'Warm & Conversational')}
 You emphasise: {agent.get('emphasis', 'Lifestyle & Prestige')}
@@ -1253,7 +1254,7 @@ Your signature phrase: "{agent.get('signature', 'Where your next chapter begins.
 
 Write a property listing for:
 - Type: {req.property_type}
-- Location: {display_location}
+- District: {district_str}
 - Land size: {req.land_size:,} sqft
 - Built-up: {req.built_up:,} sqft
 - Bedrooms: {req.bedrooms}
@@ -1262,10 +1263,12 @@ Write a property listing for:
 
 Follow these rules with no exceptions:
 
-1. NEVER include a house or unit number. If Location contains one (e.g. "22G Tembeling Road",
-   "#03-04 Amber Road", "12A Jalan Sempadan"), drop it and refer only to the street or area name
-   ("Tembeling Road"). Do not invent a substitute number, and do not restate the number even once
-   for "colour."
+1. NEVER name the street, road, building, or specific neighbourhood, and NEVER include a house or
+   unit number. Refer to the location ONLY as the district shown above (e.g. "this District 15
+   home", "in District 15") -- never a road name, a "Jalan"/"Lorong"/"Drive"/"Walk" name, an estate
+   or condo name, or an area/neighbourhood name. If the District above is just "Singapore" (no
+   district known), keep the location entirely general and do not name any place at all. Do not
+   invent a street or area to fill the gap.
 
 2. Write the way a knowledgeable person would actually talk to a buyer, not the way a brochure
    does. Avoid stock real-estate phrases — "coveted", "established enclave", "prestigious address",
@@ -1273,7 +1276,7 @@ Follow these rules with no exceptions:
    word. Elegant is fine; inflated is not.
 
 3. Every descriptive claim must be traceable to something in the facts above. Do not call the
-   street "sought-after," "prestigious," or "coveted" unless a fact above actually supports it. If
+   location "sought-after," "prestigious," or "coveted" unless a fact above actually supports it. If
    you're reaching for a superlative and can't point to what earns it, describe what's concretely
    there instead — the layout, the orientation, the space, the light — rather than a status claim.
    A modest, honest line beats an impressive-sounding one that isn't backed up.
@@ -1301,14 +1304,16 @@ Write:
     return listing_text
 
 
-def _basic_listing_fallback(agent, req, display_location: str) -> str:
+def _basic_listing_fallback(agent, req, district_str: str) -> str:
     """Last-resort copy if BOTH the multimodal and the text-only Claude calls fail
     (e.g. a full Anthropic outage). Deliberately plain and built only from the given
-    facts -- no price, no house number -- so the agent still gets a usable listing
-    instead of losing it. They can regenerate or hand-edit later."""
+    facts -- no price, no house number, DISTRICT-ONLY (never the street) -- so the agent
+    still gets a usable, street-free listing instead of losing it."""
     ptype = (req.property_type or "property").strip()
-    loc = (display_location or "").strip()
-    where = f" in {loc}" if loc else ""
+    # District-only, never the street. "Singapore" is the neutral no-district fallback;
+    # treat it as "no place" so the template stays general rather than saying "in Singapore".
+    loc = (district_str or "").strip()
+    where = f" in {loc}" if loc and loc.lower() != "singapore" else ""
     bits = []
     if (req.bedrooms or "").strip():
         bits.append(f"{req.bedrooms.strip()} bedrooms")
@@ -1420,9 +1425,12 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     listing_images = photo_urls[:MAX_LISTING_PHOTOS]   # saved on the listing (all of them, capped)
     vision_urls = photo_urls[:WRITEUP_MAX_IMAGES]      # subset actually sent to the vision model
 
+    # District-only for ALL generated copy (hide-the-road): the write-up prose must never name
+    # the street/area, only the district. Precedence: explicit agent district (1-28) >
+    # location-derived token > "Singapore". Passed to every copy path below.
+    district_str = _resolve_writeup_district(req.district, req.location)
+
     if listing_images:
-        # Precedence: explicit agent-selected district (1-28) > location-derived token > "Singapore".
-        district_str = _resolve_writeup_district(req.district, req.location)
         try:
             listing_text = await _generate_writeup_from_photos(
                 agent, req, vision_urls, district_str,
@@ -1430,17 +1438,18 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
             )
         except Exception as e:
             # Never lose the agent's listing over a copy failure. Degrade: multimodal ->
-            # text-only write-up -> plain fact-based template. The listing is still
-            # created with real, price-free, house-number-free copy either way.
+            # text-only write-up -> plain fact-based template. The listing is still created
+            # with real, price-free, house-number-free, STREET-FREE copy either way.
             logger.error("multimodal write-up failed for agent %s, falling back to text-only: %s", agent["id"], e)
             try:
-                listing_text = await _generate_listing_text_only(agent, req, display_location)
+                listing_text = await _generate_listing_text_only(agent, req, district_str)
             except Exception as e2:
                 logger.error("text-only fallback ALSO failed for agent %s, using basic template: %s", agent["id"], e2)
-                listing_text = _basic_listing_fallback(agent, req, display_location)
+                listing_text = _basic_listing_fallback(agent, req, district_str)
     else:
-        # Original text-only behavior, exactly as before (no photos sent).
-        listing_text = await _generate_listing_text_only(agent, req, display_location)
+        # Text-only path (no photos) -- now DISTRICT-ONLY, same location discipline as the
+        # multimodal path.
+        listing_text = await _generate_listing_text_only(agent, req, district_str)
 
     # Discreet per-agent buyer-link code (nestlist.sg/{handle}/{code}). An
     # agent-supplied override wins (validated); otherwise it's derived from the
@@ -4069,6 +4078,51 @@ def _whatsapp_link_for(phone: str) -> str:
         digits = "65" + digits
     return f"https://wa.me/{digits}"
 
+def _own_street_forms(location: str) -> set:
+    """The distinctive spellings of THIS listing's own street, derived from its private
+    `location`: the raw value ("12 Jalan Sedap"), the house-number-stripped value
+    ("Jalan Sedap"), and the bare street core (first comma-part, minus a trailing
+    "Singapore"/6-digit postal). Precise to this one property -- no broad Singapore-street
+    regex -- so scrubbing them from outward text has no false positives on other listings."""
+    forms = set()
+    raw = str(location or "").strip()
+    if not raw:
+        return forms
+    forms.add(raw)
+    nh = (_strip_house_number(location) or "").strip()
+    if nh:
+        forms.add(nh)
+    core = re.split(r"[,\n]", nh or raw)[0].strip()
+    core = re.sub(r"\bsingapore\b.*$", "", core, flags=re.IGNORECASE).strip()
+    core = re.sub(r"\b\d{5,6}\s*$", "", core).strip(" ,")
+    if core:
+        forms.add(core)
+    # Only forms distinctive enough to be a street name -- and never a bare "District N"
+    # (that's the label we scrub TO, not a road) -- to avoid clipping legit words.
+    return {f for f in forms if len(f) >= 3 and not re.fullmatch(r"(?i)district\s*\d+", f)}
+
+
+def _scrub_own_street(text: str, location: str, district_label: str) -> str:
+    """Serve-time privacy scrub: remove THIS listing's own known street from outward text
+    (content / features), replacing it with the district label (or "the area" when no
+    district is known). Covers ALL existing and agent-edited copy with no regeneration and
+    no false positives, because it only ever removes this property's real road. Word-bounded
+    so a street token can't clip inside a legit word ("Rise" must not touch "sunrise").
+    Never raises -- on any trouble it returns the text unchanged (guards still ran on it)."""
+    if not text or not location:
+        return text
+    try:
+        replacement = district_label or "the area"
+        for form in sorted(_own_street_forms(location), key=len, reverse=True):
+            text = re.sub(r"\b" + re.escape(form) + r"\b", replacement, text, flags=re.IGNORECASE)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\s+([,.;])", r"\1", text)
+        return text
+    except Exception as e:
+        logger.error("own-street scrub failed (returning text as-is): %s", e)
+        return text
+
+
 def _public_listing_payload(listing) -> dict:
     # Shared builder for the buyer-facing listing payload. Both the by-id public
     # endpoint and the memorable /enquiry/{agent_code}/{listing_code} endpoint
@@ -4094,6 +4148,19 @@ def _public_listing_payload(listing) -> dict:
     # competitor reading this JSON can never recover the road, regardless of which field a
     # client reads. The full street stays only on the AUTHED agent endpoints.
     district_label = _listing_district_label(listing)
+    # The street lives in the PROSE too (older / photo-less / fallback / agent-edited copy
+    # named the street), and features is free text. Guard the content first (house numbers,
+    # price), then scrub THIS listing's own known street out of both content and features so
+    # nothing outward -- page or JSON -- carries the road.
+    own_location = listing.get("location")
+    public_content = apply_listing_copy_guards(
+        listing.get("content"),
+        price=listing.get("price"),
+        built_up=listing.get("built_up"),
+        context=f"public:{listing['id']}",
+    )
+    public_content = _scrub_own_street(public_content, own_location, district_label)
+    public_features = _scrub_own_street(listing.get("features"), own_location, district_label)
     return {
         "id": listing["id"],
         "property_type": listing["property_type"],
@@ -4101,17 +4168,12 @@ def _public_listing_payload(listing) -> dict:
         "location": district_label,
         "display_location": district_label,
         "price": listing["price"],
-        "content": apply_listing_copy_guards(
-            listing.get("content"),
-            price=listing.get("price"),
-            built_up=listing.get("built_up"),
-            context=f"public:{listing['id']}",
-        ),
+        "content": public_content,
         "images": listing.get("images") or [],
         "bedrooms": listing.get("bedrooms"),
         "land_size": listing.get("land_size"),
         "built_up": listing.get("built_up"),
-        "features": listing.get("features"),
+        "features": public_features,
         "agent": {"name": agent_info.get("name"), "agency": agent_info.get("agency")}
     }
 
