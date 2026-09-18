@@ -20,6 +20,7 @@ import re
 import secrets
 import hashlib
 import threading
+import fcntl
 import time
 import random
 import logging
@@ -188,12 +189,47 @@ async def create_claude_message(**kwargs):
         client = anthropic.AsyncAnthropic(api_key=backup_key)
         return await client.messages.create(**kwargs)
 
+# With `uvicorn --workers 4` the startup event runs in EVERY worker, so a naive
+# background loop fires 4x per cycle (4x URA token mints + 4x fetches + 4x upserts).
+# A POSIX advisory file lock elects exactly one worker to own the daily refresh.
+# The lock releases automatically when that worker's process dies, so a respawned
+# worker can reclaim it -- no stuck state after a crash or redeploy.
+_refresh_loop_lock_fh = None
+
+def _acquire_refresh_singleton() -> bool:
+    global _refresh_loop_lock_fh
+    try:
+        fh = open("/tmp/nestlist_market_pulse_refresh.lock", "w")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _refresh_loop_lock_fh = fh  # keep the fd open for the life of the process
+        return True
+    except OSError:
+        return False
+
 async def refresh_market_pulse_loop():
     while True:
         try:
-            stats = await ura_market_pulse.refresh_market_pulse()
-            if stats:
-                await db_execute_async(lambda db: db.table("market_pulse").upsert({"id": 1, **stats}), what="refresh_market_pulse_loop market_pulse upsert")
+            result = await ura_market_pulse.refresh_market_pulse()
+            if result["ok"] and result["stats"]:
+                stats = dict(result["stats"])
+                stats["partial"] = False
+                await db_execute_async(
+                    lambda db: db.table("market_pulse").upsert(_market_pulse_row(stats)),
+                    what="refresh_market_pulse_loop market_pulse upsert")
+            else:
+                # Token failure, partial fetch, or zero qualifying data -- KEEP the last
+                # known-good row instead of overwriting with an under-count under a LIVE
+                # badge. Alert with enough detail to tell an expired key apart from a
+                # dropped batch apart from a genuinely empty period.
+                if not result["token_ok"]:
+                    detail = f"URA rejected the access key/token ({result.get('error')}) -- the AccessKey likely needs renewing in Railway."
+                elif result["partial"]:
+                    failed = [b["batch"] for b in result["batch_report"] if not b["ok"]]
+                    detail = f"only {result['batches_ok']}/4 URA data batches returned (batches {failed} failed) -- keeping the last complete figures rather than saving an under-count."
+                else:
+                    detail = "no qualifying GCB transactions across all 4 batches (kept previous figures)."
+                await send_telegram_alert_throttled("market_pulse_refresh_failed",
+                    f"⚠️ <b>NestList Warning</b>\n\nMarket Pulse auto-refresh from URA did not complete: {detail}")
         except Exception as e:
             await send_telegram_alert_throttled("market_pulse_refresh_failed",
                 f"⚠️ <b>NestList Warning</b>\n\nMarket Pulse auto-refresh from URA failed: {e}\n\nThe panel will keep showing its last known values.")
@@ -202,7 +238,10 @@ async def refresh_market_pulse_loop():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(monitor_api_key())
-    asyncio.create_task(refresh_market_pulse_loop())
+    if _acquire_refresh_singleton():
+        asyncio.create_task(refresh_market_pulse_loop())
+        logger.info("This worker owns the Market Pulse daily refresh loop.")
+    asyncio.create_task(asyncio.to_thread(_probe_market_pulse_columns))
     # Reclaims abandoned staged photos (reference-aware; never touches a live listing).
     asyncio.create_task(sweep_staging_loop())
     # Backgrounded so a slow database can't hold up the port binding.
@@ -1814,6 +1853,35 @@ def _probe_district_column():
         _district_column_supported = False
         logger.warning("listings.district column NOT present -- district not persisted yet "
                        "(add it: ALTER TABLE listings ADD COLUMN IF NOT EXISTS district text;)")
+
+
+# Freshness metadata (day-precision refreshed_at + partial flag) needs two extra
+# columns on market_pulse. Probe-guarded exactly like listings.district so an
+# un-migrated DB can never break the upsert (unknown-column error) -- the metadata
+# just isn't persisted until the migration runs.
+_market_pulse_columns_supported = False
+
+def _probe_market_pulse_columns():
+    global _market_pulse_columns_supported
+    try:
+        get_db().table("market_pulse").select("refreshed_at,partial").limit(1).execute()
+        _market_pulse_columns_supported = True
+        logger.info("market_pulse.refreshed_at/partial columns present -- freshness metadata enabled")
+    except Exception:
+        _market_pulse_columns_supported = False
+        logger.warning("market_pulse.refreshed_at/partial columns NOT present -- freshness metadata "
+                       "not persisted yet (add them: ALTER TABLE market_pulse "
+                       "ADD COLUMN IF NOT EXISTS refreshed_at text, "
+                       "ADD COLUMN IF NOT EXISTS partial boolean;)")
+
+def _market_pulse_row(stats: dict) -> dict:
+    """Build the id=1 upsert payload, dropping freshness columns the DB doesn't
+    have yet so a not-yet-migrated market_pulse table can never break the write."""
+    row = {"id": 1, **stats}
+    if not _market_pulse_columns_supported:
+        row.pop("refreshed_at", None)
+        row.pop("partial", None)
+    return row
 
 
 async def _generate_writeup_from_photos(agent, req, vision_urls, district_str, context, price=None):
@@ -3941,6 +4009,8 @@ def get_market_pulse():
         "gcb_largest": "SGD 148M",
         "nassim_range": "SGD 2,500-4,000 psf",
         "last_updated": "Jan 2026",
+        "refreshed_at": None,
+        "partial": False,
         "source": "manual"
     }
 
@@ -3950,8 +4020,10 @@ async def update_market_pulse(request: Request, agent=Depends(get_current_agent)
         raise HTTPException(status_code=403, detail="Not authorised")
     body = await request.json()
     body["last_updated"] = date.today().strftime("%b %Y")
+    body["refreshed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    body["partial"] = False
     body["source"] = "manual"
-    await db_execute_async(lambda db: db.table("market_pulse").upsert({"id": 1, **body}), what="update_market_pulse market_pulse upsert")
+    await db_execute_async(lambda db: db.table("market_pulse").upsert(_market_pulse_row(body)), what="update_market_pulse market_pulse upsert")
     return {"success": True}
 
 @app.post("/api/market-pulse/refresh")
@@ -3960,11 +4032,53 @@ async def trigger_market_pulse_refresh(agent=Depends(get_current_agent)):
         raise HTTPException(status_code=403, detail="Not authorised")
     if not os.environ.get("URA_ACCESS_KEY", ""):
         raise HTTPException(status_code=400, detail="URA_ACCESS_KEY is not set in Railway yet")
-    stats = await ura_market_pulse.refresh_market_pulse()
-    if not stats:
-        raise HTTPException(status_code=502, detail="No qualifying GCB transactions found in the past 12 months, or the URA request failed")
-    await db_execute_async(lambda db: db.table("market_pulse").upsert({"id": 1, **stats}), what="trigger_market_pulse_refresh market_pulse upsert")
-    return stats
+    result = await ura_market_pulse.refresh_market_pulse()
+
+    # Distinct, actionable failures instead of one generic 502 -- and critically,
+    # NEVER overwrite the last complete figures with a partial/failed fetch.
+    if not result["token_ok"]:
+        raise HTTPException(status_code=502, detail=(
+            f"URA rejected the access key or token request ({result.get('error')}). "
+            "The URA AccessKey most likely needs renewing in Railway."))
+    if result["partial"]:
+        failed = [b["batch"] for b in result["batch_report"] if not b["ok"]]
+        raise HTTPException(status_code=502, detail=(
+            f"URA returned only {result['batches_ok']}/4 data batches (batches {failed} failed). "
+            "Refusing to overwrite the panel with an incomplete under-count -- the existing "
+            "figures are kept. Please try again shortly."))
+    if not result["ok"] or not result["stats"]:
+        raise HTTPException(status_code=502, detail=(
+            "All 4 URA batches were fetched but no qualifying GCB (Detached/Land) "
+            "transactions were found in the trailing 12 months."))
+
+    stats = dict(result["stats"])
+    stats["partial"] = False
+    await db_execute_async(lambda db: db.table("market_pulse").upsert(_market_pulse_row(stats)), what="trigger_market_pulse_refresh market_pulse upsert")
+    # Return the saved row plus a light diagnostic so the UI/caller can confirm freshness.
+    return {**stats, "batches_ok": result["batches_ok"], "raw_projects": result["raw_projects"]}
+
+@app.get("/api/market-pulse/diagnostics")
+async def market_pulse_diagnostics(agent=Depends(get_current_agent)):
+    """Admin-only raw-truth probe. Runs the full URA fetch WITHOUT saving and
+    reports token validity + per-batch outcomes + the computed stats, so a
+    stuck or under-counted panel can be root-caused directly against
+    production. Never exposes the AccessKey."""
+    if agent["email"] != "leesbjane@gmail.com":
+        raise HTTPException(status_code=403, detail="Not authorised")
+    if not os.environ.get("URA_ACCESS_KEY", ""):
+        return {"configured": False, "detail": "URA_ACCESS_KEY not set in Railway"}
+    result = await ura_market_pulse.refresh_market_pulse()
+    return {
+        "configured": True,
+        "token_ok": result["token_ok"],
+        "batches_ok": result["batches_ok"],
+        "partial": result["partial"],
+        "raw_projects": result["raw_projects"],
+        "batch_report": result["batch_report"],
+        "computed_stats": result["stats"],
+        "would_save": result["ok"],
+        "error": result["error"],
+    }
 
 @app.post("/api/cma/generate")
 async def generate_cma_report(req: CMARequest, agent=Depends(get_current_agent)):

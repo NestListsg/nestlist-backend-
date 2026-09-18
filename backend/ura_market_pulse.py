@@ -3,7 +3,7 @@ import json
 import os
 import re
 import httpx
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 TOKEN_URL = "https://eservice.ura.gov.sg/uraDataService/insertNewToken/v1"
 TRANSACTION_URL = "https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1"
@@ -77,27 +77,53 @@ async def get_token(access_key: str) -> str:
         return token
 
 
-async def fetch_all_transactions(access_key: str, token: str) -> list:
+async def fetch_all_transactions(access_key: str, token: str):
     """Fetch all 4 batches of PMI_Resi_Transaction (split by postal district
-    ranges) and return the merged list of project entries."""
+    ranges). GCB areas live in specific districts (D10/D11/D21/D23 etc.) that
+    fall in specific batches, so a single dropped batch silently removes whole
+    GCB areas and produces an under-count that still *looks* like a valid,
+    smaller market.
+
+    Every batch is therefore attempted independently -- one failing batch no
+    longer aborts the whole fetch, and instead of vanishing silently each
+    batch's outcome is recorded. The caller uses the report to reject a
+    partial fetch rather than persist an under-count as if it were complete.
+
+    Returns (all_projects, batch_report), where batch_report is a list of
+    {"batch", "ok", "status", "projects", "message"} -- one entry per batch."""
     headers = {**BROWSER_HEADERS, "AccessKey": access_key, "Token": token}
     all_projects = []
+    batch_report = []
     async with httpx.AsyncClient(timeout=60) as client:
         for batch in (1, 2, 3, 4):
-            data = await _get_json_with_retry(
-                client, TRANSACTION_URL,
-                params={"service": "PMI_Resi_Transaction", "batch": batch},
-                headers=headers,
-            )
-            if data.get("Status") == "Success":
-                all_projects.extend(data.get("Result", []))
-            else:
-                # Don't let one failed batch silently make results look
-                # sparser than reality -- this is visible in Railway logs
-                # so a "no matching transactions" report can be told apart
-                # from a genuine data gap during troubleshooting.
-                print(f"URA batch {batch} did not return Success: {data.get('Message')}")
-    return all_projects
+            try:
+                data = await _get_json_with_retry(
+                    client, TRANSACTION_URL,
+                    params={"service": "PMI_Resi_Transaction", "batch": batch},
+                    headers=headers,
+                )
+                status = data.get("Status")
+                if status == "Success":
+                    projects = data.get("Result", []) or []
+                    all_projects.extend(projects)
+                    batch_report.append({"batch": batch, "ok": True, "status": status,
+                                         "projects": len(projects), "message": None})
+                else:
+                    # Valid JSON but not a success (rate-limit, token expiry mid-run,
+                    # a URA-side error). Previously this was printed and skipped, which
+                    # is exactly how a partial fetch got saved as if it were complete.
+                    msg = data.get("Message")
+                    print(f"URA batch {batch} did not return Success: {msg}")
+                    batch_report.append({"batch": batch, "ok": False, "status": status or "Unknown",
+                                         "projects": 0, "message": msg})
+            except Exception as e:
+                # A raising batch (empty body after retries, HTTP error, timeout) must
+                # not abort the other three -- record it and carry on so batch_report
+                # reflects exactly which districts we actually received.
+                print(f"URA batch {batch} failed: {e}")
+                batch_report.append({"batch": batch, "ok": False, "status": "Exception",
+                                     "projects": 0, "message": str(e)[:300]})
+    return all_projects, batch_report
 
 
 def _matches_gcb_area(street: str) -> bool:
@@ -181,6 +207,11 @@ def compute_market_pulse_stats(projects: list) -> dict:
         "gcb_largest": _format_sgd(largest["price"]),
         "nassim_range": nassim_range,
         "last_updated": date.today().strftime("%b %Y"),
+        # Day-precision UTC timestamp of THIS successful computation. `last_updated`
+        # is month-only and so can't tell a fresh pull apart from a weeks-old snapshot
+        # within the same month -- `refreshed_at` is what the UI should trust for
+        # freshness ("as of 18 Sep 2026", stale-after-N-days badge).
+        "refreshed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": "ura_api",
     }
 
@@ -341,7 +372,7 @@ async def generate_cma(street_keyword: str, property_type: str = "", land_size_s
     if not access_key:
         raise RuntimeError("URA_ACCESS_KEY not configured")
     token = await get_token(access_key)
-    projects = await fetch_all_transactions(access_key, token)
+    projects, _batch_report = await fetch_all_transactions(access_key, token)
     records = extract_comparable_transactions(projects, street_keyword, property_type, window_months)
     stats = compute_cma_stats(records, land_size_sqft)
     stats["street_keyword"] = street_keyword
@@ -351,12 +382,51 @@ async def generate_cma(street_keyword: str, property_type: str = "", land_size_s
     return stats
 
 async def refresh_market_pulse() -> dict:
-    """Full refresh cycle: token -> fetch -> filter -> compute. Returns the
-    stats dict to upsert, or None if URA_ACCESS_KEY isn't set or no
-    qualifying transactions were found (caller should keep prior values)."""
+    """Full refresh cycle with diagnostics: token -> fetch (4 batches) ->
+    filter -> compute. Never raises for a URA-side problem; instead returns a
+    structured result the caller inspects:
+
+        {
+          "ok":           bool,      # True ONLY if all 4 batches succeeded and stats computed
+          "stats":        dict|None, # the row to persist (present whenever computable)
+          "partial":      bool,      # <4 batches succeeded -> under-count, must NOT be saved as live
+          "batches_ok":   int,       # 0..4
+          "batch_report": list,      # per-batch {batch, ok, status, projects, message}
+          "raw_projects": int,       # merged project entries across succeeded batches
+          "token_ok":     bool,      # False => AccessKey invalid/expired or token endpoint down
+          "error":        str|None,  # set on config/token failure
+        }
+
+    Reliability rule (the fix for "stuck at 5 units"): a partial fetch returns
+    fewer GCB areas than reality, so it is treated as a FAILURE. The caller
+    keeps the last known-good row rather than overwriting it with an
+    under-count that would still wear the LIVE badge."""
+    result = {
+        "ok": False, "stats": None, "partial": False, "batches_ok": 0,
+        "batch_report": [], "raw_projects": 0, "token_ok": False, "error": None,
+    }
     access_key = os.environ.get("URA_ACCESS_KEY", "")
     if not access_key:
-        return None
-    token = await get_token(access_key)
-    projects = await fetch_all_transactions(access_key, token)
-    return compute_market_pulse_stats(projects)
+        result["error"] = "URA_ACCESS_KEY not set"
+        return result
+
+    try:
+        token = await get_token(access_key)
+        result["token_ok"] = True
+    except Exception as e:
+        # get_token raises on Status != "Success" -- i.e. "Invalid Access Key".
+        # This is the definitive "the key needs renewing" signal.
+        result["error"] = str(e) or "URA token request failed"
+        return result
+
+    projects, batch_report = await fetch_all_transactions(access_key, token)
+    batches_ok = sum(1 for b in batch_report if b["ok"])
+    result["batch_report"] = batch_report
+    result["batches_ok"] = batches_ok
+    result["raw_projects"] = len(projects)
+    result["partial"] = batches_ok < 4
+
+    stats = compute_market_pulse_stats(projects)
+    result["stats"] = stats  # exposed for diagnostics even when incomplete
+    result["ok"] = (batches_ok == 4 and stats is not None)
+    return result
