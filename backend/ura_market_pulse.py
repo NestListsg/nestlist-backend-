@@ -297,6 +297,7 @@ def _extract_gcb_transactions(projects: list, window_months: int = 12) -> list:
         return 0 <= months_ago < window_months
 
     records = []
+    seen = set()  # de-dupe identical URA records (same sale reported twice)
     for project in projects:
         street = project.get("street", "")
         # Cheap street-level prefilter; the authoritative check (with the
@@ -322,6 +323,13 @@ def _extract_gcb_transactions(projects: list, window_months: int = 12) -> list:
                 continue
             if price <= 0 or area_sqm <= 0:
                 continue
+            # URA sometimes carries the same sale twice (observed: identical
+            # street+date+price+area pairs). A full-signature key drops exact
+            # duplicates without merging genuinely distinct sales.
+            sig = (_norm_street(street), txn.get("contractDate", ""), price, round(area_sqm, 2))
+            if sig in seen:
+                continue
+            seen.add(sig)
             psf = price / (area_sqm * SQM_TO_SQFT)
             records.append({"street": street, "gcb_area": area, "price": price, "psf": psf})
     return records
