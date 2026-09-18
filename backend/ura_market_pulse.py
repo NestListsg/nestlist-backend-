@@ -131,6 +131,40 @@ def _matches_gcb_area(street: str) -> bool:
     return any(token.lower() in street_lower for token in GCB_AREA_TOKENS)
 
 
+def survey_detached_land_streets(projects: list, window_months: int = 24) -> list:
+    """Diagnostics-only: the UNIVERSE of distinct street names that carry a
+    Detached + Land transaction in the trailing window, with counts and whether
+    the current GCB token list matches them. This is how we broaden the filter
+    empirically -- rather than guessing street lists blind, we look at exactly
+    which detached-land streets URA actually reports and whitelist the ones
+    confirmed to sit inside a gazetted GCBA (a street here is a GCB *candidate*,
+    not proof -- detached houses exist outside GCBAs too)."""
+    now = datetime.utcnow()
+
+    def within_window(year, month):
+        months_ago = (now.year - year) * 12 + (now.month - month)
+        return 0 <= months_ago < window_months
+
+    agg = {}
+    for project in projects:
+        street = (project.get("street", "") or "").strip()
+        for txn in project.get("transaction", []):
+            if txn.get("propertyType") != "Detached":
+                continue
+            if txn.get("typeOfArea") != "Land":
+                continue
+            parsed = _parse_contract_date(txn.get("contractDate", ""))
+            if not parsed or not within_window(*parsed):
+                continue
+            row = agg.setdefault(street, {
+                "street": street, "count": 0,
+                "district": txn.get("district", ""),
+                "gcb_match": _matches_gcb_area(street),
+            })
+            row["count"] += 1
+    return sorted(agg.values(), key=lambda r: (not r["gcb_match"], -r["count"], r["street"]))
+
+
 def _parse_contract_date(contract_date: str):
     """'mmyy' -> (year, month), e.g. '0715' -> (2015, 7)."""
     try:
@@ -381,7 +415,7 @@ async def generate_cma(street_keyword: str, property_type: str = "", land_size_s
     stats["generated_at"] = date.today().isoformat()
     return stats
 
-async def refresh_market_pulse() -> dict:
+async def refresh_market_pulse(include_survey: bool = False) -> dict:
     """Full refresh cycle with diagnostics: token -> fetch (4 batches) ->
     filter -> compute. Never raises for a URA-side problem; instead returns a
     structured result the caller inspects:
@@ -429,4 +463,11 @@ async def refresh_market_pulse() -> dict:
     stats = compute_market_pulse_stats(projects)
     result["stats"] = stats  # exposed for diagnostics even when incomplete
     result["ok"] = (batches_ok == 4 and stats is not None)
+
+    if include_survey:
+        # Admin diagnostics only: the matched GCB records (for spot-checking every
+        # included street) plus the full detached-land street universe (for
+        # deciding what to whitelist). Kept off the normal refresh path.
+        result["gcb_records"] = _extract_gcb_transactions(projects, window_months=12)
+        result["detached_land_streets"] = survey_detached_land_streets(projects, window_months=24)
     return result

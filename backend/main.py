@@ -4067,10 +4067,10 @@ async def market_pulse_diagnostics(agent=Depends(get_current_agent)):
         raise HTTPException(status_code=403, detail="Not authorised")
     if not os.environ.get("URA_ACCESS_KEY", ""):
         return {"configured": False, "detail": "URA_ACCESS_KEY not set in Railway"}
-    result = await ura_market_pulse.refresh_market_pulse()
+    result = await ura_market_pulse.refresh_market_pulse(include_survey=True)
     return {
         "configured": True,
-        "token_ok": result["token_ok"],
+        "token_valid": result["token_ok"],
         "batches_ok": result["batches_ok"],
         "partial": result["partial"],
         "raw_projects": result["raw_projects"],
@@ -4078,6 +4078,11 @@ async def market_pulse_diagnostics(agent=Depends(get_current_agent)):
         "computed_stats": result["stats"],
         "would_save": result["ok"],
         "error": result["error"],
+        # Verification aids (admin-only): every matched GCB record so each
+        # included street can be eyeballed, and the full detached-land street
+        # universe (24mo) for deciding what to whitelist.
+        "gcb_records": result.get("gcb_records"),
+        "detached_land_streets": result.get("detached_land_streets"),
     }
 
 @app.post("/api/cma/generate")
