@@ -3858,26 +3858,6 @@ def health():
         "photo_writes_atomic": bool(_IMAGES_CAS_ENCODING),
     }
 
-@app.get("/api/telegram/debug-webhook")
-async def debug_telegram_webhook():
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    if not bot_token:
-        return {"error": "TELEGRAM_BOT_TOKEN not set"}
-    async with httpx.AsyncClient() as client:
-        response = await client.get(f"https://api.telegram.org/bot{bot_token}/getWebhookInfo", timeout=10)
-        return response.json()
-
-@app.get("/api/instagram/debug-account")
-def debug_instagram_account():
-    fb_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
-    fb_page_id = os.environ.get("FB_PAGE_ID", "")
-    if not fb_token or not fb_page_id:
-        return {"error": "FB_PAGE_ACCESS_TOKEN or FB_PAGE_ID not set"}
-    response = requests.get(
-        f"https://graph.facebook.com/v25.0/{fb_page_id}",
-        params={"fields": "instagram_business_account", "access_token": fb_token}, timeout=15)
-    return response.json()
-
 @app.post("/api/extract-listing-image")
 async def extract_listing_image(request: Request):
     try:
