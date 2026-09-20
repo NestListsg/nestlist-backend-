@@ -33,6 +33,7 @@ import video_renderer
 import ura_market_pulse
 import autoenhance
 import cloudinary_enhance
+import photo_upscale
 
 app = FastAPI()
 
@@ -248,6 +249,12 @@ async def startup_event():
     asyncio.create_task(asyncio.to_thread(_probe_images_cas_encoding))
     # Detect whether the optional `district` column exists (gates district persistence).
     asyncio.create_task(asyncio.to_thread(_probe_district_column))
+    # Background photo upscaling. Hands the module a storage-client factory rather than
+    # a client, so it always picks up a fresh connection after _reset_db(). No worker
+    # thread starts until the first photo is actually queued.
+    photo_upscale.configure(lambda: get_db().storage.from_("listings-images"))
+    logger.info("Photo upscaling at upload: %s",
+                "ENABLED" if photo_upscale.is_enabled() else "off (default)")
     await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
     await register_telegram_webhook()
 
@@ -2362,7 +2369,16 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list, app
     # Check ownership before spending 30 seconds on uploads. The old replace path
     # skipped this and just updated zero rows, so a wrong listing id looked like
     # a successful upload that vanished.
-    owner = supabase.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id).execute()
+    #
+    # Routed through db_execute (audit finding F3): this was the last unprotected
+    # PostgREST call on the upload path. Bare .execute() meant a single transport blip
+    # on the ownership read surfaced as a 500 AFTER the agent had already sat through
+    # selecting their photos -- and it left the pool poisoned for the next request on
+    # this worker. A SELECT is idempotent, so retrying it is free.
+    owner = db_execute(
+        lambda db: db.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent_id),
+        what="upload_images ownership check",
+    )
     if not owner.data:
         raise HTTPException(status_code=404, detail="Listing not found")
 
@@ -2479,8 +2495,41 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list, app
     if upload_session:
         _clear_staging(supabase, listing_id, upload_session)
 
+    # Queue background upscaling -- AFTER the commit, so only photos that actually
+    # landed on a listing can ever cost money, and so nothing here can affect whether
+    # the upload succeeded. Non-blocking and exception-proof by contract; the listing is
+    # already complete and usable, and every renderer falls back to these originals.
+    _queue_photo_upscales(listing_id, [u for u in all_urls if u in set(final_urls)])
+
     return {"success": True, "image_urls": final_urls, "committed": True,
             "staged_count": 0, "capped": capped}
+
+
+def _storage_path_from_url(url: str):
+    """Public URL -> the object path inside the listings-images bucket, or None."""
+    marker = "/listings-images/"
+    if not url or marker not in url:
+        return None
+    path = url.split(marker, 1)[1].split("?", 1)[0]
+    return path or None
+
+
+def _queue_photo_upscales(listing_id: str, urls: list):
+    """Hand freshly-committed photos to the background upscaler. Wrapped so that a
+    problem in an optional quality feature can never turn a successful upload into an
+    error the agent sees."""
+    try:
+        if not photo_upscale.is_enabled():
+            return
+        photos = []
+        for url in urls:
+            path = _storage_path_from_url(url)
+            if path:
+                photos.append((path, url))
+        photo_upscale.enqueue(listing_id, photos)
+    except Exception:
+        logger.exception("Could not queue photos for upscaling (listing %s); "
+                         "the upload itself is unaffected", listing_id)
 
 PDF_MIN_PHOTO_DIM = 400  # skip embedded logos/icons/decorative graphics smaller than this
 # Size alone does not separate photos from graphics: brochures use big solid-colour
@@ -3637,7 +3686,15 @@ def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_age
     try:
         img_bytes = base64.b64decode(req.image_data)
         pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
-        pil_img.thumbnail((800, 800))
+        # 1200, not 800. The video's closing card crops this to a SQUARE and renders it
+        # into a 620px circle (video_renderer._render_contact_card), so what matters is
+        # the SHORT edge, not the long one. thumbnail() caps the long edge, so at 800 an
+        # ordinary 3:4 phone portrait came out 600x800 -- a 600px square being stretched
+        # into a 620px circle, i.e. the card was upscaling almost every agent's portrait.
+        # A 9:16 selfie was worse still, at 450. At 1200 even a 9:16 crop yields 675px,
+        # so the circle always downsamples. Costs ~150KB more in storage per agent and
+        # needs no AI at all.
+        pil_img.thumbnail((1200, 1200))
 
         buffer = io.BytesIO()
         pil_img.save(buffer, format="JPEG", quality=85)

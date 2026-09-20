@@ -43,6 +43,8 @@ import uuid
 import requests
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
+import photo_upscale
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -202,10 +204,76 @@ CAPTION_SCRIM_FEATHER = 180         # px of fade-out above and below that core
 CAPTION_SCRIM_STEPS = 45            # strips the feather is built from (4px each)
 CAPTION_GLYPH_HEIGHT = 1.30         # Gelasio ascent+descent as a multiple of size
 
+# Output-side clarity pass, applied to each clip after it has been scaled to its final
+# 1080x1920 (sharpening the 2x working frame and then downscaling washes it straight back
+# out). CAS does the contrast-adaptive lift; the gentle unsharp adds local acutance.
+#
+# These two values are the survivors of a bake-off -- the alternatives were tested and
+# REJECTED, so do not "improve" this string without re-testing:
+#   cas=strength=1.0        speckles noise badly in dark areas (a boundary wall and pool
+#                           decking both went visibly grainy)
+#   a second stacked unsharp haloes around dark window frames, and clips both the black
+#                           and white points
+#   hqdn3d + sharpen        sharper by the metric but visibly crunchy -- it made a
+#                           person's FACE look harshly etched, which is disqualifying
+#   Richardson-Lucy deconv  genuinely the best-looking, far too slow to render per photo
+CLARITY_FILTER = "cas=strength=0.80,unsharp=9:9:1.10:5:5:0.0"
+# cas (Contrast Adaptive Sharpen) only exists in ffmpeg 4.3+. Railway installs Debian's
+# ffmpeg, which is new enough -- but an unknown filter name makes ffmpeg exit non-zero,
+# and this string goes into EVERY clip encode, so being wrong would fail every render
+# rather than degrade one. Probed once per process instead of assumed. unsharp has been
+# in ffmpeg essentially forever and is the fallback; if even that is missing, clips
+# render exactly as they did before this change.
+CLARITY_FALLBACK_FILTER = "unsharp=9:9:1.10:5:5:0.0"
+_clarity_filter_cache = None
+_clarity_lock = threading.Lock()
+
+
+def _has_ffmpeg_filter(name):
+    """True if this ffmpeg build knows `name`. Any doubt answers False."""
+    try:
+        probe = subprocess.run(["ffmpeg", "-hide_banner", "-h", f"filter={name}"],
+                               capture_output=True, timeout=TIMEOUT_PROBE)
+        out = (probe.stdout + probe.stderr).decode("utf-8", errors="replace")
+        return probe.returncode == 0 and "Unknown filter" not in out
+    except Exception as e:
+        logger.warning("could not probe ffmpeg for the %r filter (%s)", name, e)
+        return False
+
+
+def _clarity_filter():
+    """The clarity chain this ffmpeg build can actually run, worked out once."""
+    global _clarity_filter_cache
+    with _clarity_lock:
+        if _clarity_filter_cache is None:
+            if _has_ffmpeg_filter("cas"):
+                _clarity_filter_cache = CLARITY_FILTER
+            elif _has_ffmpeg_filter("unsharp"):
+                logger.warning("ffmpeg has no 'cas' filter; using unsharp alone -- "
+                               "videos will be slightly less sharp than intended")
+                _clarity_filter_cache = CLARITY_FALLBACK_FILTER
+            else:
+                logger.warning("ffmpeg has neither 'cas' nor 'unsharp'; rendering "
+                               "without the clarity pass")
+                _clarity_filter_cache = ""
+        return _clarity_filter_cache
+
+# Delivery quality. Was 18. The clarity pass above roughly doubles the bitrate a given
+# CRF needs, and at 18 that pushed a finished film to ~52MB; at 23 the same film measured
+# ~27MB with effectively identical sharpness (9.91 vs 9.89 on the greyscale-minus-blur
+# proxy). Since these videos are uploaded to Facebook, Instagram and TikTok -- all of
+# which re-encode anyway -- the extra 25MB bought nothing but upload time and storage.
+#
+# This is the single most revertible knob in the file: the clips are what get delivered
+# (the concat is a stream copy, and only the 1.25s crossfade segments are ever
+# re-encoded), so changing this number changes the delivered file directly. If dark
+# exteriors ever show banding, this is the first thing to walk back.
+DELIVERY_CRF = "23"
+
 # Identical encoder settings on every clip, so the final concat can be a stream copy
 # (no re-encode) without mismatched stream parameters.
 _ENCODE_ARGS = [
-    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+    "-c:v", "libx264", "-preset", "fast", "-crf", DELIVERY_CRF,
     "-pix_fmt", "yuv420p", "-r", str(FPS), "-vsync", "cfr", "-an",
     # A keyframe every 30 frames (1.25s), with scene detection off so the spacing is
     # exact. Style B's dissolve assembly stream-copies clip segments starting at frame
@@ -313,6 +381,33 @@ def _fetch_image(url, attempts=2):
             if attempt + 1 < attempts:
                 time.sleep(1.0)
     raise RuntimeError(f"could not fetch photo: {last_error}")
+
+
+def _fetch_listing_photo(url):
+    """A listing photo, preferring its upscaled twin when one exists.
+
+    Agents are given portal-resized ~800x600 photos, which this renderer then has to
+    STRETCH into a 2808x3840 working frame. photo_upscale stores a 4x version alongside
+    the original at upload time; using it means the working frame is DOWNSAMPLED instead,
+    which is where the measured sharpness gain comes from.
+
+    Strictly best-effort. A miss here is not an error and is not a degradation worth
+    reporting to the agent -- the original is the photo the listing has always used, and
+    a video built from it is exactly what we shipped before. Reasons a miss is normal:
+    upscaling is off, the photo predates the feature, the background job hasn't reached
+    it yet, or its upscale failed the fidelity check.
+    """
+    hires = photo_upscale.hires_url_for(url)
+    if hires:
+        try:
+            # One attempt only: the hires file either exists or it doesn't, and retrying
+            # a 404 just delays a render that is going to use the original anyway.
+            img = _fetch_image(hires, attempts=1)
+            logger.info("using the upscaled copy of a photo (%dx%d)", img.width, img.height)
+            return img
+        except Exception as e:
+            logger.debug("no upscaled copy available (%s); using the original", e)
+    return _fetch_image(url)
 
 
 def _prepare_frame(img, centering=(0.5, 0.42)):
@@ -808,6 +903,14 @@ def _kenburns_clip(frame_img, out_path, workdir, index, caption=None, caption_si
         ]
     filters.append("setsar=1")
 
+    # Clarity BEFORE the caption, deliberately. The caption is vector type drawn by
+    # drawtext at final resolution and is already perfectly crisp -- running unsharp over
+    # it would only put haloes around the letterforms. Everything above this line is the
+    # photo; everything below is overlay.
+    clarity = _clarity_filter()
+    if clarity:
+        filters.append(clarity)
+
     # drawtext reads the caption from a file rather than an inline `text=` value: the
     # caption is model-written, and inline text has to be escaped against three nested
     # parsers (shell-free argv, filtergraph, drawtext). textfile= plus expansion=none
@@ -1009,7 +1112,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
         photos = []
         for url in selected_urls:
             try:
-                photos.append(_fetch_image(url))
+                photos.append(_fetch_listing_photo(url))
             except Exception as e:
                 logger.warning("skipping unreadable photo %s: %s", url, e)
                 degradations.append("a photo could not be read and was skipped")

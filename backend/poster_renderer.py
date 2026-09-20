@@ -7,9 +7,12 @@ live at the top; template-specific layout code lives in each _render_* function.
 """
 import io
 import os
+import time
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+
+import photo_upscale
 
 W, H = 1200, 1500
 
@@ -69,10 +72,60 @@ STRIP_NAME_FONT = _load_font(INTER, 34, weight=700, opsz=16)
 STRIP_CONTACT_FONT = _load_font(INTER, 30, weight=600, opsz=14)
 
 
-def _fetch_image(url):
-    response = requests.get(url, timeout=15)
-    response.raise_for_status()
-    return Image.open(io.BytesIO(response.content))
+# Guards the video renderer already had and this one did not: an unbounded
+# requests.get() on an agent-supplied URL would happily read a mis-uploaded 200MB file
+# straight into memory, and a decompression bomb past that.
+MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024
+MAX_SOURCE_PIXELS = 80_000_000
+
+
+def _fetch_image(url, attempts=2):
+    """Downloads one photo, with a hard byte cap and one retry -- a single flaky CDN read
+    shouldn't cost the agent a whole poster."""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            with requests.get(url, timeout=(5, 25), stream=True) as response:
+                response.raise_for_status()
+                declared = response.headers.get("content-length")
+                if declared and int(declared) > MAX_DOWNLOAD_BYTES:
+                    raise ValueError(f"photo is over the {MAX_DOWNLOAD_BYTES // 1024 // 1024}MB limit")
+                buffer = io.BytesIO()
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    buffer.write(chunk)
+                    if buffer.tell() > MAX_DOWNLOAD_BYTES:
+                        raise ValueError(f"photo exceeded the {MAX_DOWNLOAD_BYTES // 1024 // 1024}MB limit while downloading")
+            buffer.seek(0)
+            img = Image.open(buffer)
+            if img.width * img.height > MAX_SOURCE_PIXELS:
+                raise ValueError(f"photo is {img.width}x{img.height}, too large to render")
+            img.load()
+            # Phone photos carry their rotation in EXIF; without this a portrait shot
+            # renders on its side.
+            return ImageOps.exif_transpose(img)
+        except Exception as e:
+            last_error = e
+            if attempt + 1 < attempts:
+                time.sleep(1.0)
+    raise RuntimeError(f"could not fetch photo: {last_error}")
+
+
+def _fetch_listing_photo(url):
+    """The property photo, preferring its upscaled twin when one exists.
+
+    A poster is 1200x1500 and _fit() crops to that aspect, so an 800x600 source is being
+    stretched roughly 2.5x -- posters gain even more from the upload-time upscale than
+    videos do, and get it for free from the same stored file.
+
+    A miss is normal and silent: the original is what posters have always used.
+    """
+    hires = photo_upscale.hires_url_for(url)
+    if hires:
+        try:
+            return _fetch_image(hires, attempts=1)
+        except Exception:
+            pass
+    return _fetch_image(url)
 
 
 def _fit(img, w, h, centering=(0.5, 0.42)):
@@ -646,7 +699,8 @@ def render_poster(property_type, district, price_text, stats, agent_name, agent_
     Empty/falsy entries are dropped from the joined stats line rather than left blank.
     template_id: one of TEMPLATES' keys; falls back to "editorial" if unknown.
     """
-    property_photo = _fetch_image(property_photo_url) if property_photo_url else None
+    property_photo = _fetch_listing_photo(property_photo_url) if property_photo_url else None
+    # The agent portrait is not a listing photo and has no hires twin -- fetched plainly.
     agent_photo = _fetch_image(agent_photo_url) if agent_photo_url else None
 
     renderer = TEMPLATES.get(template_id, _render_editorial)
