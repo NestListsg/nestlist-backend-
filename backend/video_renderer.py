@@ -258,25 +258,54 @@ def _clarity_filter():
                 _clarity_filter_cache = ""
         return _clarity_filter_cache
 
-# Delivery quality. STILL 18 -- deliberately, and this is the second time the question
-# has come up, so here is the reasoning in full.
+# Delivery quality. SETTLED AT 22 -- measured on real style B output, not inferred.
+# The banding question below has now been asked three times; the answer is in the table,
+# please do not re-litigate it from first principles a fourth time.
 #
-# There is a real saving available: on a hand-built film, CRF 23 measured ~27MB against
-# ~52MB at CRF 18, with effectively identical sharpness (9.91 vs 9.89 on the
-# greyscale-minus-blur proxy). The clarity pass above roughly doubles the bitrate a given
-# CRF needs, so something like this will eventually be worth taking.
+# The worry was legitimate: _contain_over_blur puts a large smooth darkened field behind
+# every photo, and a big flat dark gradient in every frame is the textbook 8-bit banding
+# case, which is exactly what a higher CRF provokes. An earlier 52MB->27MB measurement
+# existed but had been taken on the style A path, so it did not transfer.
 #
-# It is NOT taken yet, because that measurement was made on the style A path and does not
-# transfer to the one that ships. Style B composites every photo over a blurred, darkened
-# full-frame backdrop (_contain_over_blur), and the contact card is a second large flat
-# field -- a big smooth dark gradient in every single frame is the textbook case for
-# 8-bit banding, which is exactly what a higher CRF provokes. Raising CRF on the one
-# style that ships, justified by a number measured on the style that doesn't, is how you
-# put banding into every agent's video and only find out from a complaint.
+# MEASURED on a production style B render of the demo listing, sampling the blurred
+# backdrop above the photo (rows 120-470):
 #
-# Land it separately, measured on real style B output: encode the same listing at 18 and
-# 23, then LOOK at the pool decking and the boundary wall, not just the file size.
-DELIVERY_CRF = "18"
+#     CRF   distinct luma levels   max step between rows
+#      18           136                    0.99
+#      20           138                    0.96
+#      22           138                    0.94
+#      23           138                    0.94
+#
+# It does not degrade at all -- marginally MORE levels at higher CRF, because 18 is where
+# the detail is. Contrast-stretching the backdrop ~100x to expose contouring visually
+# shows the same faint contour pattern at EVERY setting including 18: those contours come
+# from the Gaussian blur itself, not from the encoder.
+#
+# METHOD, so this is repeatable if the blur or the backdrop treatment ever changes:
+# take a frame, crop the backdrop band above the photo, convert to luma, then (a) count
+# distinct luma levels and (b) take the maximum difference between adjacent row means.
+# Banding shows up as FEWER distinct levels and a LARGER inter-row step. Separately,
+# stretch that crop to full range and look at it -- the arithmetic can miss what the eye
+# catches, and vice versa.
+#
+# Sharpening survives compression almost entirely (same render, sampled at 3s/12s/20s):
+# the pre-clarity baseline scored 2.70/2.40/3.83; CRF 18 scored 5.72/3.63/7.99 and CRF 23
+# still scored 5.66/3.53/7.68 -- about 96% of the gain, and still roughly DOUBLE the old
+# render, so the size saving costs essentially nothing.
+#
+# Why 22 and not 23: at 18 the clarity pass pushed a real render to 19.5MB against 12.7MB
+# before it. Jane's constraints are agent upload time on mobile and Supabase storage
+# (free tier; 50 agents x 10 listings), so getting back UNDER the old 12.7MB is the goal,
+# and 22 is the mildest setting expected to do it while sitting inside the range where
+# banding was measured clean.
+#
+# STILL TO CONFIRM ON A DIRECT RENDER: the size. The 20/22/23 figures above came from
+# RE-ENCODING the 18 output, so they understate a single-pass encode -- the second pass
+# never had to carry detail the first had already discarded. The banding and sharpness
+# findings are conservative and do transfer; the sizes do not. Expect roughly 11-13MB at
+# 22, and check the contact card too, not just the backdrop -- it is a second large flat
+# field and it carries fine serif type and a phone number that have to stay legible.
+DELIVERY_CRF = "22"
 
 # Identical encoder settings on every clip, so the final concat can be a stream copy
 # (no re-encode) without mismatched stream parameters.
@@ -804,6 +833,12 @@ def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=No
     # `dissolve = (style != STYLE_A_ID)` sends it here. The first cut of this change put
     # the clarity pass in _kenburns_clip only, which is style A, which nothing reaches.
     # If you add a filter for photo quality, it belongs HERE first.
+    #
+    # The open question on this was whether unsharp would halo the hard luminance edge
+    # where the sharp photo meets its blurred backdrop. MEASURED on a production render:
+    # detail energy at the border row rose 28.54 -> 46.0 with clarity on, while the rows
+    # on the BLURRED side went down (2.42 -> 1.88 and 7.06 -> 2.74). A halo bleeds
+    # outward and would have raised those rows; it didn't. The edge is simply crisper.
     clarity = _clarity_filter()
     tail = ",".join(
         [zoompan, "setsar=1"]
