@@ -4784,11 +4784,35 @@ def delete_listing_permanently(listing_id: str, agent=Depends(get_current_agent)
     supabase = get_db()
     bucket = supabase.storage.from_("listings-images")
     try:
-        files = bucket.list(listing_id)
-        if files:
-            bucket.remove([f"{listing_id}/{f['name']}" for f in files])
+        # Supabase's list() is NOT recursive: a subfolder comes back as a pseudo-entry
+        # with no file behind it, and removing that key deletes nothing. Since photo
+        # upscaling writes enhanced copies to "{listing_id}/hires/", a flat sweep left
+        # full-resolution photographs of the client's property sitting in a PUBLIC
+        # bucket, at a URL derivable from the original's, after the agent had asked for
+        # the listing to be permanently deleted -- with both the agent and Jane believing
+        # it was gone. That is a privacy problem, not a storage leak.
+        #
+        # Swept explicitly rather than by walking arbitrary depth: we own exactly one
+        # subfolder, and a blind recursive delete over agent data is not something to
+        # write speculatively.
+        #
+        # Strictly additive to what was here before -- the top-level sweep keeps passing
+        # every listed key, including the "hires" folder pseudo-entry (removing that is
+        # the same harmless no-op it is today). Only the second prefix is new, so this
+        # cannot delete less than the previous code did.
+        targets = []
+        for prefix in (listing_id, f"{listing_id}/hires"):
+            try:
+                for entry in (bucket.list(prefix) or []):
+                    name = entry.get("name")
+                    if name:
+                        targets.append(f"{prefix}/{name}")
+            except Exception:
+                logger.exception("Could not list %s while deleting listing %s", prefix, listing_id)
+        if targets:
+            bucket.remove(targets)
     except Exception:
-        pass
+        logger.exception("Storage cleanup failed for permanently deleted listing %s", listing_id)
     try:
         bucket.remove([f"posters/{listing_id}.jpg"])
     except Exception:

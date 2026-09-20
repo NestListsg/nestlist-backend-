@@ -258,17 +258,25 @@ def _clarity_filter():
                 _clarity_filter_cache = ""
         return _clarity_filter_cache
 
-# Delivery quality. Was 18. The clarity pass above roughly doubles the bitrate a given
-# CRF needs, and at 18 that pushed a finished film to ~52MB; at 23 the same film measured
-# ~27MB with effectively identical sharpness (9.91 vs 9.89 on the greyscale-minus-blur
-# proxy). Since these videos are uploaded to Facebook, Instagram and TikTok -- all of
-# which re-encode anyway -- the extra 25MB bought nothing but upload time and storage.
+# Delivery quality. STILL 18 -- deliberately, and this is the second time the question
+# has come up, so here is the reasoning in full.
 #
-# This is the single most revertible knob in the file: the clips are what get delivered
-# (the concat is a stream copy, and only the 1.25s crossfade segments are ever
-# re-encoded), so changing this number changes the delivered file directly. If dark
-# exteriors ever show banding, this is the first thing to walk back.
-DELIVERY_CRF = "23"
+# There is a real saving available: on a hand-built film, CRF 23 measured ~27MB against
+# ~52MB at CRF 18, with effectively identical sharpness (9.91 vs 9.89 on the
+# greyscale-minus-blur proxy). The clarity pass above roughly doubles the bitrate a given
+# CRF needs, so something like this will eventually be worth taking.
+#
+# It is NOT taken yet, because that measurement was made on the style A path and does not
+# transfer to the one that ships. Style B composites every photo over a blurred, darkened
+# full-frame backdrop (_contain_over_blur), and the contact card is a second large flat
+# field -- a big smooth dark gradient in every single frame is the textbook case for
+# 8-bit banding, which is exactly what a higher CRF provokes. Raising CRF on the one
+# style that ships, justified by a number measured on the style that doesn't, is how you
+# put banding into every agent's video and only find out from a complaint.
+#
+# Land it separately, measured on real style B output: encode the same listing at 18 and
+# 23, then LOOK at the pool decking and the boundary wall, not just the file size.
+DELIVERY_CRF = "18"
 
 # Identical encoder settings on every clip, so the final concat can be a stream copy
 # (no re-encode) without mismatched stream parameters.
@@ -787,8 +795,19 @@ def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=No
     caption_alpha = (
         f"max(0,min(1,min((t-{start:.2f})/0.35,({end:.2f}-t)/0.35)))"
     )
+    # Clarity after the zoom has produced the final 1080x1920 frame and BEFORE the
+    # caption, for the same reason as style A: drawtext type is already crisp and
+    # unsharp would only halo the letterforms.
+    #
+    # This is the path that actually ships. STYLE B IS THE DEFAULT AND ONLY AGENT-FACING
+    # STYLE -- main.py's VIDEO_TEMPLATES contains "classic" alone, and
+    # `dissolve = (style != STYLE_A_ID)` sends it here. The first cut of this change put
+    # the clarity pass in _kenburns_clip only, which is style A, which nothing reaches.
+    # If you add a filter for photo quality, it belongs HERE first.
+    clarity = _clarity_filter()
     tail = ",".join(
         [zoompan, "setsar=1"]
+        + ([clarity] if clarity else [])
         + _caption_filters(caption, caption_size, workdir, index,
                            alpha_expr=caption_alpha,
                            enable_expr=f"between(t,{start:.2f},{end:.2f})")

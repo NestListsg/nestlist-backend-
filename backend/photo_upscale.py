@@ -136,14 +136,23 @@ HIRES_JPEG_QUALITY = 92
 FIDELITY_TILE = 16
 # Mean absolute difference, 0-255, between the round-tripped upscale and the source.
 #
-# CALIBRATION STATUS: the tile size above is evidence-based; this threshold is NOT yet.
-# The "faithful" baseline above was a pure LANCZOS resample, which round-trips almost
-# perfectly. A real Real-ESRGAN output adds legitimate texture everywhere, so its honest
-# baseline will sit higher than 5.4 -- how much higher is exactly what the per-photo
-# logging below is for. Set loose on purpose, above any plausible honest baseline and
-# still well under the ~35 floor of a detected hallucination. Tighten from the logs, not
-# from intuition.
+# Independently reproduced by the reliability audit, which also settled the open question
+# above: synthesised GAN texture does NOT push the honest baseline up the way I expected,
+# because the round-trip downsample is itself a low-pass and washes invented texture back
+# out. Aggressive unsharp measured 15.22 and synthetic grain 13.90 -- both comfortably
+# accepted. So the gate is neither inert nor trigger-happy. The same audit found the 64px
+# tile would have scored the redrawn "23A"->"28A" at 22.83, i.e. UNDER this threshold and
+# passing; at 16px it scores 98.12. The tile size is load-bearing, not incidental.
+#
+# KNOWN BLIND SPOT, which is the honest limit of this check: edits smaller than roughly
+# 10x15 source pixels are not detected. It catches a digit redrawn as a different digit.
+# It does not catch a stroke added to one character. Do not describe this as proof that
+# nothing was fabricated -- it is a net for gross failures, and the real safeguard
+# remains that the untouched original is always retained.
 FIDELITY_MAX_TILE_MAE = 25.0
+# Never bound in any test -- the worst observed global figure was 3.12, against this 8.0.
+# The tile gate does all the real work; this is a cheap backstop for a whole-image shift
+# (a colour cast, a gamma change) that a per-tile maximum would not single out.
 FIDELITY_MAX_GLOBAL_MAE = 8.0
 
 # --- cost guards ----------------------------------------------------------------------
@@ -225,33 +234,44 @@ _budget_used = 0
 _listing_counts = {}
 
 
-def _budget_take() -> bool:
-    """Claim one upscale from this process's monthly allowance. False means the tripwire
-    has fired and we stop spending until the month rolls over."""
+# These counters exist to cap SPEND, so they must count predictions that actually
+# happened -- never attempts. The first cut consumed both allowances before entering the
+# 429 retry loop, so a busy period burned a listing's whole allowance producing nothing:
+# ten agents uploading at once meant a 15-photo listing spent 15 of its 30, the agent
+# re-uploaded, spent the remaining 15, and that listing could then NEVER be upscaled
+# again until the process restarted. Hence the check/commit split below: _available()
+# decides whether we may spend, _commit() records that we did.
+#
+# The gap between the two is not a race in practice -- there is one worker thread per
+# process, and each process keeps its own counters.
+def _budget_available() -> bool:
+    """Is there monthly allowance left in this process? Reads only; spends nothing."""
     global _budget_month, _budget_used
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     with _budget_lock:
         if month != _budget_month:
             _budget_month, _budget_used = month, 0
-        if _budget_used >= MAX_UPSCALES_PER_MONTH:
-            return False
-        _budget_used += 1
-        return True
+        return _budget_used < MAX_UPSCALES_PER_MONTH
 
 
-def _listing_take(listing_id: str) -> bool:
+def _listing_available(listing_id: str) -> bool:
     """Per-listing cap, so a stuck client re-uploading in a loop cannot run up a bill on
-    one listing. Reset when the process restarts, which is the right trade: the cap
-    exists to bound a runaway, not to be an exact ledger."""
+    one listing. Reads only; spends nothing."""
     with _budget_lock:
-        used = _listing_counts.get(listing_id, 0)
-        if used >= MAX_UPSCALES_PER_LISTING:
-            return False
-        _listing_counts[listing_id] = used + 1
+        return _listing_counts.get(listing_id, 0) < MAX_UPSCALES_PER_LISTING
+
+
+def _commit_spend(listing_id: str):
+    """Record one prediction that Replicate actually ran (and therefore billed). Called
+    only after a prediction succeeds -- including when the result is later rejected on
+    fidelity, because we paid for that one too."""
+    global _budget_used
+    with _budget_lock:
+        _budget_used += 1
+        _listing_counts[listing_id] = _listing_counts.get(listing_id, 0) + 1
         # Cheap unbounded-growth guard: this dict only ever holds small ints.
         if len(_listing_counts) > 5000:
             _listing_counts.clear()
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -370,18 +390,29 @@ def _predict(client: httpx.Client, image_url: str, scale: int) -> str:
     # `Prefer: wait` usually returns a finished prediction. If the account slot was busy
     # the prediction is queued instead, so poll -- bounded hard by the deadline, because
     # a stuck prediction must never pin this worker thread.
+    poll_backoff = POLL_INTERVAL_SECONDS
     while prediction.get("status") not in ("succeeded", "failed", "canceled"):
         if time.monotonic() - started > PREDICT_DEADLINE_SECONDS:
             raise RuntimeError(f"prediction still {prediction.get('status')} after "
                                f"{PREDICT_DEADLINE_SECONDS}s")
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(poll_backoff)
         get_url = (prediction.get("urls") or {}).get("get")
         if not get_url:
             raise RuntimeError("prediction response carried no polling URL")
         poll = client.get(get_url, headers=_auth_headers())
         if poll.status_code == 429:
-            raise _Busy("Replicate rate-limited the status poll")
+            # A 429 HERE is rate-limiting on the status endpoint, NOT "the slot is busy".
+            # Our prediction is already running and already being billed for. Raising
+            # _Busy would send the caller back to the retry loop to start a SECOND
+            # prediction while the first was still going -- multiplying spend under
+            # exactly the contention the retry loop exists to handle. Slow down and keep
+            # polling the prediction we have; the deadline above still bounds this.
+            poll_backoff = min(poll_backoff * 2, 30)
+            logger.debug("rate-limited polling a running prediction; backing off to %ss",
+                         poll_backoff)
+            continue
         poll.raise_for_status()
+        poll_backoff = POLL_INTERVAL_SECONDS
         prediction = poll.json()
 
     if prediction.get("status") != "succeeded":
@@ -450,12 +481,15 @@ def _process_one(storage, listing_id: str, source_path: str, source_url: str):
         if scale is None:
             return f"skipped: {original.width}x{original.height} is already large enough"
 
-        if not _budget_take():
+        # Checked, not spent -- see the note above the counters.
+        if not _budget_available():
             return "skipped: monthly upscale budget reached"
-        if not _listing_take(listing_id):
+        if not _listing_available(listing_id):
             return "skipped: per-listing upscale cap reached"
 
-        # 429 is "another worker has the account's one slot", not a failure.
+        # 429 is "another worker has the account's one slot", not a failure. _Busy can
+        # only ever be raised by the CREATE call, so reaching here means no prediction
+        # was started and nothing was billed -- which is what makes retrying safe.
         backoff = BUSY_BASE_BACKOFF_SECONDS
         output_url = None
         for attempt in range(BUSY_MAX_RETRIES):
@@ -464,12 +498,15 @@ def _process_one(storage, listing_id: str, source_path: str, source_url: str):
                 break
             except _Busy:
                 if attempt + 1 >= BUSY_MAX_RETRIES:
-                    return "gave up: Replicate stayed busy"
+                    return "gave up: Replicate stayed busy (nothing spent)"
                 # Jitter matters: without it four workers retry in lockstep forever.
                 time.sleep(backoff * (0.5 + random.random()))
                 backoff = min(backoff * 2, BUSY_MAX_BACKOFF_SECONDS)
         if not output_url:
-            return "gave up: Replicate stayed busy"
+            return "gave up: Replicate stayed busy (nothing spent)"
+
+        # A prediction ran, so Replicate billed for it regardless of what we do next.
+        _commit_spend(listing_id)
 
         upscaled_bytes = _download(client, output_url)
 
