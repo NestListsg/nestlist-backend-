@@ -176,6 +176,21 @@ AUDIO_DIR = os.path.join(_HERE, "audio")
 # stray .DS_Store are excluded by not being on this list.
 AUDIO_EXTENSIONS = (".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus")
 
+# Optional, advisory track metadata: {"soft_piano.mp3": "warm", ...}. It exists so a
+# grand house and a terrace don't share a register (content-studio's mood palette --
+# see docs/classic-video-music-library-spec.md). It is NOT load-bearing: a missing
+# file, malformed JSON, an untagged track or a tier nobody is tagged with all fall
+# back to "any track in audio/ will do". Music is the most degradable stage in this
+# renderer and this must not be the thing that makes it fragile.
+TRACKS_MANIFEST = os.path.join(AUDIO_DIR, "tracks.json")
+TIER_GRAND = "grand"   # content-studio's "Grand Prestige": GCB, Detached/Bungalow, Penthouse
+TIER_WARM = "warm"     # content-studio's "Warm Home": Semi-Detached, Inter/Corner Terrace
+MUSIC_TIERS = (TIER_GRAND, TIER_WARM)
+# Substrings that promote a listing to the grand tier, tested against a lowercased
+# property_type. "semi" is checked FIRST and separately, because "Semi-Detached"
+# contains "detached" -- matching on that alone would score every semi-D as grand.
+_GRAND_TYPE_TOKENS = ("gcb", "good class", "bungalow", "detached", "penthouse")
+
 FONT_DIR = os.path.join(_HERE, "fonts")
 # Gelasio is metric-compatible with Georgia, which the prototypes used (a macOS system
 # font we cannot ship). Same string at the same size measures identically in both, so
@@ -367,7 +382,60 @@ def _music_library():
     return [os.path.join(AUDIO_DIR, name) for name in names]
 
 
-def _select_music_track(seed):
+def _music_tier(property_type):
+    """Which mood register this property sits in. Anything unconfirmed is WARM.
+
+    Blank is a common, deliberate state, not an edge case: the vision prompt in
+    main.py explicitly tells agents to leave property_type empty rather than guess
+    between similar landed types. Defaulting those to the grand tier would score
+    unconfirmed properties as prestige, which is exactly the overclaim the brand
+    cannot make -- so unknown, blank and unrecognised all land on WARM.
+    """
+    text = str(property_type or "").strip().lower()
+    if not text:
+        return TIER_WARM
+    # Order matters: "Semi-Detached" contains "detached".
+    if "semi" in text or "terrace" in text:
+        return TIER_WARM
+    if any(token in text for token in _GRAND_TYPE_TOKENS):
+        return TIER_GRAND
+    return TIER_WARM
+
+
+def _track_tiers():
+    """Filename -> tier, from audio/tracks.json. {} whenever it can't be trusted.
+
+    Every failure here is silent-but-logged and returns {}, which the caller reads
+    as "no opinion, every track is eligible". A typo in this file must never cost an
+    agent their music bed.
+    """
+    try:
+        with open(TRACKS_MANIFEST, "rb") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("music manifest %s is unreadable (%s); treating every track "
+                       "as eligible for every property type", TRACKS_MANIFEST, e)
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("music manifest %s is not a JSON object; ignoring it",
+                       TRACKS_MANIFEST)
+        return {}
+    tiers = {}
+    for name, tier in raw.items():
+        tier = str(tier or "").strip().lower()
+        if tier in MUSIC_TIERS:
+            tiers[str(name)] = tier
+        else:
+            # An unrecognised tier name is treated as "untagged" rather than dropped,
+            # so a typo widens that track's eligibility instead of silencing it.
+            logger.warning("music manifest lists %r under unknown tier %r; leaving "
+                           "that track eligible for every property type", name, tier)
+    return tiers
+
+
+def _select_music_track(seed, property_type=None):
     """Pick this listing's track. Same seed + same library -> always the same file.
 
     Determinism is the requirement, not variety-for-its-own-sake: an agent who
@@ -383,19 +451,38 @@ def _select_music_track(seed):
     keys on the track's own filename instead, so adding a track moves only the ~1/N of
     listings that land on it, and removing a track moves only the listings that had it.
     Everyone else keeps the music they had. Distribution is uniform either way.
+
+    Scoping to the tier happens BEFORE the hash, so the minimal-churn property above
+    holds within a tier. Retagging a track from one tier to the other is itself a
+    reassignment event -- it moves that track's listings out and pulls roughly 1/N of
+    the destination tier's listings in -- so tiers are worth settling before the
+    library grows, not after.
     """
     tracks = _music_library()
     if not tracks:
-        return None
-    if len(tracks) == 1:
-        return tracks[0]
+        return None, None
+    tier = _music_tier(property_type)
+    tagged = _track_tiers()
+    # A track with no usable entry stays eligible everywhere. That way an untagged
+    # file is over-used rather than unplayable, and a missing or broken manifest
+    # degrades to exactly the behaviour we had before tiers existed.
+    candidates = [p for p in tracks
+                  if tagged.get(os.path.basename(p), tier) == tier]
+    if not candidates:
+        # Nothing is tagged for this tier. Better a track from the wrong register
+        # than a silent video.
+        logger.warning("no music track is tagged for the %r tier; choosing from the "
+                       "whole library instead", tier)
+        candidates = tracks
+    if len(candidates) == 1:
+        return candidates[0], tier
     key = str(seed or "")
 
     def weight(path):
         blob = f"{key}\x00{os.path.basename(path)}".encode("utf-8")
         return hashlib.sha256(blob).digest()
 
-    return max(tracks, key=weight)
+    return max(candidates, key=weight), tier
 
 
 # ---------------------------------------------------------------------------
@@ -1190,16 +1277,20 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     circle rather than leaving an empty ring.
     music_seed: chooses the music bed from the audio/ library, deterministically --
     main.py passes the listing id, so regenerating a listing's video always brings
-    back the same track. Omitting it is safe (every listing then shares one track);
-    it only matters once audio/ holds more than one file.
+    back the same track. The candidate list is first narrowed to the property's mood
+    tier (audio/tracks.json, advisory). Omitting the seed is safe (every listing then
+    shares one track); it only matters once audio/ holds more than one file.
     copy_guard: optional callable(text, context=...) -> text. main.py passes
     apply_listing_copy_guards so captions go through the same house-number/price
     stripping as every other copy surface. Passed in rather than imported because
     main.py imports this module.
 
-    property_type / district / price_text / stats are accepted for signature
-    compatibility and are no longer drawn: the Classic tier's on-screen text is the
-    room captions, and a stats block in the same lower third would collide with them.
+    property_type / district / price_text / stats are not drawn: the Classic tier's
+    on-screen text is the room captions, and a stats block in the same lower third
+    would collide with them. district / price_text / stats are kept for signature
+    compatibility only -- but property_type is no longer inert, because it now picks
+    the music's mood register (see _music_tier). Blank is fine and common; it reads
+    as the warmer of the two registers.
     """
     if not image_urls:
         raise ValueError("At least one photo is required to generate a video")
@@ -1323,7 +1414,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             # --- music bed (degrades to silence) ---
             final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
             wrote_final = False
-            track_path = _select_music_track(music_seed)
+            track_path, music_tier = _select_music_track(music_seed, property_type)
             if track_path:
                 fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
                 audio_filter = (
@@ -1345,8 +1436,9 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                     wrote_final = True
                     # Logged on every render so "why does my video sound different
                     # from my colleague's?" is answerable from Railway's logs alone.
-                    logger.info("music bed: %s (seed %r)",
-                                os.path.basename(track_path), str(music_seed or ""))
+                    logger.info("music bed: %s (%s tier, property_type %r, seed %r)",
+                                os.path.basename(track_path), music_tier,
+                                str(property_type or ""), str(music_seed or ""))
                 except Exception as e:
                     # Covers an unreadable or corrupt track as well as a mux failure:
                     # either way the video ships, silent.
