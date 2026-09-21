@@ -135,8 +135,17 @@ MAX_VIDEO_PHOTOS = 6
 # Ceiling on renders running at once *in this worker process*. Railway runs 4 uvicorn
 # workers, so the fleet ceiling is 4x this. Renders are background jobs, so waiting is
 # cheap and far better than 50 agents each holding an ffmpeg process and taking the
-# instance down. Past the wait window the job fails with a retryable message rather
-# than queueing behind the listing's 10-minute stale-render lock.
+# instance down.
+#
+# This semaphore used to be the ONLY thing limiting concurrency, which made it the thing
+# that failed renders: past the wait window it raised "the video service is busy, try
+# again in a few minutes" and the agent was told no. Admission control now lives in
+# video_jobs, which hands out at most MAX_CONCURRENT_RENDERS Classic jobs per process,
+# so from the queued path this semaphore is never contended and is purely a backstop
+# against a future caller forgetting. When it IS contended the caller gets
+# RenderSlotBusy, which the queue understands as "put this back and try shortly" --
+# busyness never fails a job any more. The legacy in-process path (used only until the
+# video_jobs migration is run) still surfaces the old wording, unchanged.
 #
 # Set to 1 after measuring one clip render at ~800MB peak RSS (both styles, macOS).
 # At 2 the fleet worst case was 8 concurrent x ~800MB = ~6.6GB, uncomfortably close to
@@ -150,6 +159,14 @@ MAX_VIDEO_PHOTOS = 6
 MAX_CONCURRENT_RENDERS = 1
 RENDER_SLOT_WAIT_SECONDS = 240
 _RENDER_SLOTS = threading.Semaphore(MAX_CONCURRENT_RENDERS)
+
+
+class RenderSlotBusy(RuntimeError):
+    """No local render slot was free in time.
+
+    A distinct type so callers can tell "this process is full right now" apart from
+    "this render went wrong". The queue treats it as a reason to wait; it is never a
+    reason to tell an agent their video failed."""
 
 # Whole-job wall-clock budget. Past this we stop adding photos and finish with what is
 # already rendered -- a shorter video beats a listing stuck in 'rendering'.
@@ -1314,7 +1331,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     started = time.monotonic()
 
     if not _RENDER_SLOTS.acquire(timeout=RENDER_SLOT_WAIT_SECONDS):
-        raise RuntimeError(
+        raise RenderSlotBusy(
             "The video service is busy with other renders right now. Please try again "
             "in a few minutes."
         )

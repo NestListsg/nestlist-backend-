@@ -30,6 +30,7 @@ from PIL import Image as PILImage, ImageEnhance, ImageOps, ImageStat
 import fitz
 import poster_renderer
 import video_renderer
+import video_jobs
 import ura_market_pulse
 import autoenhance
 import cloudinary_enhance
@@ -255,8 +256,50 @@ async def startup_event():
     photo_upscale.configure(lambda: get_db().storage.from_("listings-images"))
     logger.info("Photo upscaling at upload: %s",
                 "ENABLED" if photo_upscale.is_enabled() else "off (default)")
+    # Durable video render queue. Wiring order matters: the module gets main's
+    # db_execute (so it inherits the retry and poisoned-pool discipline), then the
+    # Classic renderer, and only then does it probe and start consuming.
+    #
+    # 'signature' is deliberately NOT registered. Its job type, its row shape and its
+    # account-wide limit of 1 all exist in video_jobs.JOB_TYPES, but with no renderer
+    # attached no worker will ever claim one -- so the type is ready and inert until
+    # the avatar pipeline is built.
+    video_jobs.configure(db_execute)
+    video_jobs.register_renderer(video_jobs.JOB_TYPE_CLASSIC,
+                                 _classic_job_run, _classic_job_failed)
+    # Backgrounded for the same reason as the probes above: a slow database must not
+    # hold up the port binding.
+    asyncio.create_task(_start_video_queue())
     await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
     await register_telegram_webhook()
+
+
+async def _start_video_queue():
+    """Probe for the video_jobs table, and consume from it if it is there.
+
+    A failed probe is not an error -- it just means the migration has not been run yet,
+    and generate-video keeps using the old in-process path until it is."""
+    try:
+        if await asyncio.to_thread(video_jobs.probe):
+            await video_jobs.run_consumer()
+    except Exception as e:
+        logger.error("video queue consumer stopped unexpectedly (%s: %s) -- this worker "
+                     "will not pick up renders until it restarts", type(e).__name__, e)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Hand back any render this worker is holding, so a redeploy costs seconds not minutes.
+
+    Railway sends SIGTERM and then kills the process, so this is strictly best-effort and
+    is bounded accordingly. The heartbeat sweep in video_jobs is the real guarantee; this
+    is just the fast path that usually fires. Both exist on purpose -- the whole point of
+    the queue is that an interrupted render is recovered, not lost."""
+    video_jobs.begin_shutdown()
+    try:
+        await asyncio.wait_for(asyncio.to_thread(video_jobs.release_local_claims), timeout=5)
+    except Exception as e:
+        logger.warning("could not release in-flight render claims on shutdown (%s)", e)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1282,9 +1325,18 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
     # code) is added so the frontend can build the memorable enquiry link
     # nestlist.sg/enquiry/{agent_code}/{code}. Purely additive.
     owner_code = agent.get("code")
+    # Queue metadata for anything this agent currently has rendering, so My Listings can
+    # say "3rd in the queue, about four minutes" instead of showing an unexplained
+    # spinner. One indexed select that returns nothing at all in the common case of an
+    # agent with no render in flight, and it degrades to None rather than failing the
+    # whole listings page if the queue table is unreadable.
+    active_video_jobs = video_jobs.describe_active_for_agent(agent["id"])
     for row in rows:
         row["display_location"] = _strip_house_number(row.get("location"))
         row["agent_code"] = owner_code
+        progress = active_video_jobs.get(str(row.get("id"))) or {}
+        row["video_queue_position"] = progress.get("queue_position")
+        row["video_eta_seconds"] = progress.get("eta_seconds")
     return rows
 
 
@@ -3377,93 +3429,121 @@ def get_video_templates(agent=Depends(get_current_agent)):
 # polls the listing until video_status lands on 'done' or 'failed'. Status
 # lives in the DB (not process memory) because uvicorn runs multiple workers --
 # the poll may be answered by a different worker than the one rendering.
+#
+# That is still true, but the WORK no longer lives in process memory either. The render
+# is now a row in video_jobs (see that module), claimed by whichever worker has capacity
+# rather than by whichever one answered the request, and recovered rather than lost when
+# Railway redeploys mid-render. The set below only backs the legacy in-process path,
+# which runs until the video_jobs migration has been applied.
 _video_render_tasks = set()
 
-def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int):
+def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int):
+    """Render one Classic video, store it, and write the finished URL onto the listing.
+
+    Returns (video_url, degradations). Raises on failure -- deliberately, because the
+    two callers want to handle failure differently: the legacy in-process path marks the
+    listing failed immediately, while the queued path retries first and only tells the
+    agent once the job has genuinely run out of attempts. Splitting this out of
+    _render_video_job is what lets both share one renderer with zero duplicated logic,
+    and video_renderer's degradation ladder is untouched by the split -- degradations
+    still travel back with the video and are still logged, on either path.
+    """
+    # Re-read the listing at job start rather than trusting the snapshot the
+    # endpoint captured. A render takes a minute or more, and in that window the
+    # agent may well delete or reorder a photo from the same My Listings screen --
+    # rendering the stale array would put a photo they just removed into a video
+    # they are about to post. The freshest possible read is also the cheapest fix:
+    # one extra select per render. If the re-read fails (DB blip), fall back to the
+    # snapshot rather than losing the render entirely.
     try:
-        # Re-read the listing at job start rather than trusting the snapshot the
-        # endpoint captured. A render takes a minute or more, and in that window the
-        # agent may well delete or reorder a photo from the same My Listings screen --
-        # rendering the stale array would put a photo they just removed into a video
-        # they are about to post. The freshest possible read is also the cheapest fix:
-        # one extra select per render. If the re-read fails (DB blip), fall back to the
-        # snapshot rather than losing the render entirely.
-        try:
-            fresh = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="_render_video_job listings select")
-            if fresh.data:
-                listing = fresh.data[0]
-        except Exception as e:
-            logger.warning("video job %s: could not re-read listing (%s); using the queued snapshot", listing_id, e)
+        fresh = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="_render_video_job listings select")
+        if fresh.data:
+            listing = fresh.data[0]
+    except Exception as e:
+        logger.warning("video job %s: could not re-read listing (%s); using the queued snapshot", listing_id, e)
 
-        images = listing.get("images") or []
-        if not images:
-            raise RuntimeError("This listing has no photos any more -- add a photo and generate the video again.")
-        # The hero photo may have been the one deleted, which would leave photo_index
-        # pointing past the end of the shortened array.
-        if photo_index < 0 or photo_index >= len(images):
-            photo_index = 0
+    images = listing.get("images") or []
+    if not images:
+        raise RuntimeError("This listing has no photos any more -- add a photo and generate the video again.")
+    # The hero photo may have been the one deleted, which would leave photo_index
+    # pointing past the end of the shortened array.
+    if photo_index < 0 or photo_index >= len(images):
+        photo_index = 0
 
-        price_num = _to_number(listing.get("price"))
-        built_up_num = _to_number(listing.get("built_up"))
-        price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
-        bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
-        bathrooms_match = re.search(r"\d+", str(listing.get("bathrooms") or ""))
-        bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
-        bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
+    price_num = _to_number(listing.get("price"))
+    built_up_num = _to_number(listing.get("built_up"))
+    price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
+    bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
+    bathrooms_match = re.search(r"\d+", str(listing.get("bathrooms") or ""))
+    bedrooms_val = bedrooms_match.group(0) if bedrooms_match else ""
+    bathrooms_val = bathrooms_match.group(0) if bathrooms_match else ""
 
-        # Same as the poster path: only the DISTRICT is drawn, never the street. Uses the
-        # stored district (or the location token), never any part of the road.
-        district_label = _listing_district_label(listing)
-        property_type_text = (listing.get("property_type") or "").upper()
-        district_text = district_label.upper() if district_label else ""
+    # Same as the poster path: only the DISTRICT is drawn, never the street. Uses the
+    # stored district (or the location token), never any part of the road.
+    district_label = _listing_district_label(listing)
+    property_type_text = (listing.get("property_type") or "").upper()
+    district_text = district_label.upper() if district_label else ""
 
-        stats = [
-            f"{bedrooms_val} Rooms" if bedrooms_val else "",
-            f"{bathrooms_val} Baths" if bathrooms_val else "",
-            f"{built_up_num:,.0f} sqft" if built_up_num else "",
-            f"SGD {price_psf:,} psf" if price_psf else "",
-        ]
+    stats = [
+        f"{bedrooms_val} Rooms" if bedrooms_val else "",
+        f"{bathrooms_val} Baths" if bathrooms_val else "",
+        f"{built_up_num:,.0f} sqft" if built_up_num else "",
+        f"SGD {price_psf:,} psf" if price_psf else "",
+    ]
 
-        video_bytes, degradations = video_renderer.render_property_video(
-            image_urls=images,
-            property_type=property_type_text,
-            district=district_text,
-            price_text=f"SGD {_format_price_millions(listing['price'])}",
-            stats=stats,
-            agent_name=agent["name"],
-            agent_contact_line=agent.get("contact", ""),
-            style=chosen_video_template_id,
-            photo_index=photo_index,
-            agent_photo_url=agent.get("photo_url"),
-            # Picks the music bed from the audio/ library. Keyed on the listing id so
-            # a regenerated video keeps the soundtrack the agent already approved,
-            # while two listings side by side don't sound like the same template.
-            music_seed=listing_id,
-            # Room captions are model-written and burned into the video, so they go
-            # through exactly the same house-number/price stripping as every other
-            # copy surface. Passed in rather than imported because video_renderer
-            # cannot import main (main imports it).
-            copy_guard=apply_listing_copy_guards,
-        )
-        if degradations:
-            # The agent still gets a video, so this is not a failure -- but a quietly
-            # degraded render should be visible in Railway's logs, not indistinguishable
-            # from a clean one.
-            logger.warning("video %s rendered with degradations: %s", listing_id, "; ".join(degradations))
+    video_bytes, degradations = video_renderer.render_property_video(
+        image_urls=images,
+        property_type=property_type_text,
+        district=district_text,
+        price_text=f"SGD {_format_price_millions(listing['price'])}",
+        stats=stats,
+        agent_name=agent["name"],
+        agent_contact_line=agent.get("contact", ""),
+        style=chosen_video_template_id,
+        photo_index=photo_index,
+        agent_photo_url=agent.get("photo_url"),
+        # Picks the music bed from the audio/ library. Keyed on the listing id so
+        # a regenerated video keeps the soundtrack the agent already approved,
+        # while two listings side by side don't sound like the same template.
+        music_seed=listing_id,
+        # Room captions are model-written and burned into the video, so they go
+        # through exactly the same house-number/price stripping as every other
+        # copy surface. Passed in rather than imported because video_renderer
+        # cannot import main (main imports it).
+        copy_guard=apply_listing_copy_guards,
+    )
+    if degradations:
+        # The agent still gets a video, so this is not a failure -- but a quietly
+        # degraded render should be visible in Railway's logs, not indistinguishable
+        # from a clean one.
+        logger.warning("video %s rendered with degradations: %s", listing_id, "; ".join(degradations))
 
-        supabase = get_db()
-        filename = f"videos/{listing_id}.mp4"
-        supabase.storage.from_("listings-images").upload(
-            filename,
-            video_bytes,
-            {"content-type": "video/mp4", "upsert": "true"}
-        )
-        video_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
+    supabase = get_db()
+    filename = f"videos/{listing_id}.mp4"
+    supabase.storage.from_("listings-images").upload(
+        filename,
+        video_bytes,
+        {"content-type": "video/mp4", "upsert": "true"}
+    )
+    video_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
 
-        update_payload = {"video_url": video_url, "video_status": "done", "video_error": None}
-        if persist_video_template_id:
-            update_payload["video_template_id"] = chosen_video_template_id
-        db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="_render_video_job listings update")
+    update_payload = {"video_url": video_url, "video_status": "done", "video_error": None}
+    if persist_video_template_id:
+        update_payload["video_template_id"] = chosen_video_template_id
+    db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="_render_video_job listings update")
+    return video_url, degradations
+
+
+def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int):
+    """The legacy in-process render path, behaviour-for-behaviour as it was.
+
+    Still used whenever the video_jobs table is not available -- so the backend can be
+    deployed before or after Jane runs the migration and video generation keeps working
+    either way. Once the queue is live nothing calls this, and it can be deleted.
+    """
+    try:
+        _render_video_core(listing_id, agent, listing, chosen_video_template_id,
+                           persist_video_template_id, photo_index)
     except Exception as e:
         try:
             db_execute(
@@ -3475,6 +3555,96 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
             )
         except Exception:
             pass  # DB unreachable too -- the stale-lock timeout lets the agent retry
+
+
+# ---------------------------------------------------------------------------
+# The queue's view of a Classic render.
+#
+# video_jobs owns "which job runs where, and what happens when it doesn't"; this file
+# owns "what a Classic video IS and what it means for the listing row". These two
+# functions are the whole seam between them, and they are the reason adding Signature
+# later is wiring rather than surgery: it needs its own pair of these and nothing else.
+# ---------------------------------------------------------------------------
+def _classic_job_run(job: dict):
+    """Run one queued Classic render. Returns (video_url, degradations).
+
+    The agent record is re-read here rather than carried in the job row. Two reasons,
+    and both matter: the agent dict holds Facebook and Instagram page tokens, which must
+    never be written into a queue table, and a job that waited in the queue should use
+    the agent's name, contact line and profile photo as they are NOW, not as they were
+    when the button was pressed.
+    """
+    listing_id = str(job["listing_id"])
+    agent_id = str(job["agent_id"])
+    payload = job.get("payload") or {}
+
+    agent_res = db_execute(
+        lambda db: db.table("agents").select("*").eq("id", agent_id),
+        what="_classic_job_run agents select")
+    if not agent_res.data:
+        raise video_jobs.PermanentJobError("This agent account no longer exists.")
+    agent = agent_res.data[0]
+
+    listing_res = db_execute(
+        lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent_id),
+        what="_classic_job_run listings select")
+    if not listing_res.data:
+        raise video_jobs.PermanentJobError(
+            "This listing was deleted before its video could be generated.")
+    listing = listing_res.data[0]
+
+    # Validate here, before the renderer, so an agent-fixable problem fails fast and
+    # permanently instead of burning three attempts on something that cannot improve.
+    if not (listing.get("images") or []):
+        raise video_jobs.PermanentJobError(
+            "This listing has no photos any more -- add a photo and generate the video again.")
+
+    # Mirror 'rendering' onto the listing the moment the job actually starts, so My
+    # Listings distinguishes "waiting in the queue" from "being made right now".
+    try:
+        db_execute(
+            lambda db: db.table("listings").update({
+                "video_status": "rendering",
+                "video_render_started_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", listing_id).eq("agent_id", agent_id),
+            what="_classic_job_run mark rendering")
+    except Exception as e:
+        # Cosmetic only -- the job row is the source of truth for the queue, so a failed
+        # mirror write must not abort a render that is otherwise ready to go.
+        logger.warning("video job %s: could not mirror 'rendering' onto the listing (%s)",
+                       job["id"], e)
+
+    try:
+        return _render_video_core(
+            listing_id, agent, listing,
+            payload.get("video_template_id") or DEFAULT_VIDEO_TEMPLATE_ID,
+            bool(payload.get("persist_video_template_id")),
+            int(payload.get("photo_index") or 0),
+        )
+    except video_renderer.RenderSlotBusy as e:
+        # Should not happen -- the queue hands out at most one Classic job per process,
+        # which is exactly what the renderer's semaphore allows. If it ever does, it is
+        # a capacity condition, not a failure: the job goes back in the queue instead of
+        # telling the agent their video could not be made.
+        raise video_jobs.DeferJob(str(e))
+
+
+def _classic_job_failed(job: dict, error_text: str):
+    """Called once, only when a Classic job has genuinely run out of attempts.
+
+    Retries deliberately do NOT come through here: an agent whose render hit a transient
+    ffmpeg failure and succeeded on the second attempt should never have seen an error
+    at all."""
+    try:
+        db_execute(
+            lambda db: db.table("listings").update({
+                "video_status": "failed",
+                "video_error": str(error_text)[:500],
+            }).eq("id", str(job["listing_id"])).eq("agent_id", str(job["agent_id"])),
+            what="_classic_job_failed listings update")
+    except Exception as e:
+        logger.warning("video job %s: could not mark the listing failed (%s)", job["id"], e)
+
 
 @app.post("/api/listings/{listing_id}/generate-video")
 async def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, agent=Depends(get_current_agent)):
@@ -3512,6 +3682,74 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
     if photo_index < 0 or photo_index >= len(images):
         photo_index = 0
 
+    # THE QUEUED PATH. The endpoint's whole job is now: write a row, return. It does no
+    # rendering and waits for nothing, so it answers in the time of two database calls
+    # whether one agent is generating or fifty are.
+    if video_jobs.available():
+        try:
+            job, created = await asyncio.to_thread(
+                video_jobs.enqueue,
+                video_jobs.JOB_TYPE_CLASSIC, listing_id, agent["id"],
+                {
+                    "video_template_id": chosen_video_template_id,
+                    "persist_video_template_id": persist_video_template_id,
+                    "photo_index": photo_index,
+                },
+            )
+        except Exception as e:
+            # The queue is the better path, not the only one. If the insert genuinely
+            # fails we would rather render the old way than tell the agent no.
+            logger.warning("generate_video: could not enqueue (%s: %s) -- falling back "
+                           "to an in-process render", type(e).__name__, e)
+        else:
+            # A second press of Generate while one is already in flight is NOT an error
+            # and no longer returns 409. The partial unique index means the duplicate
+            # never became a second render; the agent just gets told where the render
+            # they already started has got to.
+            #
+            # The listing keeps the SAME 'rendering' vocabulary it has always used --
+            # deliberately, rather than introducing a 'queued' value. Nothing that reads
+            # this column would understand a new word (the app switches on 'done' and
+            # 'failed' only), and a column whose allowed values we cannot inspect from
+            # here is not worth risking a constraint violation over. "Queued" versus
+            # "actually rendering" is carried by job_status and queue_position instead,
+            # which are new fields that nothing old depends on.
+            try:
+                await db_execute_async(
+                    lambda db: db.table("listings").update({
+                        "video_status": "rendering",
+                        "video_error": None,
+                        "video_render_started_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", listing_id).eq("agent_id", agent["id"]),
+                    what="generate_video mirror queued status",
+                )
+            except Exception as e:
+                # The job row is already committed, so the render WILL happen. Failing
+                # the request now would tell the agent their video did not start when it
+                # did, and would tempt them into pressing Generate again.
+                logger.warning("generate_video: job %s queued but the listing mirror "
+                               "write failed (%s)", job.get("id"), e)
+            try:
+                progress = await asyncio.to_thread(video_jobs.describe, job)
+            except Exception as e:
+                # Position and ETA are a courtesy on top of an accepted job. Never let
+                # a failure to compute them turn a successful enqueue into an error.
+                logger.warning("generate_video: could not describe job %s (%s)",
+                               job.get("id"), e)
+                progress = {}
+            if not created:
+                logger.info("generate_video: listing %s already had a Classic job in "
+                            "flight; returning its position", listing_id)
+            return dict({
+                "status": "rendering",   # unchanged wire value: the existing app polls on this
+                "video_template_id": chosen_video_template_id,
+                "queued": True,
+            }, **progress)
+
+    # THE FALLBACK PATH, byte-for-byte the behaviour that shipped before the queue.
+    # Reached only when the video_jobs table is not there (or not readable with this
+    # key), which is what makes the migration and the deploy safe in either order.
+    #
     # One render at a time per listing. The 10-minute stale-lock cutoff exists so
     # a crashed worker (which can never write 'failed') doesn't lock the listing
     # out of video generation forever.
@@ -3544,6 +3782,43 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
     task.add_done_callback(_video_render_tasks.discard)
 
     return {"status": "rendering", "video_template_id": chosen_video_template_id}
+
+
+@app.get("/api/listings/{listing_id}/video-status")
+async def get_video_status(listing_id: str, agent=Depends(get_current_agent)):
+    """Where is my video? Position in the queue, or an honest estimate of the wait.
+
+    Separate from GET /api/listings so the UI can poll this cheaply and often without
+    re-reading every listing the agent owns. The listing's own video_status / video_url
+    / video_error fields are returned alongside, unchanged in meaning, so this endpoint
+    is a superset of what the app already knows how to read."""
+    result = await db_execute_async(
+        lambda db: db.table("listings").select("video_status,video_url,video_error,video_template_id")
+        .eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="get_video_status listings select")
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = result.data[0]
+
+    out = {
+        "video_status": listing.get("video_status"),
+        "video_url": listing.get("video_url"),
+        "video_error": listing.get("video_error"),
+        "video_template_id": listing.get("video_template_id"),
+        "queue_position": None,
+        "eta_seconds": None,
+    }
+    if video_jobs.available():
+        try:
+            job = await asyncio.to_thread(
+                video_jobs.find_active, video_jobs.JOB_TYPE_CLASSIC, listing_id)
+            if job:
+                out.update(await asyncio.to_thread(video_jobs.describe, job))
+        except Exception as e:
+            # Queue metadata is a nicety; the status itself already came from the
+            # listing row, so a queue read failure must not fail the request.
+            logger.warning("get_video_status: queue lookup failed (%s)", e)
+    return out
 
 def _wait_for_ig_container_ready(container_id: str, page_token: str, max_attempts: int = 10, delay_seconds: float = 1.5) -> bool:
     # Instagram fetches/processes the image asynchronously after the container is
