@@ -4317,6 +4317,30 @@ def _public_listing_payload(listing) -> dict:
     )
     public_content = _scrub_own_street(public_content, own_location, district_label)
     public_features = _scrub_own_street(listing.get("features"), own_location, district_label)
+    # The listing's own videos, so the buyer's page can actually play the tour the
+    # "Reply with Listing" copy promises. Both are optional and both default to null:
+    # most listings have neither, and a listing with no video must render a normal
+    # page, never an error. Which one plays is the FRONTEND's call (Signature when
+    # present, Classic otherwise) -- both are returned rather than resolved here
+    # because the player has to know which tier it got to pick the aspect ratio
+    # (Classic 9:16, Signature 4:3), exactly as My Listings already does.
+    #
+    # PRIVACY (hide-the-road) -- this is safe, and deliberately so:
+    #  * The file is at videos/{listing_id}.mp4 in the PUBLIC listings-images bucket,
+    #    the same bucket and the same unauthenticated get_public_url() as the `images`
+    #    array right below. This payload already carries `id`, so the URL was already
+    #    derivable. This adds discoverability, not reach.
+    #  * Nothing in a Classic render carries the road: the only imagery is this
+    #    listing's own `images` (same array served here), the burned-in text is the
+    #    DISTRICT label only, and room captions are written from the photos alone --
+    #    the model is never given the address -- then copy-guarded and rejected
+    #    outright if they contain any digit.
+    #  * Signature films are produced by hand, not by this backend, so the no-
+    #    identifying-frontage rule on them stays a directorial step, not a code one.
+    # str() so a column that is missing, null, blank or (somehow) not text can never
+    # turn a buyer's page into a 503 -- it just means "no video".
+    public_video_url = str(listing.get("video_url") or "").strip() or None
+    public_signature_video_url = str(listing.get("signature_video_url") or "").strip() or None
     return {
         "id": listing["id"],
         "property_type": listing["property_type"],
@@ -4330,6 +4354,8 @@ def _public_listing_payload(listing) -> dict:
         "land_size": listing.get("land_size"),
         "built_up": listing.get("built_up"),
         "features": public_features,
+        "video_url": public_video_url,
+        "signature_video_url": public_signature_video_url,
         "agent": {"name": agent_info.get("name"), "agency": agent_info.get("agency")}
     }
 
