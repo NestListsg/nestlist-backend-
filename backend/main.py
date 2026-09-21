@@ -669,6 +669,23 @@ class ChatRequest(BaseModel):
 # ================================
 # AUTH HELPERS
 # ================================
+# bcrypt hashes at most 72 BYTES of input, and bcrypt 5.x (what requirements.txt
+# pins) RAISES ValueError on anything longer rather than quietly truncating it.
+# So an over-long password is not a cosmetic limit -- unchecked it is an
+# exception thrown from hash_password, and any irreversible work already done by
+# then is stranded. Reject it at the door, before anything is written.
+#
+# BYTES, not characters: bcrypt counts the utf-8 encoding, so an emoji or
+# accented passphrase can sit well under 72 characters and well over 72 bytes.
+MAX_PASSWORD_BYTES = 72
+PASSWORD_TOO_LONG_MESSAGE = (
+    "That password is too long. Please use a shorter one — up to 72 characters, "
+    "or fewer if it contains emoji or accented letters."
+)
+
+def password_too_long(password: str) -> bool:
+    return len((password or "").encode("utf-8")) > MAX_PASSWORD_BYTES
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -784,32 +801,46 @@ def _agent_response(agent) -> dict:
 # ================================
 # AUTH ROUTES
 # ================================
+# Login was the one public door with no limit on it at all, so a stolen email
+# list could be walked through at whatever rate the network allowed.
+#
+# TWO counters, because on a single count a busy shared office and a brute-force
+# run look identical:
+#   _login_hits          -- a loose flood cap on EVERY request, checked before
+#                           the email lookup, so the endpoint can't be hammered
+#                           and the email column can't be walked for enumeration.
+#   _login_failure_hits  -- a tight cap on FAILURES only. A Singapore agency
+#                           behind one office NAT address (50 agents signing in
+#                           on onboarding day) pays nothing for succeeding, while
+#                           an attacker produces nothing but failures and hits
+#                           the tight brake almost immediately.
+#
+# Both are keyed on IP and never on the email: the limiter must not become a way
+# to test which addresses are registered, and nobody should be able to lock a
+# named agent out by hammering their address. Both return the identical 429.
 _login_hits = {}
+_login_failure_hits = {}
 
 @app.post("/api/login")
 def login(req: LoginRequest, request: Request):
-    # Login was the one public door with no limit on it, so a stolen email list
-    # could be walked through at whatever rate the network allowed. Keyed on IP
-    # only -- never on the email -- so the limiter can't be used to probe which
-    # addresses are registered, and so one agent can't be locked out by someone
-    # else hammering their address.
-    #
-    # 10 per 10 minutes is deliberately on the generous side. An agent who
-    # fat-fingers their password needs three or four tries; Singapore agencies
-    # commonly share one office IP, so a handful of agents signing in together
-    # must not trip it, and any block clears in ten minutes rather than an hour.
-    # See the note on _rate_limited: with 4 uvicorn workers the real ceiling is
-    # up to 40 per 10 minutes per IP. That is still far too slow to brute-force
-    # a bcrypt cost-12 hash, and it is what stops a credential-stuffing run.
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
-    if _rate_limited(_login_hits, client_ip, limit=10, window_seconds=600):
+    client_ip = _client_ip(request)
+    if _rate_limited(_login_hits, client_ip, limit=60, window_seconds=600):
         raise HTTPException(status_code=429, detail="Too many login attempts — please try again in a few minutes")
+
+    # PEEKED here rather than counted. The failure budget has to be enforced
+    # BEFORE the password is checked -- a counter consulted only afterwards
+    # still lets every guess be tested, which is no brake at all -- but it must
+    # only be SPENT on a guess that actually turned out wrong.
+    if _rate_limited(_login_failure_hits, client_ip, limit=10, window_seconds=600, record=False):
+        raise HTTPException(status_code=429, detail="Too many login attempts — please try again in a few minutes")
+
     result = get_db().table("agents").select("*").eq("email", req.email).execute()
-    if not result.data:
+    agent = result.data[0] if result.data else None
+    if agent is None or not verify_password(req.password, agent["password_hash"]):
+        # Unknown email and wrong password are counted and answered identically.
+        _rate_limited(_login_failure_hits, client_ip, limit=10, window_seconds=600)
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    agent = result.data[0]
-    if not verify_password(req.password, agent["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+
     token = create_token(str(agent["id"]))
     return {"token": token, "agent": _agent_response(agent)}
 
@@ -923,7 +954,7 @@ _handle_check_hits = {}
 def check_handle_available(handle: str, request: Request):
     # Public + unauthenticated: rate-limit per IP and validate before any DB
     # query. Never 500s -- worst case it reports "invalid"/"taken" with hints.
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    client_ip = _client_ip(request)
     if _rate_limited(_handle_check_hits, client_ip, limit=300, window_seconds=3600):
         raise HTTPException(status_code=429, detail="Too many requests — please try again later")
     # Slugify FIRST so the value we validate/check is exactly what register()
@@ -940,6 +971,11 @@ def check_handle_available(handle: str, request: Request):
 
 @app.post("/api/register")
 def register(req: RegisterRequest):
+    # Same bcrypt 72-byte ceiling as the reset path. Checked before any lookup or
+    # write so a long passphrase is a clear 400, not a 500 from deep inside the
+    # signup flow after a handle has already been reserved.
+    if password_too_long(req.password):
+        raise HTTPException(status_code=400, detail=PASSWORD_TOO_LONG_MESSAGE)
     existing = db_execute(lambda db: db.table("agents").select("id").eq("email", req.email), what="register agents select")
     if existing.data:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -1018,7 +1054,7 @@ async def request_password_reset(req: PasswordResetRequest, request: Request):
     if req.website:
         return {"success": True}
 
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    client_ip = _client_ip(request)
     if _rate_limited(_password_reset_hits, client_ip, limit=5, window_seconds=3600):
         raise HTTPException(status_code=429, detail="Too many reset requests — please try again later")
 
@@ -1061,6 +1097,12 @@ def confirm_password_reset(req: PasswordResetConfirm):
         raise HTTPException(status_code=400, detail="This reset link is invalid or has expired. Please request a new one.")
     if len(req.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    # Checked HERE, before the token is touched. bcrypt raises on an over-long
+    # password, and past this point the reset link has been burned -- a raise
+    # then would kill the link without changing the password, and the agent
+    # would loop forever pasting the same passphrase into fresh links.
+    if password_too_long(req.new_password):
+        raise HTTPException(status_code=400, detail=PASSWORD_TOO_LONG_MESSAGE)
 
     token_hash = hashlib.sha256(req.token.encode()).hexdigest()
     result = db_execute(lambda db: db.table("password_resets").select("*").eq("token_hash", token_hash), what="confirm_password_reset password_resets select")
@@ -1085,9 +1127,14 @@ def confirm_password_reset(req: PasswordResetConfirm):
     # Both writes are safe to retry: used_at and the hash are literal values
     # filtered by id. The hash is computed once up front so a retry re-sends the
     # same value rather than re-running bcrypt (cost 12) on the hot path.
+    #
+    # Hashing happens BEFORE the burn and stays outside the try on purpose: it is
+    # the last step that can fail without consequence. Anything that can raise
+    # must do so while the reset link is still usable.
+    new_hash = hash_password(req.new_password)
+
     db_execute(lambda db: db.table("password_resets").update({"used_at": datetime.utcnow().isoformat()}).eq("id", reset_row["id"]), what="confirm_password_reset password_resets update")
 
-    new_hash = hash_password(req.new_password)
     try:
         db_execute(lambda db: db.table("agents").update({"password_hash": new_hash}).eq("id", reset_row["agent_id"]), what="confirm_password_reset agents update")
     except Exception as e:
@@ -4657,7 +4704,15 @@ def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_curre
 # Procfile runs `uvicorn --workers 4`. Each worker keeps its OWN copy, so the
 # effective ceiling for any key is up to 4x the `limit` passed in: the 5-per-hour
 # password reset limit is really up to 20 per hour, the 120-per-hour listing view
-# limit up to 480, and the 10-per-10-minutes login limit up to 40.
+# limit up to 480, and the 10-failures-per-10-minutes login limit up to 40.
+#
+# And be honest about what per-IP limiting buys. It is a floor against guessing
+# from a single source -- nothing more. An attacker with a proxy pool or a
+# botnet gets a fresh bucket per address and walks straight past every number
+# here, so this is not a credential-stuffing defence. The real answer is
+# alerting on the overall login FAILURE RATE across all addresses, which no
+# single-IP counter can see. FOLLOW-UP: add that alert (it can reuse
+# send_telegram_alert_throttled) before outside agents onboard.
 #
 # We deliberately do NOT divide the limits by the worker count to compensate.
 # HTTP keep-alive pins one client's connections to a single worker, so one
@@ -4678,30 +4733,82 @@ _password_reset_hits = {}
 # enough that a real buyer refreshing/reloading a listing is never blocked.
 _public_listing_view_hits = {}
 
+def _client_ip(request: Request) -> str:
+    """The address to rate-limit a request on.
+
+    Takes the RIGHTMOST X-Forwarded-For entry, not the leftmost. Nothing here
+    validates that header -- the Procfile runs uvicorn with no --proxy-headers
+    and no --forwarded-allow-ips, and there is no trusted-proxy handling
+    anywhere -- so whatever the caller sends arrives verbatim. Railway appends
+    the real client address to the end of the chain, which makes the leftmost
+    entry a string the caller chose: rotating one fake value per request would
+    hand every request a fresh bucket and quietly void every limit in this file.
+    Rightmost is correct either way -- if the platform strips the inbound header
+    there is only one entry and the two are the same.
+
+    ASSUMES A SINGLE PROXY HOP. If Cloudflare, or any second proxy, is ever put
+    in front of nestlist.sg, the rightmost entry becomes that proxy's address
+    rather than the buyer's and every caller collapses into one bucket. Revisit
+    here if that happens -- CF-Connecting-IP would be the value to prefer."""
+    forwarded = [p.strip() for p in request.headers.get("x-forwarded-for", "").split(",") if p.strip()]
+    if forwarded:
+        return forwarded[-1]
+    real_ip = (request.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip
+    return request.client.host if request.client else "unknown"
+
+
 # Longest window any caller uses, and how often a store is swept for dead keys.
 _RATE_LIMIT_MAX_WINDOW_SECONDS = 3600
 _RATE_LIMIT_SWEEP_SECONDS = 600
 _rate_limit_last_sweep = {}
+# One lock for every store. The endpoints below are a mix of `def` (run by
+# FastAPI in a threadpool, genuinely parallel) and `async def`, so these dicts
+# are touched concurrently: without it the sweep can iterate a dict another
+# thread is inserting into (RuntimeError: dictionary changed size during
+# iteration -> a 500 on login or on a buyer opening a listing), and two threads
+# from one IP can each read-modify-write the same key and lose a hit. Held only
+# for a few microseconds of list work, so the brief block inside an async
+# handler is not worth avoiding.
+_rate_limit_lock = threading.Lock()
 
-def _rate_limited(store: dict, key: str, limit: int = 5, window_seconds: int = 3600) -> bool:
-    now = datetime.utcnow()
-    # Evict dead keys. Without this, `store` kept one entry per IP that ever
-    # touched the endpoint, for the life of the worker -- a slow leak that only
-    # surfaces weeks later as a memory-killed worker. Swept at most once every
-    # ten minutes (so a busy endpoint doesn't pay for it per request) and on a
-    # horizon no shorter than the longest window in use, so a sweep can never
-    # drop hits that a longer-window caller still counts.
-    last_sweep = _rate_limit_last_sweep.get(id(store))
-    if last_sweep is None or (now - last_sweep).total_seconds() > _RATE_LIMIT_SWEEP_SECONDS:
-        _rate_limit_last_sweep[id(store)] = now
-        horizon = max(window_seconds, _RATE_LIMIT_MAX_WINDOW_SECONDS)
-        # hits are appended in time order, so the last one is the newest.
-        for dead in [k for k, v in store.items() if not v or (now - v[-1]).total_seconds() > horizon]:
-            del store[dead]
-    hits = [t for t in store.get(key, []) if (now - t).total_seconds() < window_seconds]
-    hits.append(now)
-    store[key] = hits
-    return len(hits) > limit
+def _rate_limited(store: dict, key: str, limit: int = 5, window_seconds: int = 3600, record: bool = True) -> bool:
+    """True when `key` has used up its allowance.
+
+    record=False PEEKS: it reports whether the key is already at the limit
+    without counting the current call. That is what lets the login failure
+    counter be checked before a password is verified but incremented only once
+    the password turns out to be wrong."""
+    with _rate_limit_lock:
+        now = datetime.utcnow()
+        # Evict dead keys. Without this, `store` kept one entry per IP that ever
+        # touched the endpoint, for the life of the worker -- a slow leak that only
+        # surfaces weeks later as a memory-killed worker. Swept at most once every
+        # ten minutes (so a busy endpoint doesn't pay for it per request) and on a
+        # horizon no shorter than the longest window in use, so a sweep can never
+        # drop hits that a longer-window caller still counts.
+        last_sweep = _rate_limit_last_sweep.get(id(store))
+        if last_sweep is None or (now - last_sweep).total_seconds() > _RATE_LIMIT_SWEEP_SECONDS:
+            _rate_limit_last_sweep[id(store)] = now
+            horizon = max(window_seconds, _RATE_LIMIT_MAX_WINDOW_SECONDS)
+            # hits are appended in time order, so the last one is the newest.
+            for dead in [k for k, v in store.items() if not v or (now - v[-1]).total_seconds() > horizon]:
+                del store[dead]
+        hits = [t for t in store.get(key, []) if (now - t).total_seconds() < window_seconds]
+        if not record:
+            # Keep the pruning, drop the key entirely once it has gone quiet so a
+            # peek can never be the thing that keeps a dead entry alive.
+            if hits:
+                store[key] = hits
+            else:
+                store.pop(key, None)
+            # >= limit, not > limit: `limit` hits already banked means the next
+            # recorded one would exceed the allowance, so the answer is yes.
+            return len(hits) >= limit
+        hits.append(now)
+        store[key] = hits
+        return len(hits) > limit
 
 def _is_valid_uuid(value: str) -> bool:
     try:
@@ -4858,7 +4965,7 @@ def _ilike_literal(value: str) -> str:
 
 @app.get("/api/public/listings/{listing_id}")
 def get_public_listing(listing_id: str, request: Request):
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    client_ip = _client_ip(request)
     if _rate_limited(_public_listing_view_hits, client_ip, limit=120, window_seconds=3600):
         raise HTTPException(status_code=429, detail="Too many requests — please try again later")
     # Accept either the full UUID or a short id-prefix (e.g. the first 8 hex
@@ -4904,7 +5011,7 @@ def get_public_listing_by_codes(agent_code: str, listing_code: str, request: Req
     # the agent chooses, so the URL never leaks which property it is.
     # Buyer-facing and hit at scale: guard all input, filter in the DB, and never
     # surface anything but a clean 404 for blank/unknown/weird codes.
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    client_ip = _client_ip(request)
     if _rate_limited(_public_listing_view_hits, client_ip, limit=120, window_seconds=3600):
         raise HTTPException(status_code=429, detail="Too many requests — please try again later")
 
@@ -4962,7 +5069,7 @@ async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
     if req.website:
         return {"success": True}
 
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    client_ip = _client_ip(request)
     if _rate_limited(_public_enquiry_hits, client_ip):
         raise HTTPException(status_code=429, detail="Too many enquiries — please try again later")
 
