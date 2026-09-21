@@ -168,6 +168,20 @@ POLL_JITTER = 0.4          # +/- fraction, so restarting workers do not synchron
 POLL_SECONDS_BUSY = 5.0    # slower poll when this process has no free slots anyway
 SWEEP_SECONDS = 30.0       # stale-claim sweep cadence
 
+# How long a job may sit in 'queued' untouched before we conclude nothing is draining
+# the queue and set the listing free again.
+#
+# This exists because a queued job that nobody claims is otherwise IMMORTAL: the stale
+# sweep only looks at 'running', and the partial unique index means the agent gets
+# handed that same dead row every time they press Generate. The old in-process path had
+# a 10-minute stale-lock escape; without this the queue would be a regression on it.
+#
+# Deliberately much longer than any plausible real wait -- at four concurrent Classic
+# renders of ~60s, 30 minutes is roughly 120 jobs deep, far beyond anything this
+# product will see -- and guarded further by _queue_is_draining(), so a genuinely deep
+# but healthy queue is never mistaken for a dead one.
+QUEUED_ESCAPE_SECONDS = float(os.environ.get("VIDEO_QUEUE_ESCAPE_SECONDS", "1800"))
+
 # A deferred job (no slot, account limit taken) comes back after this, jittered.
 DEFER_BACKOFF_SECONDS = 5.0
 # A job that crashed and has retries left waits this long times its attempt count.
@@ -202,6 +216,15 @@ class DeferJob(Exception):
     slot, an external service reporting it is at its limit. It rewinds the attempt
     counter, so no amount of waiting for capacity can ever push a job into 'failed'.
     Signature will raise this on a Replicate 429 for exactly the same reason."""
+
+
+class SupersededError(Exception):
+    """This job now belongs to another worker -- stop, and write nothing.
+
+    Raised from inside a renderer at the points where it is about to do something the
+    agent can actually see (store the video, update the listing). The job row is fenced
+    against a late write, but the storage bucket and the listings row are not, so a
+    renderer has to check ownership itself before touching either."""
 
 
 class PermanentJobError(Exception):
@@ -272,26 +295,71 @@ def _exec(build, what, idempotent=True, attempts=3):
     return _db_execute(build, what=what, idempotent=idempotent, attempts=attempts)
 
 
-def probe():
-    """Detect whether the video_jobs table exists AND this key may use it.
+# The reason the probe must write, not just read, and what it leaves behind.
+PROBE_LISTING_ID = "__nestlist_startup_probe__"
 
-    Deliberately probes with a real SELECT rather than reading a catalogue: a table that
-    exists but is invisible to our key (RLS with no policy for it, a typo in the grant)
-    must fail this probe too, because the queue would be just as unusable. Failing the
-    probe is safe -- generate-video falls back to today's inline render path, so the
-    code can deploy before or after Jane runs the migration, in either order."""
+
+def probe():
+    """Detect whether the video_jobs table exists AND this key may actually USE it.
+
+    A SELECT is not sufficient, and the earlier version of this function was wrong to
+    rely on one. With RLS enabled and no policies -- exactly what the migration sets up
+    -- a key that is subject to RLS does not get an error back. Default-deny FILTERS
+    ROWS; it does not revoke the privilege. So `select id limit 1` returns HTTP 200 and
+    an empty array, which is indistinguishable from an empty table. The probe would
+    pass, available() would go True, and then every single enqueue would fail 42501 and
+    fall back to an inline render. Agents would still get their videos, and the exact
+    problem the queue exists to fix would carry on happening invisibly.
+
+    So the probe proves the operation the queue actually depends on: an INSERT, followed
+    by a DELETE. The service key sails through; a key subject to RLS is refused, which
+    is the answer we need. The canary is written in a terminal state under a reserved
+    listing id, so it is invisible to every query that matters -- it is not 'active', it
+    is not 'running', and it is not 'done', so it cannot appear in a queue position, a
+    concurrency count, or the rolling duration average. It is deleted immediately, and
+    prune_finished() clears any that a crash leaves behind."""
     global _table_available
+    canary_id = None
     try:
-        _exec(lambda db: db.table(TABLE).select("id").limit(1), what="video_jobs probe")
+        _exec(lambda db: db.table(TABLE).select("id").limit(1), what="video_jobs probe read")
+        now = _iso(_now())
+        row = {
+            "job_type": JOB_TYPE_CLASSIC,
+            "listing_id": PROBE_LISTING_ID,
+            "agent_id": PROBE_LISTING_ID,
+            # Terminal on arrival: never claimable, never counted, never averaged.
+            "status": STATUS_FAILED,
+            "payload": {},
+            "attempts": 0,
+            "error": "startup write probe",
+            "run_after": now,
+            "created_at": now,
+            "updated_at": now,
+            "finished_at": now,
+        }
+        res = _exec(lambda db: db.table(TABLE).insert(row),
+                    what="video_jobs probe write", idempotent=False)
+        if res.data:
+            canary_id = res.data[0].get("id")
         _table_available = True
-        logger.info("video_jobs table present -- renders run on the durable queue "
-                    "(worker id %s)", WORKER_ID)
+        logger.info("video_jobs table present and writable -- renders run on the "
+                    "durable queue (worker id %s)", WORKER_ID)
     except Exception as e:
         _table_available = False
         logger.warning(
             "video_jobs table NOT usable (%s: %s) -- video renders fall back to the "
-            "in-process path, which does not survive a redeploy. Run the migration in "
-            "docs/video-jobs-migration.sql to enable the queue.", type(e).__name__, e)
+            "in-process path, which does not survive a redeploy. Either the migration "
+            "in docs/video-jobs-migration.sql has not been run, or SUPABASE_KEY is not "
+            "the service key and row level security is refusing the write.",
+            type(e).__name__, e)
+    finally:
+        if canary_id:
+            try:
+                _exec(lambda db: db.table(TABLE).delete().eq("id", canary_id),
+                      what="video_jobs probe cleanup")
+            except Exception as e:
+                # Harmless: it is terminal, invisible to every live query, and pruned.
+                logger.warning("video_jobs: could not remove the startup probe row (%s)", e)
     return _table_available
 
 
@@ -320,8 +388,13 @@ def enqueue(job_type, listing_id, agent_id, payload):
     now = _iso(_now())
     row = {
         "job_type": job_type,
-        "listing_id": str(listing_id),
-        "agent_id": str(agent_id),
+        # Lower-cased because these are TEXT columns carrying uuids. Postgres compares
+        # uuid values case-insensitively, but the partial unique index that stops a
+        # double-click becoming a double render compares TEXT -- so two spellings of one
+        # uuid would be two different keys. Callers should pass the canonical id from
+        # the row; this is the second line of defence.
+        "listing_id": str(listing_id).strip().lower(),
+        "agent_id": str(agent_id).strip().lower(),
         "status": STATUS_QUEUED,
         # Options only. Never the agent record -- it carries Facebook/Instagram tokens.
         "payload": payload or {},
@@ -367,7 +440,7 @@ def _is_unique_violation(exc):
 def find_active(job_type, listing_id):
     res = _exec(
         lambda db: db.table(TABLE).select("*")
-        .eq("listing_id", str(listing_id)).eq("job_type", job_type)
+        .eq("listing_id", str(listing_id).strip().lower()).eq("job_type", job_type)
         .in_("status", list(ACTIVE_STATUSES))
         .order("created_at", desc=True).limit(1),
         what="video_jobs find_active")
@@ -430,10 +503,15 @@ def _try_claim(candidate):
         "updated_at": _iso(now),
         "error": None,
     }
+    # run_after is in the predicate, not just in the candidate SELECT: between the two,
+    # another worker may have deferred this job into a backoff window, and claiming it
+    # inside that window would defeat the backoff.
+    claim_cutoff = _iso(now)
     try:
         res = _exec(
             lambda db: db.table(TABLE).update(patch)
-            .eq("id", job_id).eq("status", STATUS_QUEUED).eq("attempts", attempts),
+            .eq("id", job_id).eq("status", STATUS_QUEUED).eq("attempts", attempts)
+            .lte("run_after", claim_cutoff),
             what="video_jobs claim")
     except Exception as e:
         # Under REPEATABLE READ a losing claimer gets a serialization failure rather
@@ -525,21 +603,36 @@ def confirm_account_slot(job):
 # ---------------------------------------------------------------------------
 # Terminal and near-terminal writes -- every one fenced on (claimed_by, attempts)
 # ---------------------------------------------------------------------------
-def _fenced_update(job, patch, what):
-    """Write only if we still own this job at the attempt number we claimed.
+def _fenced_update(job, patch, what, require_status=STATUS_RUNNING):
+    """Write only if we still own this job, at the attempt we claimed, in the state we
+    expect to find it.
 
-    Returns True if the write landed. False means another worker has since reclaimed the
-    job (our claim went stale and the sweeper gave it away), so whatever we were about
-    to record is out of date and must be dropped on the floor."""
+    Returns True if the write landed. False means the job is no longer ours to write:
+    another worker reclaimed it after our claim went stale, or it has already reached a
+    terminal state. Either way whatever we were about to record is out of date and must
+    be dropped on the floor.
+
+    require_status is what stops a shutdown from RESURRECTING A FINISHED JOB. complete()
+    leaves claimed_by set (deliberately -- it is the audit trail of who rendered it), so
+    without a status predicate the shutdown hook's defer() would match a job that had
+    just been marked done, push it back to 'queued' with its attempt rewound, and hand
+    another worker a job that was already delivered. The agent would watch a finished
+    video revert to a spinner. Pass None only for a write that is genuinely valid in any
+    state."""
     job_id = job["id"]
     attempt = int(job.get("attempts") or 0)
     body = dict(patch)
     body["updated_at"] = _iso(_now())
+
+    def _build(db):
+        q = (db.table(TABLE).update(body)
+             .eq("id", job_id).eq("claimed_by", WORKER_ID).eq("attempts", attempt))
+        if require_status is not None:
+            q = q.eq("status", require_status)
+        return q
+
     try:
-        res = _exec(
-            lambda db: db.table(TABLE).update(body)
-            .eq("id", job_id).eq("claimed_by", WORKER_ID).eq("attempts", attempt),
-            what=what)
+        res = _exec(_build, what=what)
     except Exception as e:
         if _is_serialization_failure(e):
             return False
@@ -555,6 +648,11 @@ def _fenced_update(job, patch, what):
     fresh = get_job(job_id)
     if not fresh:
         return False
+    if require_status is not None and "status" not in body:
+        # Nothing in the patch moves the status, so the row must still be in the state
+        # we required for the write to have been ours.
+        if fresh.get("status") != require_status:
+            return False
     if "attempts" in body and int(fresh.get("attempts") or 0) != int(body["attempts"]):
         return False
     if "status" in body and fresh.get("status") != body["status"]:
@@ -745,6 +843,92 @@ def sweep_stale():
     return reclaimed
 
 
+def _queue_is_draining(job_type, window_seconds):
+    """Has anything of this type actually finished recently?
+
+    This is what separates "the queue is deep" from "the queue is dead". A backlog with
+    workers chewing through it keeps producing finished jobs; a backlog with no consumer
+    produces none. Only the second one justifies failing an agent's job."""
+    since = _iso(_now() - timedelta(seconds=window_seconds))
+    try:
+        res = _exec(
+            lambda db: db.table(TABLE).select("id")
+            .eq("job_type", job_type).in_("status", list(TERMINAL_STATUSES))
+            .gt("finished_at", since).limit(1),
+            what="video_jobs draining check")
+        return bool(res.data)
+    except Exception:
+        # Cannot tell -- assume healthy. Wrongly failing an agent's job is worse than
+        # leaving a stuck one for the next sweep to catch.
+        return True
+
+
+def sweep_abandoned_queue():
+    """Release listings held hostage by a queued job that nothing is ever going to run.
+
+    The failure this recovers from is a misconfiguration, not a crash: consumers turned
+    off everywhere (VIDEO_QUEUE_CONSUMER=0 on every process) while the endpoint happily
+    keeps enqueuing, or a deploy where no process ends up draining. Without an escape
+    the agent is stuck forever with 'position 1, about a minute' and no way out short of
+    someone running SQL.
+
+    Failing the job is the right recovery rather than silently deleting it: it clears
+    the partial unique index, so the agent's next press of Generate works, and it leaves
+    a row explaining what happened."""
+    cutoff = _iso(_now() - timedelta(seconds=QUEUED_ESCAPE_SECONDS))
+    try:
+        res = _exec(
+            lambda db: db.table(TABLE).select("*")
+            .eq("status", STATUS_QUEUED).lt("updated_at", cutoff).limit(50),
+            what="video_jobs abandoned queue select")
+    except Exception as e:
+        logger.warning("video_jobs: abandoned-queue sweep could not read (%s)", e)
+        return 0
+
+    rows = res.data or []
+    if not rows:
+        return 0
+
+    freed = 0
+    draining = {}
+    for job in rows:
+        job_type = job.get("job_type") or JOB_TYPE_CLASSIC
+        if job_type not in draining:
+            draining[job_type] = _queue_is_draining(job_type, QUEUED_ESCAPE_SECONDS)
+        if draining[job_type]:
+            # Deep but alive. Leave it alone -- it will get its turn.
+            continue
+
+        attempt = int(job.get("attempts") or 0)
+        now = _now()
+        patch = {
+            "status": STATUS_FAILED,
+            "error": ("This video could not be started -- the rendering service was not "
+                      "picking up work. Please try generating it again."),
+            "finished_at": _iso(now),
+            "updated_at": _iso(now),
+        }
+        try:
+            out = _exec(
+                lambda db: db.table(TABLE).update(patch)
+                .eq("id", job["id"]).eq("status", STATUS_QUEUED).eq("attempts", attempt),
+                what="video_jobs abandoned queue release")
+        except Exception as e:
+            if _is_serialization_failure(e):
+                continue
+            logger.warning("video_jobs: could not release stuck job %s (%s)", job["id"], e)
+            continue
+        if out.data or _reclaim_landed(job["id"], attempt, STATUS_FAILED):
+            freed += 1
+            logger.error(
+                "video_jobs: %s job %s sat queued for over %.0f minutes with nothing "
+                "draining the queue -- failed so the listing is not locked out. Check "
+                "that at least one process has VIDEO_QUEUE_CONSUMER enabled.",
+                job_type, job["id"], QUEUED_ESCAPE_SECONDS / 60.0)
+            _notify_final_failure(job, patch["error"])
+    return freed
+
+
 def _reclaim_landed(job_id, attempt, expected_status):
     fresh = get_job(job_id)
     return bool(fresh and fresh.get("status") == expected_status
@@ -865,7 +1049,7 @@ def describe_active_for_agent(agent_id):
     try:
         res = _exec(
             lambda db: db.table(TABLE).select("*")
-            .eq("agent_id", str(agent_id)).in_("status", list(ACTIVE_STATUSES))
+            .eq("agent_id", str(agent_id).strip().lower()).in_("status", list(ACTIVE_STATUSES))
             .order("created_at").limit(20),
             what="video_jobs active for agent")
     except Exception as e:
@@ -928,11 +1112,21 @@ def execute_job(job):
             return
 
         result_url, degradations = entry.run(job)
+        # Stop beating BEFORE the terminal write. The heartbeat fence now requires the
+        # job to still be 'running', so a beat landing after complete() would report a
+        # spurious takeover; and a render that is finished has nothing left to prove.
+        stop_event.set()
         if superseded_event.is_set():
             logger.warning("video_jobs: finished job %s but another worker owns it now; "
                            "not recording our result", job_id)
             return
         complete(job, result_url, degradations, time.monotonic() - started)
+    except SupersededError:
+        # The renderer noticed mid-flight that the job had been handed to someone else
+        # and stopped before writing anything the agent could see. Nothing to record --
+        # the new owner's render is the one that counts.
+        logger.warning("video_jobs: job %s abandoned mid-render; another worker owns it",
+                       job_id)
     except DeferJob as e:
         defer(job, str(e) or "no capacity right now")
     except PermanentJobError as e:
@@ -959,18 +1153,29 @@ async def run_consumer():
     call go out to threads. The per-type local limits are counted here, on the loop, so
     the counting itself needs no lock.
 
-    NOTE ON WHERE THIS RUNS. Nothing about the queue requires the consumer to live
-    inside a web worker -- it only needs a process with database access. Moving renders
-    off the web workers entirely is a one-line Procfile addition (`worker: python -m
-    video_jobs_worker`) plus an env var to stop the web workers consuming. That is worth
-    doing before agent numbers grow, because an ffmpeg render inside a web worker
-    competes for CPU with buyer-facing page requests. It is deliberately NOT done in
-    this change: in-process consumers across four workers give redundancy for free,
-    whereas a single worker process is a single point of failure, and the rollout gate
-    is better served by a smaller change surface. The split is a deployment decision
-    now, not an architectural one."""
+    NOTE ON WHERE THIS RUNS -- AND A WARNING. Nothing about the queue requires the
+    consumer to live inside a web worker; it only needs a process with database access.
+    Moving renders off the web workers is worth doing before agent numbers grow, because
+    an ffmpeg render inside a web worker competes for CPU with buyer-facing page
+    requests. (CPU, not memory: the RSS ceiling quoted in video_renderer.py is measured
+    against a limit far below Railway's actual one.)
+
+    DO NOT attempt that split by setting VIDEO_QUEUE_CONSUMER=0 today. There is no
+    worker entrypoint in this repo yet, so turning the consumer off on the web workers
+    turns it off EVERYWHERE while generate-video happily keeps enqueuing -- every video
+    on the platform would stop. The split needs a `video_jobs_worker` module (import the
+    app module for its db_execute and renderers, configure, probe, run this loop) that
+    is written and tested first, and only then a Procfile `worker:` line plus the env
+    var. sweep_abandoned_queue() exists to make that mistake recoverable rather than
+    permanent, and startup logs a warning when a process is enqueuing without consuming
+    -- but recovery still costs every agent in flight their render."""
     if os.environ.get("VIDEO_QUEUE_CONSUMER", "1") not in ("1", "true", "True"):
-        logger.info("video_jobs: consumer disabled on this process by VIDEO_QUEUE_CONSUMER")
+        logger.warning(
+            "video_jobs: consumer DISABLED on this process by VIDEO_QUEUE_CONSUMER. "
+            "This process will still accept video requests and write them to the queue, "
+            "so unless another process is draining it, no video will ever be rendered. "
+            "There is no separate worker entrypoint in this repo yet -- if you did not "
+            "deliberately build one, unset this variable.")
         return
     if not available():
         return
@@ -989,6 +1194,7 @@ async def run_consumer():
             if now - last_sweep > SWEEP_SECONDS * (0.7 + random.random() * 0.6):
                 last_sweep = now
                 await asyncio.to_thread(sweep_stale)
+                await asyncio.to_thread(sweep_abandoned_queue)
             if now - last_prune > PRUNE_EVERY_SECONDS:
                 last_prune = now
                 await asyncio.to_thread(prune_finished)

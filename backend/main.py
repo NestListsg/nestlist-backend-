@@ -277,11 +277,27 @@ async def startup_event():
 async def _start_video_queue():
     """Probe for the video_jobs table, and consume from it if it is there.
 
-    A failed probe is not an error -- it just means the migration has not been run yet,
-    and generate-video keeps using the old in-process path until it is."""
+    A failed probe is survivable -- generate-video keeps using the old in-process path,
+    and agents still get their videos. But it is NOT silent, because the fallback path
+    is exactly the one the queue exists to replace: renders die on every redeploy and
+    agents can be refused when several generate at once. A log line nobody reads is not
+    enough when the whole point of this work was to stop that happening, so Jane gets
+    the same Telegram alert she gets for an expired API key."""
     try:
         if await asyncio.to_thread(video_jobs.probe):
             await video_jobs.run_consumer()
+            return
+        await send_telegram_alert_throttled(
+            "video_queue_unavailable",
+            "⚠️ <b>NestList Warning</b>\n\nThe video render queue is OFF — the "
+            "<code>video_jobs</code> table is missing or not writable with the current "
+            "key.\n\nVideos still generate, but on the old path: a Railway redeploy "
+            "kills any render in progress, and agents generating at the same time can "
+            "be turned away.\n\nFix: run <code>docs/video-jobs-migration.sql</code> in "
+            "Supabase, then RESTART the backend. If it is already run, check that "
+            "SUPABASE_KEY is the service key.",
+            cooldown_seconds=21600,
+        )
     except Exception as e:
         logger.error("video queue consumer stopped unexpectedly (%s: %s) -- this worker "
                      "will not pick up renders until it restarts", type(e).__name__, e)
@@ -3437,7 +3453,53 @@ def get_video_templates(agent=Depends(get_current_agent)):
 # which runs until the video_jobs migration has been applied.
 _video_render_tasks = set()
 
-def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int):
+# Storage uploads are not covered by db_execute -- that helper wraps PostgREST, not the
+# storage API -- so they had no retry at all. storage3's default timeout is 20 seconds,
+# and a finished Classic video is several megabytes. That was survivable when one render
+# ran at a time; with the queue keeping four workers busy, four multi-megabyte uploads
+# can now land together and compete with each other and with ffmpeg, which makes a
+# timeout here a routine event rather than a rare one.
+#
+# Without a retry the cost is absurdly disproportionate: a timeout on the upload raises,
+# the job retries, and the ENTIRE ~60 second render runs again purely to redo an upload
+# that may well have succeeded -- three times over, and then the agent is told it failed
+# after it worked. Retrying the upload in place costs seconds instead of minutes.
+#
+# Retrying is safe because the upload is an upsert to a fixed, per-listing path: running
+# it twice leaves exactly the state running it once would.
+VIDEO_UPLOAD_ATTEMPTS = 4
+VIDEO_UPLOAD_BACKOFF_SECONDS = 3
+
+
+def _store_rendered_video(filename: str, video_bytes: bytes) -> str:
+    """Upload the finished video, with bounded retries, and return its public URL."""
+    delay = VIDEO_UPLOAD_BACKOFF_SECONDS
+    for attempt in range(1, VIDEO_UPLOAD_ATTEMPTS + 1):
+        try:
+            supabase = get_db()
+            supabase.storage.from_("listings-images").upload(
+                filename,
+                video_bytes,
+                {"content-type": "video/mp4", "upsert": "true"}
+            )
+            if attempt > 1:
+                logger.info("video upload of %s succeeded on attempt %d", filename, attempt)
+            return f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
+        except Exception as e:
+            logger.warning("video upload of %s failed (attempt %d/%d): %s: %s",
+                           filename, attempt, VIDEO_UPLOAD_ATTEMPTS, type(e).__name__, e)
+            if attempt == VIDEO_UPLOAD_ATTEMPTS:
+                raise
+            # Same reasoning as db_execute's _reset_db: a transport failure may have
+            # left this worker holding a poisoned connection pool, and the storage
+            # client shares it. Throw it away so the retry builds a fresh one.
+            if isinstance(e, _DB_TRANSPORT_ERRORS):
+                _reset_db()
+            time.sleep(delay)
+            delay *= 2
+
+
+def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int, ownership_check=None):
     """Render one Classic video, store it, and write the finished URL onto the listing.
 
     Returns (video_url, degradations). Raises on failure -- deliberately, because the
@@ -3518,14 +3580,31 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
         # from a clean one.
         logger.warning("video %s rendered with degradations: %s", listing_id, "; ".join(degradations))
 
-    supabase = get_db()
+    # LAST OWNERSHIP CHECK BEFORE ANYTHING THE AGENT CAN SEE.
+    #
+    # The job row is fenced against a late write, but the storage bucket and the
+    # listings row are not, and those two are what the agent actually receives. Both
+    # renders of a reclaimed job write to the SAME fixed path, and they do NOT
+    # necessarily write the same bytes: each render re-reads the listing at its own
+    # start (see the top of this function -- deliberately, so a deleted photo is not
+    # used), so if the agent edited photos or price in between, the two videos differ.
+    # Whichever finishes last wins the path, and the listing can end up recording one
+    # render's URL while the bytes sitting at it are the other's. Supabase documents
+    # upsert as last-writer-wins and does not document the replace as atomic.
+    #
+    # So: confirm we still own this job immediately before the upload, and again before
+    # the listing write. ownership_check is None on the legacy in-process path, where
+    # there is no second renderer to collide with.
+    if ownership_check is not None and not ownership_check():
+        raise video_jobs.SupersededError(
+            "this render was reclaimed by another worker before its video was stored")
+
     filename = f"videos/{listing_id}.mp4"
-    supabase.storage.from_("listings-images").upload(
-        filename,
-        video_bytes,
-        {"content-type": "video/mp4", "upsert": "true"}
-    )
-    video_url = f"{supabase.storage.from_('listings-images').get_public_url(filename)}?v={uuid.uuid4().hex[:8]}"
+    video_url = _store_rendered_video(filename, video_bytes)
+
+    if ownership_check is not None and not ownership_check():
+        raise video_jobs.SupersededError(
+            "this render was reclaimed by another worker before the listing was updated")
 
     update_payload = {"video_url": video_url, "video_status": "done", "video_error": None}
     if persist_video_template_id:
@@ -3620,6 +3699,11 @@ def _classic_job_run(job: dict):
             payload.get("video_template_id") or DEFAULT_VIDEO_TEMPLATE_ID,
             bool(payload.get("persist_video_template_id")),
             int(payload.get("photo_index") or 0),
+            # Re-checked immediately before the video is stored and again before the
+            # listing is updated. heartbeat() is already the fenced "is this still ours
+            # at the attempt we claimed" question, so it answers this exactly, and it
+            # doubles as a liveness beat at the two slowest moments of the job.
+            ownership_check=lambda: video_jobs.heartbeat(job),
         )
     except video_renderer.RenderSlotBusy as e:
         # Should not happen -- the queue hands out at most one Classic job per process,
@@ -3689,7 +3773,13 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
         try:
             job, created = await asyncio.to_thread(
                 video_jobs.enqueue,
-                video_jobs.JOB_TYPE_CLASSIC, listing_id, agent["id"],
+                # The listing row's OWN id, not the one spelled in the URL. Postgres
+                # compares uuids case-insensitively, so a mixed-case path would find
+                # the listing yet produce a differently-spelled text key in video_jobs
+                # -- and a differently-spelled key slips past the partial unique index,
+                # which is the one thing standing between a double-click and a double
+                # render.
+                video_jobs.JOB_TYPE_CLASSIC, listing.get("id") or listing_id, agent["id"],
                 {
                     "video_template_id": chosen_video_template_id,
                     "persist_video_template_id": persist_video_template_id,
@@ -3701,6 +3791,20 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
             # fails we would rather render the old way than tell the agent no.
             logger.warning("generate_video: could not enqueue (%s: %s) -- falling back "
                            "to an in-process render", type(e).__name__, e)
+            # This is the signature of a key that passed the probe but cannot write:
+            # the probe now catches that at startup, so reaching here means something
+            # changed underneath us. Either way it is silent degradation back to the
+            # exact behaviour this work replaced, so it must reach Jane, not just the
+            # Railway logs.
+            await send_telegram_alert_throttled(
+                "video_queue_enqueue_failed",
+                "⚠️ <b>NestList Warning</b>\n\nA video request could not be added to "
+                "the render queue, so it rendered the old way instead "
+                f"(<code>{type(e).__name__}</code>).\n\nVideos are still being made, "
+                "but renders in progress will not survive a redeploy. Check the "
+                "<code>video_jobs</code> table and that SUPABASE_KEY is the service key.",
+                cooldown_seconds=3600,
+            )
         else:
             # A second press of Generate while one is already in flight is NOT an error
             # and no longer returns 409. The partial unique index means the duplicate
@@ -3737,12 +3841,32 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                 logger.warning("generate_video: could not describe job %s (%s)",
                                job.get("id"), e)
                 progress = {}
+
+            # THE TEMPLATE WE REPORT IS THE ONE THAT WILL ACTUALLY BE RENDERED.
+            #
+            # When the job already existed, the render in flight is using the template
+            # it was queued with -- not the one this request asked for. Echoing back the
+            # newly chosen id would tell an agent who started Style A and then switched
+            # to Style B that they are getting B, and hand them A with no error at all.
+            # The old 409 was less convenient but it was honest, and quietly delivering
+            # the wrong thing is worse than being told to wait.
+            in_flight_template = (
+                (job.get("payload") or {}).get("video_template_id")
+                or chosen_video_template_id
+            )
             if not created:
                 logger.info("generate_video: listing %s already had a Classic job in "
-                            "flight; returning its position", listing_id)
+                            "flight (template %s); returning its position",
+                            listing_id, in_flight_template)
             return dict({
                 "status": "rendering",   # unchanged wire value: the existing app polls on this
-                "video_template_id": chosen_video_template_id,
+                "video_template_id": in_flight_template,
+                # Set when this press did NOT start a new render. The template actually
+                # being made is video_template_id above; what this press asked for is
+                # requested_video_template_id. They differ only when the agent changed
+                # style mid-render, which is precisely when the UI needs to say so.
+                "already_in_flight": not created,
+                "requested_video_template_id": chosen_video_template_id,
                 "queued": True,
             }, **progress)
 

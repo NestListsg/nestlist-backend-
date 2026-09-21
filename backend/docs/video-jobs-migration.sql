@@ -12,9 +12,17 @@
 -- Supabase dashboard -> SQL Editor -> New query -> paste ALL of section 1 -> Run.
 -- It is safe to run more than once (every statement is IF NOT EXISTS).
 --
--- ORDER DOES NOT MATTER. The backend probes for this table at startup. Until it exists,
--- video generation keeps working exactly as it does today, on the old in-process path.
--- So you can run this before or after the deploy, and nothing breaks either way.
+-- ORDER IS SAFE EITHER WAY, BUT YOU MUST RESTART AFTERWARDS.
+-- The backend checks for this table ONCE, when each process starts, and never checks
+-- again. So:
+--   * Running this BEFORE the deploy: nothing more to do, the deploy restarts the
+--     service and picks the table up.
+--   * Running this AFTER the deploy: the queue stays OFF until the service restarts.
+--     Redeploy from Railway (or restart the service) once the SQL has run.
+-- Nothing breaks while the queue is off -- video generation keeps working exactly as it
+-- does today, on the old in-process path -- but the problems this table fixes carry on
+-- until the restart. You will get a Telegram warning if the backend starts up and finds
+-- the queue unavailable, so no news after a restart is good news.
 -- ============================================================================
 
 

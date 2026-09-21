@@ -62,6 +62,10 @@ class _Query:
         self.filters.append(("lt", column, value))
         return self
 
+    def gt(self, column, value):
+        self.filters.append(("gt", column, value))
+        return self
+
     def lte(self, column, value):
         self.filters.append(("lte", column, value))
         return self
@@ -93,6 +97,9 @@ class _Query:
                     return False
             elif kind == "lte":
                 if current is None or _cmp_key(current) > _cmp_key(value):
+                    return False
+            elif kind == "gt":
+                if current is None or _cmp_key(current) <= _cmp_key(value):
                     return False
         return True
 
@@ -163,6 +170,34 @@ class _Table:
 
     def delete(self):
         return _Query(self.db, self.name, "delete")
+
+
+class RlsFakeDB(object):
+    """A database our key can SELECT from but not INSERT into.
+
+    This is what Supabase actually does with `alter table ... enable row level
+    security` and no policies, for a key that is subject to RLS (i.e. the anon key
+    rather than the service key): default-deny FILTERS ROWS, it does not revoke the
+    privilege. So a SELECT succeeds and returns an empty array -- HTTP 200, no error --
+    while an INSERT is refused with 42501. Any probe that only reads cannot tell this
+    apart from an empty table."""
+
+    def __init__(self):
+        self.inner = FakeDB()
+
+    def table(self, name):
+        return _RlsTable(self.inner, name)
+
+
+class _RlsTable(_Table):
+    def insert(self, payload):
+        raise FakeAPIError(
+            'new row violates row-level security policy for table "video_jobs"',
+            code="42501")
+
+    def select(self, *columns, **kwargs):
+        # Succeeds, and returns nothing, because every row is filtered out.
+        return _Query(FakeDB(), self.name, "select", count=kwargs.get("count"))
 
 
 class FakeDB:

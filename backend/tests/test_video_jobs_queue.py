@@ -498,6 +498,220 @@ check("agent-facing queue metadata degrades to empty, not an error",
 
 
 # ===========================================================================
+print("\n[11] S3(a): a shutdown cannot resurrect a job that already finished")
+# ===========================================================================
+db = FakeDB()
+w = load_worker(db, 1100)
+w.enqueue(w.JOB_TYPE_CLASSIC, "listing-sigterm", "agent-1", {})
+job = w.claim_next(w.JOB_TYPE_CLASSIC)
+w._locally_claimed[job["id"]] = job          # execute_job records it here
+w.complete(job, "https://example/done.mp4", [], 50.0)
+check("the job is done with its video recorded",
+      db.rows[0]["status"] == "done" and db.rows[0]["result_url"])
+
+# SIGTERM lands in the window between complete() committing and execute_job's finally.
+w.release_local_claims()
+check("the finished job was NOT pushed back to queued",
+      db.rows[0]["status"] == "done", "status=%s" % db.rows[0]["status"])
+check("its attempt count was not rewound", db.rows[0]["attempts"] == 1,
+      "attempts=%s" % db.rows[0]["attempts"])
+check("the delivered video url survived", db.rows[0]["result_url"] == "https://example/done.mp4")
+
+# Same fence on the failure writes.
+db = FakeDB()
+w = load_worker(db, 1110)
+w.enqueue(w.JOB_TYPE_CLASSIC, "listing-sigterm2", "agent-1", {})
+job = w.claim_next(w.JOB_TYPE_CLASSIC)
+w.complete(job, "https://example/done2.mp4", [], 50.0)
+check("fail_permanently cannot overwrite a completed job",
+      w.fail_permanently(job, "late error") is False and db.rows[0]["status"] == "done")
+check("defer cannot overwrite a completed job",
+      w.defer(job, "late defer") is False and db.rows[0]["status"] == "done")
+
+
+# ===========================================================================
+print("\n[12] S1: a queued job nothing will ever run stops holding the listing")
+# ===========================================================================
+db = FakeDB()
+w = load_worker(db, 1200)
+told = []
+w.register_renderer(w.JOB_TYPE_CLASSIC, run=lambda job: ("u", []),
+                    on_final_failure=lambda job, err: told.append(err))
+w.enqueue(w.JOB_TYPE_CLASSIC, "listing-stuck", "agent-1", {})
+check("a fresh queued job is left alone", w.sweep_abandoned_queue() == 0)
+
+# Nobody ever claimed it, and nothing has finished -- the consumers are not running.
+db.rows[0]["updated_at"] = iso(now() - timedelta(seconds=w.QUEUED_ESCAPE_SECONDS + 60))
+freed = w.sweep_abandoned_queue()
+check("the abandoned job was released", freed == 1, "freed=%d" % freed)
+check("it failed rather than lingering", db.rows[0]["status"] == "failed")
+check("the agent is told something actionable",
+      "try generating it again" in db.rows[0]["error"], db.rows[0]["error"])
+check("the listing was notified once", len(told) == 1)
+
+# The listing is free again: the partial unique index no longer blocks a new job.
+_, created = w.enqueue(w.JOB_TYPE_CLASSIC, "listing-stuck", "agent-1", {})
+check("the agent can generate again without anyone running SQL", created is True)
+
+# A DEEP BUT HEALTHY queue must not be mistaken for a dead one.
+db = FakeDB()
+w = load_worker(db, 1210)
+for n in range(5):
+    w.enqueue(w.JOB_TYPE_CLASSIC, "deepq-%d" % n, "agent-1", {})
+for r in db.rows:
+    r["updated_at"] = iso(now() - timedelta(seconds=w.QUEUED_ESCAPE_SECONDS + 60))
+# ...but the queue IS draining: something finished a moment ago.
+db.rows.append({
+    "id": "recent-done", "job_type": "classic", "listing_id": "other", "agent_id": "a",
+    "status": "done", "attempts": 1, "max_attempts": 3, "payload": {},
+    "created_at": iso(now()), "updated_at": iso(now()), "finished_at": iso(now()),
+    "run_after": iso(now()), "claimed_by": None, "duration_seconds": 50.0,
+})
+check("a deep but draining queue is left strictly alone",
+      w.sweep_abandoned_queue() == 0,
+      "statuses=%s" % [r["status"] for r in db.rows[:5]])
+
+
+# ===========================================================================
+print("\n[13] S2(d): the probe detects a key that can read but not write")
+# ===========================================================================
+from fake_postgrest import RlsFakeDB
+
+rls = RlsFakeDB()
+w = load_worker(rls, 1300)
+w._table_available = None
+w.configure(make_db_execute(rls))
+check("a read-only SELECT against RLS succeeds and returns nothing (the trap)",
+      rls.table("video_jobs").select("id").limit(1).execute().data == [])
+check("the probe nonetheless FAILS, because it proves it can write",
+      w.probe() is False)
+check("so generate-video falls back instead of enqueuing into a black hole",
+      w.available() is False)
+
+# And on a healthy database it passes and leaves nothing behind.
+db = FakeDB()
+w = load_worker(db, 1310)
+w._table_available = None
+check("the probe passes on a writable table", w.probe() is True)
+check("the probe row was cleaned up", len(db.rows) == 0, "rows=%d" % len(db.rows))
+
+# Even if cleanup were skipped, a probe row must be invisible to everything that counts.
+db = FakeDB()
+w = load_worker(db, 1320)
+db.rows.append({
+    "id": "leftover-probe", "job_type": "classic",
+    "listing_id": w.PROBE_LISTING_ID, "agent_id": w.PROBE_LISTING_ID,
+    "status": "failed", "attempts": 0, "max_attempts": 3, "payload": {},
+    "created_at": iso(now()), "updated_at": iso(now()), "finished_at": iso(now()),
+    "run_after": iso(now()), "claimed_by": None, "duration_seconds": None,
+    "error": "startup write probe",
+})
+w.enqueue(w.JOB_TYPE_CLASSIC, "real-listing", "agent-1", {})
+desc = w.describe(w.get_job([r for r in db.rows if r["listing_id"] == "real-listing"][0]["id"]))
+check("a leftover probe row does not affect queue position",
+      desc["queue_position"] == 1, "position=%s" % desc.get("queue_position"))
+check("a leftover probe row is not claimable",
+      w.claim_next(w.JOB_TYPE_CLASSIC)["listing_id"] == "real-listing")
+
+
+# ===========================================================================
+print("\n[14] S2(c): a superseded render writes nothing the agent can see")
+# ===========================================================================
+db = FakeDB()
+w_slow = load_worker(db, 1400)
+w_new = load_worker(db, 1401)
+
+uploads = []          # stands in for the storage bucket
+listing_writes = []   # stands in for listings.video_url / video_status
+
+def render_with_ownership_checks(job):
+    """Mirrors _render_video_core: check ownership immediately before the upload, and
+    again immediately before the listing write."""
+    time.sleep(0.05)                                   # the render itself
+    if not w_slow.heartbeat(job):                      # check before storing
+        raise w_slow.SupersededError("reclaimed before the video was stored")
+    uploads.append(job["listing_id"])
+    if not w_slow.heartbeat(job):                      # check before the listing write
+        raise w_slow.SupersededError("reclaimed before the listing was updated")
+    listing_writes.append(job["listing_id"])
+    return "https://example/%s.mp4" % job["listing_id"], []
+
+w_slow.register_renderer(w_slow.JOB_TYPE_CLASSIC, run=render_with_ownership_checks)
+w_slow.enqueue(w_slow.JOB_TYPE_CLASSIC, "listing-super", "agent-1", {})
+stolen = w_slow.claim_next(w_slow.JOB_TYPE_CLASSIC)
+
+# While it renders, its heartbeat dies and the job is handed to another worker.
+db.rows[0]["heartbeat_at"] = iso(now() - timedelta(seconds=w_new.STALE_AFTER_SECONDS + 5))
+w_new.sweep_stale()
+new_owner = w_new.claim_next(w_new.JOB_TYPE_CLASSIC)
+check("another worker now owns the job", new_owner is not None and new_owner["attempts"] == 2)
+
+w_slow.execute_job(stolen)
+check("the superseded render never uploaded a video", uploads == [], str(uploads))
+check("the superseded render never touched the listing", listing_writes == [], str(listing_writes))
+check("the job row still belongs to the new owner, still running",
+      db.rows[0]["claimed_by"] == w_new.WORKER_ID and db.rows[0]["status"] == "running",
+      "status=%s" % db.rows[0]["status"])
+check("no result url was recorded by the loser", db.rows[0]["result_url"] is None)
+check("the supersession did not count as a failure", db.rows[0]["error"] is None)
+
+# The owner's own render completes normally, checks and all.
+w_new.register_renderer(w_new.JOB_TYPE_CLASSIC, run=render_with_ownership_checks)
+uploads.clear()
+listing_writes.clear()
+
+def render_as_owner(job):
+    if not w_new.heartbeat(job):
+        raise w_new.SupersededError("x")
+    uploads.append(job["listing_id"])
+    if not w_new.heartbeat(job):
+        raise w_new.SupersededError("x")
+    listing_writes.append(job["listing_id"])
+    return "https://example/owner.mp4", []
+
+w_new.register_renderer(w_new.JOB_TYPE_CLASSIC, run=render_as_owner)
+w_new.execute_job(new_owner)
+check("the rightful owner's render did complete and deliver",
+      db.rows[0]["status"] == "done" and uploads == ["listing-super"]
+      and listing_writes == ["listing-super"],
+      "status=%s uploads=%s" % (db.rows[0]["status"], uploads))
+
+
+# ===========================================================================
+print("\n[15] A deferred job is not re-claimed inside its own backoff")
+# ===========================================================================
+db = FakeDB()
+w = load_worker(db, 1500)
+w.enqueue(w.JOB_TYPE_CLASSIC, "listing-backoff", "agent-1", {})
+job = w.claim_next(w.JOB_TYPE_CLASSIC)
+stale_candidate = dict(job)                      # a candidate list read before the defer
+w.defer(job, "no slot", backoff_seconds=60)
+check("the job is queued with a future run_after", db.rows[0]["status"] == "queued")
+check("claim_next will not pick it up during the backoff",
+      w.claim_next(w.JOB_TYPE_CLASSIC) is None)
+# Even a worker acting on a candidate list read BEFORE the defer must be refused.
+stale_candidate["attempts"] = 0
+check("a stale candidate cannot bypass the backoff via the CAS",
+      w._try_claim(stale_candidate) is None)
+
+
+# ===========================================================================
+print("\n[16] Two spellings of one uuid cannot become two renders")
+# ===========================================================================
+db = FakeDB()
+w = load_worker(db, 1600)
+upper = "A1B2C3D4-0000-0000-0000-00000000FFFF"
+lower = upper.lower()
+w.enqueue(w.JOB_TYPE_CLASSIC, upper, "agent-1", {})
+_, created = w.enqueue(w.JOB_TYPE_CLASSIC, lower, "agent-1", {})
+check("the second spelling did not create a second job", created is False)
+check("only one row exists", len(db.rows) == 1, "rows=%d" % len(db.rows))
+check("find_active resolves either spelling",
+      w.find_active(w.JOB_TYPE_CLASSIC, upper) is not None
+      and w.find_active(w.JOB_TYPE_CLASSIC, lower) is not None)
+
+
+# ===========================================================================
 print("\n" + "=" * 70)
 print("PASSED: %d    FAILED: %d" % (len(PASS), len(FAIL)))
 if FAIL:
