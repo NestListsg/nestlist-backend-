@@ -673,11 +673,20 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 def verify_password(password: str, hashed: str) -> bool:
+    # Bcrypt or nothing. There used to be a `return password == hashed` fallback
+    # here for pre-bcrypt rows, which meant a plain-text value sitting in
+    # password_hash was a working credential -- anyone who could read the column
+    # could log in. Every stored hash is bcrypt (verified 2026-09-21), so the
+    # only rows this can now refuse are corrupt or empty ones, which SHOULD be
+    # refused. Bare `except:` also swallowed KeyboardInterrupt/SystemExit, so a
+    # shutdown landing mid-verify looked like a wrong password.
     try:
         if hashed.startswith("$2b$") or hashed.startswith("$2a$"):
             return bcrypt.checkpw(password.encode(), hashed.encode())
-        return password == hashed
-    except:
+        logger.warning("verify_password: stored credential is not a bcrypt hash -- refusing login")
+        return False
+    except Exception as e:
+        logger.warning("verify_password failed (%s: %s) -- refusing login", type(e).__name__, e)
         return False
 
 def create_token(agent_id: str) -> str:
@@ -775,8 +784,26 @@ def _agent_response(agent) -> dict:
 # ================================
 # AUTH ROUTES
 # ================================
+_login_hits = {}
+
 @app.post("/api/login")
-def login(req: LoginRequest):
+def login(req: LoginRequest, request: Request):
+    # Login was the one public door with no limit on it, so a stolen email list
+    # could be walked through at whatever rate the network allowed. Keyed on IP
+    # only -- never on the email -- so the limiter can't be used to probe which
+    # addresses are registered, and so one agent can't be locked out by someone
+    # else hammering their address.
+    #
+    # 10 per 10 minutes is deliberately on the generous side. An agent who
+    # fat-fingers their password needs three or four tries; Singapore agencies
+    # commonly share one office IP, so a handful of agents signing in together
+    # must not trip it, and any block clears in ten minutes rather than an hour.
+    # See the note on _rate_limited: with 4 uvicorn workers the real ceiling is
+    # up to 40 per 10 minutes per IP. That is still far too slow to brute-force
+    # a bcrypt cost-12 hash, and it is what stops a credential-stuffing run.
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if _rate_limited(_login_hits, client_ip, limit=10, window_seconds=600):
+        raise HTTPException(status_code=429, detail="Too many login attempts — please try again in a few minutes")
     result = get_db().table("agents").select("*").eq("email", req.email).execute()
     if not result.data:
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -1048,8 +1075,30 @@ def confirm_password_reset(req: PasswordResetConfirm):
     if datetime.utcnow() > expires_at:
         raise HTTPException(status_code=400, detail="This reset link has expired. Please request a new one.")
 
-    db_execute(lambda db: db.table("agents").update({"password_hash": hash_password(req.new_password)}).eq("id", reset_row["agent_id"]), what="confirm_password_reset agents update")
+    # These are two separate writes and there is no transaction across them, so
+    # the ORDER decides which way a half-completed reset fails. Burn the token
+    # FIRST: if the second write then fails, the agent gets a visible error and
+    # a dead link, and asks for a new one. The other way round -- password first
+    # -- a failed second write left the password changed, the link still valid
+    # for the rest of its hour, and nobody told about either.
+    #
+    # Both writes are safe to retry: used_at and the hash are literal values
+    # filtered by id. The hash is computed once up front so a retry re-sends the
+    # same value rather than re-running bcrypt (cost 12) on the hot path.
     db_execute(lambda db: db.table("password_resets").update({"used_at": datetime.utcnow().isoformat()}).eq("id", reset_row["id"]), what="confirm_password_reset password_resets update")
+
+    new_hash = hash_password(req.new_password)
+    try:
+        db_execute(lambda db: db.table("agents").update({"password_hash": new_hash}).eq("id", reset_row["agent_id"]), what="confirm_password_reset agents update")
+    except Exception as e:
+        # The link is already spent, so "try again" would just hit the
+        # already-used branch above and confuse them. Say plainly that the
+        # password did NOT change and that they need a fresh link.
+        logger.error("password reset: token burned but password update failed for agent %s: %s", reset_row["agent_id"], e)
+        raise HTTPException(
+            status_code=503,
+            detail="Your password was not changed — we couldn't reach the database. This reset link is no longer usable; please request a new one.",
+        )
 
     return {"success": True}
 
@@ -4603,6 +4652,25 @@ def exchange_long_lived_token(req: TokenExchangeRequest, agent=Depends(get_curre
 # ================================
 # PUBLIC ROUTES (no auth — buyer-facing)
 # ================================
+# ---- Rate limiting ----
+# READ BEFORE CHOOSING A LIMIT. These counters are plain in-memory dicts and the
+# Procfile runs `uvicorn --workers 4`. Each worker keeps its OWN copy, so the
+# effective ceiling for any key is up to 4x the `limit` passed in: the 5-per-hour
+# password reset limit is really up to 20 per hour, the 120-per-hour listing view
+# limit up to 480, and the 10-per-10-minutes login limit up to 40.
+#
+# We deliberately do NOT divide the limits by the worker count to compensate.
+# HTTP keep-alive pins one client's connections to a single worker, so one
+# agent's attempts usually all land on the SAME worker and would hit a
+# divided-down limit at a quarter of the intended allowance -- locking out real
+# agents in exchange for slowing an attacker, who can open fresh connections and
+# spread across all four workers anyway. Each limit below is instead chosen with
+# its 4x worst case in mind, and stated here so nobody reads "5 per hour" and
+# believes it.
+#
+# FOLLOW-UP (before the 50-agent rollout): move these counters to one shared
+# store -- Redis, or a small Postgres table -- so a limit means what it says.
+# Until then, every advertised number silently loosens if workers are added.
 _public_enquiry_hits = {}
 _password_reset_hits = {}
 # Public read endpoints (by-id and coded enquiry links). Rate-limited per IP so
@@ -4610,8 +4678,26 @@ _password_reset_hits = {}
 # enough that a real buyer refreshing/reloading a listing is never blocked.
 _public_listing_view_hits = {}
 
+# Longest window any caller uses, and how often a store is swept for dead keys.
+_RATE_LIMIT_MAX_WINDOW_SECONDS = 3600
+_RATE_LIMIT_SWEEP_SECONDS = 600
+_rate_limit_last_sweep = {}
+
 def _rate_limited(store: dict, key: str, limit: int = 5, window_seconds: int = 3600) -> bool:
     now = datetime.utcnow()
+    # Evict dead keys. Without this, `store` kept one entry per IP that ever
+    # touched the endpoint, for the life of the worker -- a slow leak that only
+    # surfaces weeks later as a memory-killed worker. Swept at most once every
+    # ten minutes (so a busy endpoint doesn't pay for it per request) and on a
+    # horizon no shorter than the longest window in use, so a sweep can never
+    # drop hits that a longer-window caller still counts.
+    last_sweep = _rate_limit_last_sweep.get(id(store))
+    if last_sweep is None or (now - last_sweep).total_seconds() > _RATE_LIMIT_SWEEP_SECONDS:
+        _rate_limit_last_sweep[id(store)] = now
+        horizon = max(window_seconds, _RATE_LIMIT_MAX_WINDOW_SECONDS)
+        # hits are appended in time order, so the last one is the newest.
+        for dead in [k for k, v in store.items() if not v or (now - v[-1]).total_seconds() > horizon]:
+            del store[dead]
     hits = [t for t in store.get(key, []) if (now - t).total_seconds() < window_seconds]
     hits.append(now)
     store[key] = hits
