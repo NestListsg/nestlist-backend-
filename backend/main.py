@@ -3435,6 +3435,10 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
             style=chosen_video_template_id,
             photo_index=photo_index,
             agent_photo_url=agent.get("photo_url"),
+            # Picks the music bed from the audio/ library. Keyed on the listing id so
+            # a regenerated video keeps the soundtrack the agent already approved,
+            # while two listings side by side don't sound like the same template.
+            music_seed=listing_id,
             # Room captions are model-written and burned into the video, so they go
             # through exactly the same house-number/price stripping as every other
             # copy surface. Passed in rather than imported because video_renderer
@@ -4716,7 +4720,7 @@ async def generate_enquiry_auto_reply(enquiry_id: str, agent=Depends(get_current
     # Template fallback -- always sendable, never mentions price.
     fallback_message = (
         f"Hi {first_name}, thanks for reaching out about the {property_type} in {area_phrase}! "
-        f"I'd be happy to help. I've put together a short video tour plus the full details for you to look through. "
+        f"I'd be happy to help. I've put together a short video tour — tap the link below to watch it and see the full details. "
         f"Would you be free for a viewing this week? Happy to work around your schedule. — {agent_name}"
     )
 
@@ -4733,7 +4737,7 @@ Write the WhatsApp reply as 3-5 short sentences, warm and concise, natural Whats
 - Greet {first_name} by first name.
 - Acknowledge their specific enquiry.
 - Highlight the {property_type} in {area_phrase}.
-- Mention that a short video tour and the full details are included.
+- Tell them the video tour and full details are on the link, and invite them to tap it.
 - Invite them to a viewing.
 - Sign off as {agent_name}.
 Do NOT mention any price, budget, or dollar figure. Return ONLY the message text -- no preamble, no surrounding quotes."""

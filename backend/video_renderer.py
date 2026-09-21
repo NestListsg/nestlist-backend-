@@ -1,8 +1,8 @@
 """NestList property video renderer -- the production "Classic tier" listing video.
 
 Turns a listing's photos into a 1080x1920 (9:16) cinematic slideshow: alternating Ken
-Burns motion, one expressive AI-written room caption per photo, a soft piano bed, and a
-closing contact card built from the agent's own profile.
+Burns motion, one expressive AI-written room caption per photo, a music bed picked from
+the audio/ library, and a closing contact card built from the agent's own profile.
 
 Vertical is the only output format, because these videos are posted to Facebook,
 Instagram and TikTok. Since listing photos are overwhelmingly landscape, the frame is
@@ -29,6 +29,7 @@ than looking like a normal success.
 Requires the `ffmpeg` binary (with `ffprobe`) on PATH -- see railpack.json.
 """
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -164,10 +165,16 @@ TIMEOUT_PROBE = 30
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# "Piano Soft Gentle Morning Keys" by Alex Morgan, from Pixabay, whose Content License
-# permits commercial use (including social video) without attribution -- see
-# audio/LICENSE-music.txt. Byte-identical to the track validated in the prototypes.
-AUDIO_PATH = os.path.join(_HERE, "audio", "soft_piano.mp3")
+# The music bed is whatever audio files are sitting in audio/ at deploy time -- the
+# directory IS the library, so adding a track is a file drop plus a licence note, with
+# no code change. Today that directory holds one file ("Piano Soft Gentle Morning Keys"
+# by Alex Morgan, from Pixabay, whose Content License permits commercial use including
+# social video without attribution -- see audio/LICENSE-music.txt; byte-identical to
+# the track validated in the prototypes), so every video sounds exactly as it does now.
+AUDIO_DIR = os.path.join(_HERE, "audio")
+# Anything ffmpeg can decode and our aac encode can consume. LICENSE-music.txt and any
+# stray .DS_Store are excluded by not being on this list.
+AUDIO_EXTENSIONS = (".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus")
 
 FONT_DIR = os.path.join(_HERE, "fonts")
 # Gelasio is metric-compatible with Georgia, which the prototypes used (a macOS system
@@ -335,6 +342,60 @@ _BANNED_CAPTION_WORDS = {
     "opulent", "lavish", "breathtaking", "sprawling", "boasts", "nestled",
 }
 _PRICE_TOKENS = ("$", "sgd", "psf", "price", "priced", "psm", "£", "€", "usd")
+
+
+# ---------------------------------------------------------------------------
+# Music bed selection
+# ---------------------------------------------------------------------------
+def _music_library():
+    """Every usable track in audio/, sorted by filename. [] if there are none.
+
+    Read fresh on each render rather than cached at import: a render takes a minute,
+    so one listdir costs nothing, and a cache would mean a track added to the volume
+    stayed invisible until the worker restarted.
+    """
+    try:
+        names = sorted(
+            name for name in os.listdir(AUDIO_DIR)
+            if not name.startswith(".")
+            and name.lower().endswith(AUDIO_EXTENSIONS)
+            and os.path.isfile(os.path.join(AUDIO_DIR, name))
+        )
+    except OSError as e:
+        logger.warning("could not read the music directory %s (%s)", AUDIO_DIR, e)
+        return []
+    return [os.path.join(AUDIO_DIR, name) for name in names]
+
+
+def _select_music_track(seed):
+    """Pick this listing's track. Same seed + same library -> always the same file.
+
+    Determinism is the requirement, not variety-for-its-own-sake: an agent who
+    regenerates a video must get back the film they already approved, so a random
+    pick is wrong. Python's built-in hash() is also wrong -- it is salted per process
+    (PYTHONHASHSEED), so two uvicorn workers would disagree about the same listing.
+    sha256 is stable across processes, machines and Python versions.
+
+    The pick is rendezvous ("highest random weight") hashing rather than
+    sha256(seed) % len(tracks), because the modulus form is keyed on a track's
+    POSITION in the list: adding one file to the library renumbers everything and
+    silently reassigns the music of nearly every existing listing. Rendezvous hashing
+    keys on the track's own filename instead, so adding a track moves only the ~1/N of
+    listings that land on it, and removing a track moves only the listings that had it.
+    Everyone else keeps the music they had. Distribution is uniform either way.
+    """
+    tracks = _music_library()
+    if not tracks:
+        return None
+    if len(tracks) == 1:
+        return tracks[0]
+    key = str(seed or "")
+
+    def weight(path):
+        blob = f"{key}\x00{os.path.basename(path)}".encode("utf-8")
+        return hashlib.sha256(blob).digest()
+
+    return max(tracks, key=weight)
 
 
 # ---------------------------------------------------------------------------
@@ -1111,7 +1172,7 @@ def _build_card_clip(body_path, card_img, out_path, workdir):
 def render_property_video(image_urls, property_type=None, district=None, price_text=None,
                           stats=None, agent_name="", agent_contact_line="",
                           style="classic", photo_index=0, agent_photo_url=None,
-                          copy_guard=None):
+                          copy_guard=None, music_seed=None):
     """Renders the Classic-tier listing video and returns (mp4_bytes, degradations).
 
     `degradations` is a list of plain-language strings naming anything that quietly
@@ -1127,6 +1188,10 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     the agent already uses for the poster (My Listings' star picker).
     agent_photo_url: optional. Without it the closing card renders without the portrait
     circle rather than leaving an empty ring.
+    music_seed: chooses the music bed from the audio/ library, deterministically --
+    main.py passes the listing id, so regenerating a listing's video always brings
+    back the same track. Omitting it is safe (every listing then shares one track);
+    it only matters once audio/ holds more than one file.
     copy_guard: optional callable(text, context=...) -> text. main.py passes
     apply_listing_copy_guards so captions go through the same house-number/price
     stripping as every other copy surface. Passed in rather than imported because
@@ -1258,7 +1323,8 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             # --- music bed (degrades to silence) ---
             final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
             wrote_final = False
-            if os.path.exists(AUDIO_PATH):
+            track_path = _select_music_track(music_seed)
+            if track_path:
                 fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
                 audio_filter = (
                     f"[1:a]atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS,"
@@ -1270,18 +1336,25 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                     _run_ffmpeg([
                         "ffmpeg", "-y", "-i", silent_path,
                         # -stream_loop so a track shorter than the video still covers it.
-                        "-stream_loop", "-1", "-i", AUDIO_PATH,
+                        "-stream_loop", "-1", "-i", track_path,
                         "-filter_complex", audio_filter,
                         "-map", "0:v", "-map", "[aout]",
                         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                         "-movflags", "+faststart", final_path,
                     ], TIMEOUT_MUSIC)
                     wrote_final = True
+                    # Logged on every render so "why does my video sound different
+                    # from my colleague's?" is answerable from Railway's logs alone.
+                    logger.info("music bed: %s (seed %r)",
+                                os.path.basename(track_path), str(music_seed or ""))
                 except Exception as e:
-                    logger.warning("music bed failed (%s); shipping a silent video", e)
+                    # Covers an unreadable or corrupt track as well as a mux failure:
+                    # either way the video ships, silent.
+                    logger.warning("music bed %s failed (%s); shipping a silent video",
+                                   os.path.basename(track_path), e)
                     degradations.append("the background music could not be added")
             else:
-                logger.warning("music track missing at %s", AUDIO_PATH)
+                logger.warning("no usable music track found in %s", AUDIO_DIR)
                 degradations.append("the background music file is missing from the deploy")
 
             if not wrote_final:
