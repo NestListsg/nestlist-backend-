@@ -3260,6 +3260,26 @@ _CAPTION_REJECTION_REASONS = {
 }
 
 
+def _agent_caption_overrides(stored) -> dict:
+    """Pull out only the captions an AGENT wrote, as {photo url: text}.
+
+    Entries the model wrote are kept in the same column so the agent can read back
+    what their video says, but they are deliberately NOT treated as overrides. The
+    first version of this replayed every stored caption, which quietly pinned a wrong
+    caption to a listing forever and meant an improved prompt could never reach any
+    listing that had been rendered once.
+
+    A bare string is the old shape, written before this distinction existed. Those all
+    came from the model, so they are read as model-written -- which is what lets a
+    listing carrying a wrong caption pick up the fix on its next render.
+    """
+    out = {}
+    for url, value in (stored or {}).items():
+        if isinstance(value, dict) and value.get("edited") and value.get("text"):
+            out[url] = value["text"]
+    return out
+
+
 def _explain_caption_rejection(reason: str) -> str:
     """Turn the guard's internal code into something an agent can act on.
 
@@ -3325,7 +3345,7 @@ def update_video_captions(listing_id: str, req: CaptionUpdate, agent=Depends(get
         if not ok:
             rejected[url] = _explain_caption_rejection(reason)
             continue
-        stored[url] = text
+        stored[url] = {"text": text, "edited": True}
 
     db_execute(
         lambda db: db.table("listings").update({"video_captions": stored}).eq("id", listing_id).eq("agent_id", agent["id"]),
@@ -3779,8 +3799,11 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
         # copy surface. Passed in rather than imported because video_renderer
         # cannot import main (main imports it).
         copy_guard=apply_listing_copy_guards,
-        # Anything the agent has rewritten for this listing wins over the model.
-        caption_overrides=(listing.get("video_captions") or {}),
+        # Only captions the AGENT rewrote may override the model. The ones the model
+        # wrote last time are stored too -- so the agent can read them back -- but they
+        # must NOT be replayed, or a wrong caption becomes permanent and no improvement
+        # to the prompt can ever reach a listing that has been rendered once.
+        caption_overrides=_agent_caption_overrides(listing.get("video_captions")),
     )
     if degradations:
         # The agent still gets a video, so this is not a failure -- but a quietly
@@ -3830,8 +3853,14 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
     # video they just waited for.
     if captions_used:
         try:
+            merged = dict(listing.get("video_captions") or {})
+            for url, text in captions_used.items():
+                prev = merged.get(url)
+                if isinstance(prev, dict) and prev.get("edited"):
+                    continue          # the agent's wording stands; do not overwrite it
+                merged[url] = {"text": text, "edited": False}
             db_execute(
-                lambda db: db.table("listings").update({"video_captions": captions_used}).eq("id", listing_id).eq("agent_id", agent["id"]),
+                lambda db: db.table("listings").update({"video_captions": merged}).eq("id", listing_id).eq("agent_id", agent["id"]),
                 what="_render_video_job captions update",
             )
         except Exception as e:
