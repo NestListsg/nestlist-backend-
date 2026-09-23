@@ -29,6 +29,7 @@ from urllib.parse import quote
 from PIL import Image as PILImage, ImageEnhance, ImageOps, ImageStat
 import fitz
 import poster_renderer
+import photo_tidy
 import video_renderer
 import video_jobs
 import ura_market_pulse
@@ -4389,6 +4390,11 @@ def upload_avatar_photos(req: AvatarPhotosRequest, agent=Depends(get_current_age
             # for a likeness, and detail around the eyes and hairline is exactly what a
             # 1200px cap throws away.
             pil_img.thumbnail((AVATAR_PHOTO_LONG_EDGE, AVATAR_PHOTO_LONG_EDGE))
+            # Flyaway strands stand out sharply against the plain wall the shooting
+            # guide asks agents to stand in front of, and they carry into every avatar
+            # built from the photo. No agent is going to notice or ask, so it happens
+            # here, for everyone. Falls back to the photo as uploaded if it cannot help.
+            pil_img = photo_tidy.tidy_stray_hairs(pil_img)
             buf = io.BytesIO()
             pil_img.save(buf, format="JPEG", quality=90)
             buf.seek(0)
