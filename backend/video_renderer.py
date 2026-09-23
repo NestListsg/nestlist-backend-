@@ -697,6 +697,23 @@ Rules, no exceptions:
   Describe what is actually visible and how it feels, not status.
 - If a photo shows an exterior, a view, or a detail rather than a room, name that
   instead ("the terrace", "quiet mornings", "the garden path").
+- NEVER name a room type you cannot actually see the evidence for. This is the rule
+  that matters most: a caption is a claim about the property, and a wrong one is a
+  misrepresentation the agent has to answer for.
+    * "the kitchen" needs a worktop, a sink or a hob IN THE PHOTO.
+    * "the dining hall" needs a dining table laid out as a dining table -- a desk, a
+      work table or a table pushed against a wall is NOT a dining hall.
+    * "the master suite" or "the bedroom" needs a bed.
+    * "the pool" needs water.
+  If the defining feature is not visible, do NOT guess the room from the style of the
+  furniture, the flooring, or what a house "usually" has next to it.
+- When you cannot tell what a space is, say something true about what IS there --
+  "the open living space", "morning light through the windows", "the upper landing",
+  "where the day begins". A quieter caption that is true always beats a specific one
+  that is wrong.
+- A space can serve two purposes. If a room holds both a work table and a dining
+  table, do not pick one and hide the other -- describe the room as it is
+  ("the flexible room ... where work and home sit side by side").
 
 Reply with JSON only, no other text, in exactly this shape:
 {{"captions": [{{"n": 1, "caption": "..."}}, {{"n": 2, "caption": "..."}}]}}
