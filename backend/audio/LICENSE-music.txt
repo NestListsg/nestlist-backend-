@@ -72,3 +72,61 @@ Before adding a track: normalise it to roughly -9.8 LUFS, confirm with
   ffmpeg -i <file> -af ebur128=framelog=quiet -f null -
 and only then list it here. A track nobody can account for, or one nobody has
 levelled, does not belong in this directory.
+
+
+Added 2026-09-23 (second batch) -- enough tracks that a portfolio varies
+=======================================================================
+Two tracks per tier was still too few. An agent with a dozen semi-detached
+listings would have heard the same two pieces across all of them, and so would
+a buyer browsing several of that agent's listings. All Pixabay Content Licence,
+free commercial use, no attribution required. All trimmed to 75s with a 3s fade
+and levelled to match soft_piano.mp3.
+
+WARM tier (semi-detached, terrace, unconfirmed):
+
+  peaceful_piano.mp3        "Peaceful Piano" by leberch
+                            https://pixabay.com/music/solo-piano-peaceful-piano-590944/
+                            MD5 475e9d94b568fb28790230f0effde774   -10.5 LUFS
+
+  soft_piano_leberch.mp3    "Soft Piano" by leberch
+                            https://pixabay.com/music/solo-piano-soft-piano-590997/
+                            MD5 f74e51130330f71b5b623bd5817af3f0   -12.0 LUFS
+                            NOTE: named with the artist suffix on purpose. It is
+                            a DIFFERENT track from soft_piano.mp3 ("Piano Soft
+                            Gentle Morning Keys" by Alex Morgan) despite the
+                            similar title. Do not treat them as duplicates.
+
+  reading.mp3               "Reading" by leberch
+                            https://pixabay.com/music/modern-classical-reading-590426/
+                            MD5 fff0c7219990d91959f72845a2c72ced   -11.1 LUFS
+
+  cozy_ambience.mp3         "Cozy Ambience" by leberch
+                            https://pixabay.com/music/ambient-cozy-ambience-603940/
+                            MD5 a4bcc81ceeb43f1b0bb8981e1a855e74   -10.8 LUFS
+
+  reflected_light.mp3       "Reflected Light" by SergePavkinMusic
+                            https://pixabay.com/music/beautiful-plays-reflected-light-147979/
+                            MD5 7075058a20915a6f60b35e4b585db567   -11.1 LUFS
+
+GRAND tier (GCB, bungalow, detached, penthouse):
+
+  the_way_home.mp3          "THE WAY HOME" by Good_B_Music
+                            https://pixabay.com/music/modern-classical-the-way-home-6674/
+                            MD5 93048f451eb95b253fdaad08e2b3c8b3   -10.7 LUFS
+
+  boundless_hope.mp3        "Boundless Hope" by Grand_Project
+                            https://pixabay.com/music/main-title-boundless-hope-269804/
+                            MD5 541ebdcd1a1d7ea89c932392de36f9a7    -9.8 LUFS
+
+  ambient_piano_strings.mp3 "Ambient Piano and Strings" by Good_B_Music
+                            https://pixabay.com/music/beautiful-plays-ambient-piano-and-strings-10711/
+                            MD5 69d938215acc7290db20bc4953474f7b   -10.5 LUFS
+
+Rejected in this batch, and why -- so nobody re-adds them:
+  "Piano Moment"            12% of its opening 35s is near-silence and the level
+                            wanders badly. A video would open on almost nothing.
+  "Ambient Cinematic
+   Atmosphere"              32% near-silence in the opening. Same problem, worse.
+  "Scotland Harp"           Mastered at -28.8 LUFS, 19 dB below the reference.
+                            Usable only after heavy normalisation; not worth it
+                            when better-behaved tracks were available.
