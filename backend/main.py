@@ -559,6 +559,14 @@ class ProfileUpdate(BaseModel):
     notification_channel: str = "telegram"
     whatsapp_number: str = ""
 
+class AvatarPhotosRequest(BaseModel):
+    images: list = []          # base64-encoded, one per photo
+
+
+class AvatarPhotoDelete(BaseModel):
+    url: str
+
+
 class ProfilePhotoRequest(BaseModel):
     image_data: str
 
@@ -4339,6 +4347,84 @@ def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_age
     except Exception:
         logger.exception("Profile photo upload failed for agent %s", agent["id"])
         raise HTTPException(status_code=500, detail="Something went wrong uploading that photo -- please try again")
+
+AVATAR_PHOTO_MAX = 8
+AVATAR_PHOTO_LONG_EDGE = 1600
+
+
+@app.post("/api/profile/avatar-photos")
+def upload_avatar_photos(req: AvatarPhotosRequest, agent=Depends(get_current_agent)):
+    """The one-time set of photos an agent gives us of themselves.
+
+    This is the thing that makes a Signature possible for an agent at all: their
+    likeness, captured once, reused for every Signature they ever order. It is NOT the
+    profile photo -- that is a single headshot for the contact card, cropped to a
+    circle. These are reference material for building the agent's avatar, so they want
+    several angles and rather more resolution than a card needs.
+
+    Kept as a LIST rather than one file because likeness from a single frontal photo is
+    unreliable -- the model has nothing to go on for the side of a face it has never
+    seen.
+
+    Appends rather than replaces, so an agent adding a better angle next week does not
+    lose the four they took today.
+    """
+    existing = list(agent.get("avatar_photos") or [])
+    if not req.images:
+        return {"avatar_photos": existing}
+    room = AVATAR_PHOTO_MAX - len(existing)
+    if room <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You already have {AVATAR_PHOTO_MAX} photos. Remove one before adding another.",
+        )
+
+    supabase = get_db()
+    added = []
+    for raw in req.images[:room]:
+        try:
+            img_bytes = base64.b64decode(raw)
+            pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+            # Bigger than the contact-card photo on purpose: this is reference material
+            # for a likeness, and detail around the eyes and hairline is exactly what a
+            # 1200px cap throws away.
+            pil_img.thumbnail((AVATAR_PHOTO_LONG_EDGE, AVATAR_PHOTO_LONG_EDGE))
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=90)
+            buf.seek(0)
+            filename = f"agents/{agent['id']}/avatar/{uuid.uuid4().hex[:12]}.jpg"
+            supabase.storage.from_("listings-images").upload(
+                filename, buf.read(), {"content-type": "image/jpeg", "upsert": "true"}
+            )
+            added.append(supabase.storage.from_("listings-images").get_public_url(filename))
+        except Exception:
+            logger.exception("avatar photo rejected for agent %s", agent["id"])
+            # One unreadable file must not cost the agent the others in the same upload.
+            continue
+
+    if not added:
+        raise HTTPException(status_code=400, detail="None of those files could be read as a photo")
+
+    photos = existing + added
+    db_execute(
+        lambda db: db.table("agents").update({"avatar_photos": photos}).eq("id", agent["id"]),
+        what="upload_avatar_photos agents update",
+    )
+    return {"avatar_photos": photos, "added": len(added), "skipped": len(req.images[:room]) - len(added)}
+
+
+@app.delete("/api/profile/avatar-photos")
+def delete_avatar_photo(req: AvatarPhotoDelete, agent=Depends(get_current_agent)):
+    """Remove one reference photo. The file is left in storage deliberately -- an
+    avatar already built from it does not become wrong, and deleting the bytes buys
+    nothing while risking a broken reference in something already generated."""
+    photos = [u for u in (agent.get("avatar_photos") or []) if u != req.url]
+    db_execute(
+        lambda db: db.table("agents").update({"avatar_photos": photos}).eq("id", agent["id"]),
+        what="delete_avatar_photo agents update",
+    )
+    return {"avatar_photos": photos}
+
 
 @app.get("/api/profile/telegram-connect-link")
 def get_telegram_connect_link(agent=Depends(get_current_agent)):
