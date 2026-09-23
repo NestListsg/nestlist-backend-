@@ -100,9 +100,7 @@ WARM tier (semi-detached, terrace, unconfirmed):
                             https://pixabay.com/music/modern-classical-reading-590426/
                             MD5 fff0c7219990d91959f72845a2c72ced   -11.1 LUFS
 
-  cozy_ambience.mp3         "Cozy Ambience" by leberch
-                            https://pixabay.com/music/ambient-cozy-ambience-603940/
-                            MD5 a4bcc81ceeb43f1b0bb8981e1a855e74   -10.8 LUFS
+
 
   reflected_light.mp3       "Reflected Light" by SergePavkinMusic
                             https://pixabay.com/music/beautiful-plays-reflected-light-147979/
@@ -130,3 +128,18 @@ Rejected in this batch, and why -- so nobody re-adds them:
   "Scotland Harp"           Mastered at -28.8 LUFS, 19 dB below the reference.
                             Usable only after heavy normalisation; not worth it
                             when better-behaved tracks were available.
+
+
+Removed 2026-09-23 -- Jane's call after hearing them under real footage
+=======================================================================
+Both were installed, then pulled the same day once they could be heard against
+the Classic video rather than judged on measurements alone. Measuring well is
+not the same as sounding right, which is the whole reason the audition step
+exists. Do not re-add without her say-so.
+
+  cozy_ambience.mp3         "Cozy Ambience" by leberch -- was tier: warm
+  cinematic_strings.mp3     "Cinematic Strings" by AtlasAudio -- was tier: grand
+
+Removing a track reassigns only the listings that had it; every other listing
+keeps the music it already had. Videos already rendered are untouched -- the
+file that shipped is the file the buyer keeps hearing.
