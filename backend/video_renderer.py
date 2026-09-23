@@ -1293,8 +1293,17 @@ def _build_card_clip(body_path, card_img, out_path, workdir):
 def render_property_video(image_urls, property_type=None, district=None, price_text=None,
                           stats=None, agent_name="", agent_contact_line="",
                           style="classic", photo_index=0, agent_photo_url=None,
-                          copy_guard=None, music_seed=None):
-    """Renders the Classic-tier listing video and returns (mp4_bytes, degradations).
+                          copy_guard=None, music_seed=None, caption_overrides=None):
+    """Renders the Classic-tier listing video and returns (mp4_bytes, degradations, captions).
+
+    `caption_overrides` maps a photo's URL to a caption the AGENT wrote. Keyed on the
+    URL rather than the photo's position because an agent who reorders or deletes a
+    photo must not silently inherit someone else's caption. Any photo without an
+    override is captioned by the model as before, so an agent who edits one line does
+    not lose the other five.
+
+    `captions` comes back as {photo url: caption} for the photos actually used, so the
+    caller can store them and show the agent what their video says.
 
     `degradations` is a list of plain-language strings naming anything that quietly
     fell back (no captions, no music, no card). Empty means a full-quality render.
@@ -1354,9 +1363,11 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
         )
     try:
         photos = []
+        photo_urls = []          # kept in step with `photos`; a skipped photo drops both
         for url in selected_urls:
             try:
                 photos.append(_fetch_listing_photo(url))
+                photo_urls.append(url)
             except Exception as e:
                 logger.warning("skipping unreadable photo %s: %s", url, e)
                 degradations.append("a photo could not be read and was skipped")
@@ -1371,7 +1382,29 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                 logger.warning("agent profile photo unavailable (%s)", e)
                 degradations.append("the agent's profile photo could not be loaded, so the closing card has no portrait")
 
-        captions, caption_note = _generate_room_captions(photos, copy_guard=copy_guard)
+        overrides = {}
+        for url, text in (caption_overrides or {}).items():
+            text = (text or "").strip()
+            ok, _reason = _caption_is_safe(text)
+            if ok:
+                overrides[url] = text
+        if overrides:
+            todo = [i for i, u in enumerate(photo_urls) if u not in overrides]
+            if todo:
+                generated, caption_note = _generate_room_captions(
+                    [photos[i] for i in todo], copy_guard=copy_guard)
+            else:
+                # Every photo carries an agent caption: no model call, no cost, no wait.
+                generated, caption_note = [], None
+            captions = [None] * len(photos)
+            for slot, i in enumerate(todo):
+                captions[i] = generated[slot] if slot < len(generated) else None
+            for i, u in enumerate(photo_urls):
+                if u in overrides:
+                    captions[i] = overrides[u]
+        else:
+            captions, caption_note = _generate_room_captions(photos, copy_guard=copy_guard)
+        captions_used = {u: captions[i] for i, u in enumerate(photo_urls) if captions[i]}
         if caption_note:
             degradations.append(f"captions: {caption_note}")
         caption_size = _caption_font_size(captions)
@@ -1497,6 +1530,6 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             len(clip_paths), silent_duration, len(data) / 1024 / 1024,
             time.monotonic() - started,
         )
-        return data, degradations
+        return data, degradations, captions_used
     finally:
         _RENDER_SLOTS.release()

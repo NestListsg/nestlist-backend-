@@ -3240,6 +3240,95 @@ async def enhance_listing_image_by_url(listing_id: str, image_url: str, agent=De
     new_url = await asyncio.to_thread(_enhance_listing_image, listing_id, agent["id"], None, image_url)
     return {"success": True, "image_url": new_url}
 
+_CAPTION_REJECTION_REASONS = {
+    "empty": "the caption is empty",
+    "too long": "too long for one line on screen",
+    "wrong format": "needs the ' ... ' in the middle, like \"the terrace ... where golden hours drift by\"",
+    "non-ascii": "please use plain English letters only",
+    "contains a digit": "captions cannot contain numbers -- no unit numbers, house numbers or prices",
+    "price-adjacent wording": "captions cannot mention price",
+    "unsupported punctuation": "please remove quotes, colons and percent signs",
+}
+
+
+def _explain_caption_rejection(reason: str) -> str:
+    """Turn the guard's internal code into something an agent can act on.
+
+    The superlative case carries the offending words inside the code
+    ("superlative (luxury, stunning)"), so it is matched by prefix and rebuilt --
+    naming the words is the whole point, since "remove the superlatives" is useless
+    advice if the agent cannot see which ones.
+    """
+    if reason.startswith("superlative"):
+        words = reason[reason.find("(") + 1:reason.rfind(")")] if "(" in reason else ""
+        if words:
+            return ("please remove %s -- captions describe what is actually there, "
+                    "not how impressive it is" % words)
+        return "please remove the superlatives"
+    return _CAPTION_REJECTION_REASONS.get(reason, reason)
+
+
+class CaptionUpdate(BaseModel):
+    captions: dict
+
+
+@app.patch("/api/listings/{listing_id}/captions")
+def update_video_captions(listing_id: str, req: CaptionUpdate, agent=Depends(get_current_agent)):
+    """Let the agent correct what their video says about their own property.
+
+    Captions are the one place the video makes a CLAIM -- "the kitchen", "the dining
+    hall" -- and the model writes them from the photos alone, so it can be wrong in a
+    way only the person who has stood in the property can catch. This endpoint is that
+    correction, and it is deliberately the agent's to make rather than ours.
+
+    Rejected captions are reported per photo instead of failing the whole save, so one
+    bad line never costs the agent the other five. The same house rules the model is
+    held to are enforced here: no digits (house numbers, unit numbers, prices), no
+    price-adjacent wording, no unsubstantiated superlatives. An agent typing a price
+    into a caption is exactly the CEA problem those rules exist to prevent, and a rule
+    the UI merely asks for is not a rule.
+
+    Takes effect on the NEXT render -- the current video already has the old caption
+    burned into its frames.
+    """
+    result = db_execute(
+        lambda db: db.table("listings").select("images, video_captions").eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="update_video_captions listing select",
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    listing = result.data[0]
+    known = set(listing.get("images") or [])
+
+    stored = dict(listing.get("video_captions") or {})
+    rejected = {}
+    for url, text in (req.captions or {}).items():
+        if url not in known:
+            # A caption for a photo that is no longer on the listing would be invisible
+            # and would resurface if that photo were ever re-added. Drop it.
+            rejected[url] = "that photo is no longer on this listing"
+            continue
+        text = (text or "").strip()
+        if not text:
+            stored.pop(url, None)          # cleared: the model writes this one again
+            continue
+        ok, reason = video_renderer._caption_is_safe(text)
+        if not ok:
+            rejected[url] = _explain_caption_rejection(reason)
+            continue
+        stored[url] = text
+
+    db_execute(
+        lambda db: db.table("listings").update({"video_captions": stored}).eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="update_video_captions listing update",
+    )
+    return {
+        "captions": stored,
+        "rejected": rejected,
+        "regenerate_required": True,
+    }
+
+
 @app.post("/api/listings/{listing_id}/post-facebook")
 def post_to_facebook(listing_id: str, req: FacebookPostRequest, agent=Depends(get_current_agent)):
     if not _can_use_facebook_beta(agent):
@@ -3661,7 +3750,7 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
     # ~1305 -- so this only affects any tier that does; either way it's never empty garbage.)
     price_text = f"SGD {_format_price_millions(listing.get('price'))}" if price_num > 0 else "Price on request"
 
-    video_bytes, degradations = video_renderer.render_property_video(
+    video_bytes, degradations, captions_used = video_renderer.render_property_video(
         image_urls=images,
         property_type=property_type_text,
         district=district_text,
@@ -3681,6 +3770,8 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
         # copy surface. Passed in rather than imported because video_renderer
         # cannot import main (main imports it).
         copy_guard=apply_listing_copy_guards,
+        # Anything the agent has rewritten for this listing wins over the model.
+        caption_overrides=(listing.get("video_captions") or {}),
     )
     if degradations:
         # The agent still gets a video, so this is not a failure -- but a quietly
@@ -3718,6 +3809,24 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
     if persist_video_template_id:
         update_payload["video_template_id"] = chosen_video_template_id
     db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="_render_video_job listings update")
+
+    # Store what the video actually says, so the agent can read it back and correct a
+    # caption without watching the whole film to find out what is in it.
+    #
+    # Deliberately a SEPARATE write, after the one that matters, and deliberately
+    # swallowed on failure. The video is the deliverable; these captions are a
+    # convenience on top of it. Bundling them into the payload above would mean a
+    # missing video_captions column -- the state of production between this deploy and
+    # the migration being run -- failing the whole update and costing the agent the
+    # video they just waited for.
+    if captions_used:
+        try:
+            db_execute(
+                lambda db: db.table("listings").update({"video_captions": captions_used}).eq("id", listing_id).eq("agent_id", agent["id"]),
+                what="_render_video_job captions update",
+            )
+        except Exception as e:
+            logger.warning("could not store captions for %s (%s) -- video is unaffected", listing_id, e)
     return video_url, degradations
 
 
