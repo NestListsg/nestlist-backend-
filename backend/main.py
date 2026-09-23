@@ -510,7 +510,10 @@ class ListingRequest(BaseModel):
     built_up: int = 0
     bedrooms: str
     bathrooms: str = ""
-    price: str
+    # OPTIONAL: blank/omitted is valid ("price on request"). A blank price must never block
+    # listing creation; the copy guards treat price<=0 as a no-op and the poster/video fall
+    # back to "Price on request".
+    price: str = ""
     features: str
     plot_width: float = 0
     plot_depth: float = 0
@@ -3461,11 +3464,15 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
         f"SGD {price_psf:,} psf" if price_psf else "",
     ]
 
+    # Price is optional. A blank price would otherwise render as "SGD " (empty garbage),
+    # so fall back to "Price on request". (The PSF stat above already self-omits at price 0.)
+    price_text = f"SGD {_format_price_millions(listing.get('price'))}" if price_num > 0 else "Price on request"
+
     try:
         poster_image = poster_renderer.render_poster(
             property_type=property_type_text,
             district=district_text,
-            price_text=f"SGD {_format_price_millions(listing['price'])}",
+            price_text=price_text,
             stats=stats,
             agent_name=agent["name"],
             agent_contact_line=agent.get("contact", ""),
@@ -3649,11 +3656,16 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
         f"SGD {price_psf:,} psf" if price_psf else "",
     ]
 
+    # Price is optional; a blank price falls back to "Price on request" instead of "SGD ".
+    # (Confirmed: the Classic tier doesn't draw price_text anyway -- see video_renderer.py
+    # ~1305 -- so this only affects any tier that does; either way it's never empty garbage.)
+    price_text = f"SGD {_format_price_millions(listing.get('price'))}" if price_num > 0 else "Price on request"
+
     video_bytes, degradations = video_renderer.render_property_video(
         image_urls=images,
         property_type=property_type_text,
         district=district_text,
-        price_text=f"SGD {_format_price_millions(listing['price'])}",
+        price_text=price_text,
         stats=stats,
         agent_name=agent["name"],
         agent_contact_line=agent.get("contact", ""),
