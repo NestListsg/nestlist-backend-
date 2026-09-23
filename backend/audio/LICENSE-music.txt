@@ -1,35 +1,74 @@
-NestList -- music library licences
-==================================
-Every file in this directory must be listed here with its source and licence
-BEFORE it ships. A track nobody can account for is a track we cannot defend.
+Music bundled with NestList Prestige
+====================================
 
-All tracks are levelled to about -9.8 LUFS to match soft_piano.mp3. This is not
-cosmetic: video_renderer.py applies ONE fixed volume to whichever track it picks,
-so a track mastered quieter simply plays too quietly in the finished video. One
-candidate measured -28.8 LUFS -- 19 dB below the reference -- and would have been
-effectively silent. Normalise every new track to match before adding it here.
+File:    soft_piano.mp3
+Track:   "Piano Soft Gentle Morning Keys"
+Artist:  Alex Morgan
+Source:  Pixabay (https://pixabay.com/music/  -- track id 575879)
+License: Pixabay Content License
+         https://pixabay.com/service/license-summary/
 
---------------------------------------------------------------------------------
-soft_piano.mp3
-  The original track, validated in the prototypes. Untagged in tracks.json on
-  purpose, so it stays eligible for every property type and both tiers keep at
-  least two options.
-  Source/licence: as originally obtained -- see repository history.
+What the Pixabay Content License permits, in plain terms:
 
---------------------------------------------------------------------------------
-minimal_piano.mp3            tier: warm
-  "Minimal Piano" by leberch
-  https://pixabay.com/music/modern-classical-minimal-piano-590996/
-  Pixabay Content Licence: free for commercial use, no attribution required.
-  Added 2026-09-23. Trimmed to 75s, levelled to -10.9 LUFS, 3s fade out.
-  Chosen for the warm tier (semi-detached, terrace, and anything unconfirmed):
-  measured the steadiest and warmest of ten candidates.
+  - Free commercial use. The track may be used in videos NestList produces for
+    paying agents, and in videos those agents post to Facebook, Instagram,
+    TikTok, LinkedIn, YouTube or a property portal.
+  - No attribution required. Crediting Alex Morgan is appreciated but not a
+    condition of use, which is why nothing is burned into the video.
 
---------------------------------------------------------------------------------
-cinematic_strings.mp3        tier: grand
-  "Cinematic Strings" by AtlasAudio
-  https://pixabay.com/music/build-up-scenes-cinematic-strings-593034/
-  Pixabay Content Licence: free for commercial use, no attribution required.
-  Added 2026-09-23. Trimmed to 75s, levelled to -10.2 LUFS, 3s fade out.
-  Chosen for the grand tier (GCB, bungalow, detached, penthouse): the most
-  present and cinematic of the candidates measured.
+What it does NOT permit (none of which NestList does):
+
+  - Redistributing or selling the audio file on its own, or as part of a
+    music/stock library.
+  - Using it in a way that suggests Pixabay or the artist endorses NestList.
+  - Registering the track (or a video containing it) with a content-ID or
+    rights-management service.
+
+This is the track validated during video prototyping; the file here is
+byte-identical to the one used in those tests (MD5 3052f5ca752ac6ee723c107b8877be62).
+
+If this track is ever swapped, the replacement must carry a licence that also
+permits commercial use without attribution, and this file must be updated to
+name it. Agents' reputations ride on these videos -- an unlicensed music bed
+is a takedown or a copyright strike on their account, not ours.
+
+
+Added 2026-09-23 -- a second track in each mood tier
+====================================================
+The library shipped with one file, so every video played the same piece. These
+two give each tier a real choice. Same licence terms as above apply to both:
+Pixabay Content License, free commercial use, no attribution required.
+
+File:    minimal_piano.mp3          (tracks.json tier: warm)
+Track:   "Minimal Piano"
+Artist:  leberch
+Source:  https://pixabay.com/music/modern-classical-minimal-piano-590996/
+MD5:     0b076f44c8d8f16329dff8c8ca96bba5
+Notes:   Trimmed to 75s with a 3s fade; levelled to -10.9 LUFS. Chosen for the
+         warm tier (semi-detached, terrace, and anything unconfirmed) after
+         measuring ten candidates: the steadiest and warmest opening of the set.
+
+File:    cinematic_strings.mp3      (tracks.json tier: grand)
+Track:   "Cinematic Strings"
+Artist:  AtlasAudio
+Source:  https://pixabay.com/music/build-up-scenes-cinematic-strings-593034/
+MD5:     948cc2e8ad8d414e7e9bda1d9f26d9c8
+Notes:   Trimmed to 75s with a 3s fade; levelled to -10.2 LUFS. Chosen for the
+         grand tier (GCB, bungalow, detached, penthouse): the most present and
+         cinematic opening of the set.
+
+soft_piano.mp3 is deliberately LEFT OUT of tracks.json. An untagged track stays
+eligible everywhere, so both tiers keep two options instead of one.
+
+LEVELS: match every new track to soft_piano.mp3 (about -9.8 LUFS)
+================================================================
+video_renderer.py applies ONE fixed volume to whichever track it picks. It does
+not normalise. So a track mastered quieter does not sound "softer and tasteful",
+it sounds broken -- and a louder one drowns the video. Among the candidates
+measured for this batch, one sat at -28.8 LUFS, 19 dB below the reference; it
+would have been effectively silent behind the footage.
+
+Before adding a track: normalise it to roughly -9.8 LUFS, confirm with
+  ffmpeg -i <file> -af ebur128=framelog=quiet -f null -
+and only then list it here. A track nobody can account for, or one nobody has
+levelled, does not belong in this directory.
