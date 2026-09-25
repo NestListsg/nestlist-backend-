@@ -535,6 +535,11 @@ class ListingRequest(BaseModel):
     # empty -> falls back to _extract_district_token(location) exactly as before. We never
     # guess the district from the street, so a blank here yields "Singapore", not a guess.
     district: str = Field(default="", max_length=8)
+    # OPTIONAL, backward-compatible per-listing writing style (feature #2). When set to one
+    # of WRITING_STYLE_OPTIONS it OVERRIDES the agent-profile `tone` for THIS write-up only;
+    # blank/omitted or any unrecognised value -> falls back to the agent's profile tone,
+    # exactly as before. Never persisted on the listing -- it only steers this generation.
+    writing_style: str = Field(default="", max_length=50)
 
 class ListingContentRequest(BaseModel):
     content: str
@@ -1557,6 +1562,24 @@ def _basic_listing_fallback(agent, req, district_str: str) -> str:
     ).strip()
 
 
+# The writing-style choices offered on New Listing (feature #2) are EXACTLY the ones the
+# agent profile already exposes for `tone` (frontend MyProfile.js toneOptions). Keeping the
+# authoritative set here lets a per-listing choice override the profile default for a single
+# write-up without any new column -- an unrecognised/blank value always falls back to profile.
+WRITING_STYLE_OPTIONS = {"Warm & Conversational", "Formal & Professional", "Bold & Punchy"}
+
+
+def _apply_writing_style(agent, writing_style):
+    """Return the agent dict to use for THIS generation. If `writing_style` is one of the
+    allowed options, return a shallow copy with `tone` overridden (so the existing prompt
+    builders, which read agent['tone'], pick it up unchanged); otherwise return `agent`
+    untouched so behaviour is identical to before."""
+    ws = (writing_style or "").strip()
+    if ws in WRITING_STYLE_OPTIONS:
+        return {**agent, "tone": ws}
+    return agent
+
+
 @app.post("/api/listings/generate")
 async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)):
     gcb_zones = [
@@ -1652,10 +1675,16 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     # location-derived token > "Singapore". Passed to every copy path below.
     district_str = _resolve_writeup_district(req.district, req.location)
 
+    # Per-listing writing style (feature #2): if the agent picked a style for THIS listing,
+    # gen_agent carries that as `tone`; otherwise it's the same agent dict, so the profile
+    # tone is used exactly as before. Only the copy builders see gen_agent -- ownership,
+    # the insert, and everything else still use the real `agent`.
+    gen_agent = _apply_writing_style(agent, req.writing_style)
+
     if listing_images:
         try:
             listing_text = await _generate_writeup_from_photos(
-                agent, req, vision_urls, district_str,
+                gen_agent, req, vision_urls, district_str,
                 context=f"generate:{agent['id']}", price=req.price,
             )
         except Exception as e:
@@ -1664,14 +1693,14 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
             # with real, price-free, house-number-free, STREET-FREE copy either way.
             logger.error("multimodal write-up failed for agent %s, falling back to text-only: %s", agent["id"], e)
             try:
-                listing_text = await _generate_listing_text_only(agent, req, district_str)
+                listing_text = await _generate_listing_text_only(gen_agent, req, district_str)
             except Exception as e2:
                 logger.error("text-only fallback ALSO failed for agent %s, using basic template: %s", agent["id"], e2)
-                listing_text = _basic_listing_fallback(agent, req, district_str)
+                listing_text = _basic_listing_fallback(gen_agent, req, district_str)
     else:
         # Text-only path (no photos) -- now DISTRICT-ONLY, same location discipline as the
         # multimodal path.
-        listing_text = await _generate_listing_text_only(agent, req, district_str)
+        listing_text = await _generate_listing_text_only(gen_agent, req, district_str)
 
     # Discreet per-agent buyer-link code (nestlist.sg/{handle}/{code}). An
     # agent-supplied override wins (validated); otherwise it's derived from the
@@ -2149,6 +2178,10 @@ class WriteupRequest(BaseModel):
     site_coverage: float = 0
     # Bounds the raw parse; we still slice to WRITEUP_MAX_IMAGES below.
     photo_urls: list[str] = Field(default_factory=list, max_length=60)
+    # OPTIONAL per-listing writing style (feature #2). Same semantics as ListingRequest:
+    # one of WRITING_STYLE_OPTIONS overrides the profile tone for this write-up; blank or
+    # unrecognised -> profile tone.
+    writing_style: str = Field(default="", max_length=50)
 
 
 # One Opus-5 vision call per request -- rate-limited per agent. This dict is PER WORKER, and
@@ -2186,9 +2219,12 @@ async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)
 
     district_str = _writeup_district_str(req.location)
 
+    # Per-listing writing style (feature #2) -- overrides profile tone for this write-up only.
+    gen_agent = _apply_writing_style(agent, req.writing_style)
+
     try:
         writeup = await _generate_writeup_from_photos(
-            agent, req, photo_urls, district_str,
+            gen_agent, req, photo_urls, district_str,
             context=f"writeup:{agent['id']}", price=None,  # WriteupRequest carries no price
         )
     except Exception as e:
@@ -3262,6 +3298,53 @@ async def enhance_listing_image_by_url(listing_id: str, image_url: str, agent=De
     new_url = await asyncio.to_thread(_enhance_listing_image, listing_id, agent["id"], None, image_url)
     return {"success": True, "image_url": new_url}
 
+
+def _restore_listing_image(listing_id: str, agent_id: str, enhanced_url: str, original_url: str) -> list:
+    # Guard: only ever restore to an object that lives in OUR listings-images bucket, never an
+    # arbitrary or foreign URL smuggled into the photo array.
+    if not _storage_path_from_url(original_url):
+        raise HTTPException(status_code=400, detail="That original photo URL isn't a valid listing photo")
+
+    # Enhancement never deletes the original (the enhanced copy is written under a NEW name),
+    # so the original object should still be fetchable. Verify before pointing the listing at
+    # it, so a restore can never leave a broken image on the listing. A network blip on this
+    # check fails safe (treated as unavailable) rather than saving a possibly-dead URL.
+    try:
+        check = requests.get(original_url, timeout=15, stream=True)
+        ok = check.status_code == 200
+        check.close()
+    except Exception:
+        ok = False
+    if not ok:
+        raise HTTPException(status_code=404, detail="The original photo is no longer available to restore")
+
+    def mutate(current, ctx):
+        # Already restored (our write landed, or another tab did it): nothing to do.
+        if original_url in current and enhanced_url not in current:
+            return None
+        pos = _locate_image(current, enhanced_url, None)
+        if pos is None:
+            if ctx["attempt"] > 0:
+                return None  # our own earlier attempt almost certainly landed
+            raise HTTPException(status_code=404, detail="That enhanced photo is no longer on this listing")
+        updated = list(current)
+        updated[pos] = original_url
+        return updated
+
+    return _mutate_listing_images(listing_id, agent_id, mutate)
+
+
+@app.post("/api/listings/{listing_id}/images/restore")
+def restore_listing_image(listing_id: str, original_url: str, enhanced_url: str, agent=Depends(get_current_agent)):
+    """Feature #1: undo a photo enhancement by pointing the listing's photo slot back at the
+    ORIGINAL image. Enhancement is non-destructive -- it writes the enhanced photo to a NEW
+    file and never deletes the original -- but afterwards the listing array only remembers the
+    enhanced URL, so the caller must supply the original_url it enhanced FROM (the frontend has
+    it in-session, as the URL it passed to /enhance). Swaps enhanced_url -> original_url in the
+    photo array in place; idempotent, and it never deletes the enhanced file."""
+    images = _restore_listing_image(listing_id, agent["id"], enhanced_url, original_url)
+    return {"success": True, "images": images}
+
 _CAPTION_REJECTION_REASONS = {
     "empty": "the caption is empty",
     "too long": "too long for one line on screen",
@@ -3555,7 +3638,21 @@ def get_poster_templates(agent=Depends(get_current_agent)):
     return [{"id": t["id"], "name": t["name"], "thumbnail_url": t["thumbnail_url"]} for t in POSTER_TEMPLATES]
 
 @app.post("/api/listings/{listing_id}/generate-poster")
-def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = None, agent=Depends(get_current_agent)):
+def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = None,
+                    price_override: str = None, phone_override: str = None,
+                    agent=Depends(get_current_agent)):
+    # price_override / phone_override (feature #4): OPTIONAL per-render overrides so the agent
+    # can tweak the price and contact number shown ON THE POSTER from My Listings WITHOUT
+    # touching the listing's real `price` or the profile `contact`. Blank/omitted -> the real
+    # stored values are used, exactly as before. Length-capped as a cheap abuse/overflow guard
+    # (these strings are drawn onto the image); an over-long value is rejected as a clean 400.
+    price_override = (price_override or "").strip()
+    phone_override = (phone_override or "").strip()
+    if len(price_override) > 40:
+        raise HTTPException(status_code=400, detail="Price is too long for the poster")
+    if len(phone_override) > 60:
+        raise HTTPException(status_code=400, detail="Contact number is too long for the poster")
+
     result = db_execute(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_poster listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -3573,7 +3670,11 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     if photo_index < 0 or photo_index >= len(images):
         photo_index = 0
 
-    price_num = _to_number(listing.get("price"))
+    # Feature #4: the poster's price comes from the override when supplied, otherwise the
+    # listing's real price. It flows through the SAME number pipeline so the "SGD X.XM" line
+    # and the derived PSF stat stay internally consistent with whatever price is shown.
+    price_source = price_override if price_override else listing.get("price")
+    price_num = _to_number(price_source)
     built_up_num = _to_number(listing.get("built_up"))
     price_psf = round(price_num / built_up_num) if built_up_num > 0 else 0
     bedrooms_match = re.search(r"\d+", str(listing.get("bedrooms") or ""))
@@ -3597,7 +3698,11 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
 
     # Price is optional. A blank price would otherwise render as "SGD " (empty garbage),
     # so fall back to "Price on request". (The PSF stat above already self-omits at price 0.)
-    price_text = f"SGD {_format_price_millions(listing.get('price'))}" if price_num > 0 else "Price on request"
+    price_text = f"SGD {_format_price_millions(price_source)}" if price_num > 0 else "Price on request"
+
+    # Feature #4: the contact line uses the override when supplied, otherwise the agent's
+    # profile contact. Only affects what is drawn on THIS poster -- the profile is untouched.
+    contact_line = phone_override if phone_override else agent.get("contact", "")
 
     try:
         poster_image = poster_renderer.render_poster(
@@ -3606,7 +3711,7 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
             price_text=price_text,
             stats=stats,
             agent_name=agent["name"],
-            agent_contact_line=agent.get("contact", ""),
+            agent_contact_line=contact_line,
             property_photo_url=images[photo_index],
             agent_photo_url=agent.get("photo_url"),
             template_id=chosen_template_id,
@@ -4771,7 +4876,7 @@ async def extract_listing_image(request: Request):
   "land_size": number in sqft or 0,
   "built_up": number in sqft or 0,
   "bedrooms": "number of bedrooms only, e.g. 4",
-  "bathrooms": "number of bathrooms only, e.g. 3",
+  "bathrooms": "number of bathrooms ONLY if explicitly shown in the image, e.g. 3; otherwise \"\"",
   "price": "e.g. 25,000,000",
   "features": "special features as comma separated text",
   "plot_width": number in metres or 0,
@@ -4783,6 +4888,7 @@ async def extract_listing_image(request: Request):
 Do not guess or estimate any value that is not clearly shown or stated in the images. If a field cannot be determined from the images, use "" for text fields and 0 for number fields.
 For district specifically: this field is a frequent source of confident-wrong guesses, so lean HARD toward "". Return a number 1-28 ONLY if you can point to EXPLICIT, VISIBLE district text in the image itself -- a literal "District 15" label, a "D15" tag, or a field/row clearly labelled with the postal district. If you cannot literally SEE such text in the image, you MUST return "". Do NOT infer, derive, or guess the district from the street/road name, the neighbourhood/area/estate name, the postal code, OR from your own general knowledge of where a street is located -- for example, do NOT reason "this is Tembeling Road, which is in District 15" (or any similar street-to-district inference); if the district number is not written in the image, it is not yours to supply, and a wrong district is a misrepresentation of the property. A blank the agent fills in is ALWAYS better than a wrong number. Self-check before returning: "Can I actually SEE the district written as text somewhere in this image? If not, district = \"\"."
 For property_type specifically: if any image contains an explicit official/source "Property Type" field or code, use that over your own inference from the general description — e.g. "CT" means Corner Terrace, "IT" or "ITR" means Inter-Terrace, "SD" means Semi-Detached, "DB" means Detached/Bungalow, "GCB" means Good Class Bungalow (GCB), "PH" means Penthouse. Inter-Terrace and Corner Terrace are frequently confused — an explicit source field always wins over inferring from land size or description text. If no image states or clearly implies a specific property type at all (no field, code, or explicit description), return "" for property_type rather than guessing from land size, price, or general impression — Corner Terrace, Inter-Terrace, and Semi-Detached can have very similar land sizes and are not reliably distinguishable from size alone, so leaving this blank for the agent to confirm is strongly preferred over a wrong guess.
+For bathrooms specifically: return a number ONLY if the bathroom/toilet count is explicitly written or clearly shown in the image itself -- a literal "Bathrooms" / "Baths" / "Toilets" field or an unambiguous bathroom icon with a number beside it. Do NOT infer or estimate the bathroom count from the number of bedrooms, the room count, the floor area, the property type, the photos of rooms, or your own general sense of how many bathrooms a home this size "should" have. Bedrooms and bathrooms are different figures and one never implies the other. If the bathroom count is not explicitly stated in the image, you MUST return "" -- a blank the agent fills in is always better than a guessed count, because a wrong bathroom number is a misrepresentation of the property. Self-check before returning: "Can I actually SEE a bathroom/toilet count written in this image? If not, bathrooms = \"\"."
 For land_size and built_up specifically: these must be the raw size figure shown directly in or immediately after the "Land Size" / "Built-Up Size" (or "Estm. Land Size" / "Estm. Build-Up Size") field itself, typically followed by a unit like "sqft". Many source screenshots also show a separate small badge or chip positioned near that same field labeled "PSF" (price per square foot, e.g. "3,157 PSF") — this PSF number is a completely different figure and must NEVER be used as land_size or built_up, even when it sits close to, overlapping, or immediately beside the size number. For example, if a screenshot shows "Estm. Land Size (SQFT): 3003" next to a badge reading "3,157 PSF", land_size is 3003, not 3157 — read the digits under the size label, not the digits under or next to the PSF badge. Before finalizing, sanity-check that price divided by land_size (or built_up) is a plausible PSF for the property type and location shown — if it looks off by roughly an order of magnitude, or if land_size/built_up looks suspiciously close to a PSF figure visible elsewhere in the image, re-read the image and correct it rather than outputting the PSF value by mistake.
 Return only valid JSON, nothing else."""
         })
@@ -4800,6 +4906,17 @@ Return only valid JSON, nothing else."""
         # District dropdown gets a predictable value and never an out-of-range guess.
         # Always present in the response, even if the model omitted it.
         extracted["district"] = _normalize_district(extracted.get("district"))
+        # Fact-check gate (feature #16): mirror the district/price "please confirm" safety
+        # pattern. `needs_confirmation` lists auto-filled fields the agent should verify
+        # before publishing, so the UI can show a ⚠️ confirm prompt. Bathrooms is included
+        # whenever the model returned a value (the prompt above already forces "" when the
+        # count isn't explicitly shown, so a value here means "read from the image, but the
+        # agent should still confirm it's right"). Additive + backward-compatible: older
+        # frontends simply ignore the field.
+        needs_confirmation = []
+        if str(extracted.get("bathrooms") or "").strip():
+            needs_confirmation.append("bathrooms")
+        extracted["needs_confirmation"] = needs_confirmation
         return extracted
 
     except Exception as e:
