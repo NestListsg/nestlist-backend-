@@ -2095,7 +2095,14 @@ async def _generate_writeup_from_photos(agent, req, vision_urls, district_str, c
 
     response = await create_claude_message(
         model="claude-opus-5",
-        max_tokens=4000,  # room for Opus 5's default adaptive thinking + a short write-up
+        # Opus 5 runs adaptive thinking ON by default at effort "high", and those
+        # thinking tokens are drawn from THIS same max_tokens budget. At 4000 the
+        # high-effort thinking pass could eat almost the whole budget, leaving the
+        # visible write-up to hit the cap (stop_reason "max_tokens") mid-sentence --
+        # which is exactly how a write-up came back cut off, missing the mandatory
+        # "Your Vision. Your Legacy." closing. 16000 leaves ample room for both;
+        # it's only a ceiling, so a normal write-up still stops early at end_turn.
+        max_tokens=16000,
         # Plain, proven-accessible params only (no output_config/effort) -- same shape as
         # the live chatbot endpoint -- so there's no unaccepted-param 400 risk.
         system=system_prompt,
@@ -2104,6 +2111,12 @@ async def _generate_writeup_from_photos(agent, req, vision_urls, district_str, c
     )
     if getattr(response, "stop_reason", None) == "refusal":
         raise RuntimeError("write-up refused")
+    # A max_tokens stop means the prose was truncated before its closing. Raise rather
+    # than silently return half a listing: the caller then degrades cleanly (/generate ->
+    # complete text-only write-up; /generate-writeup -> friendly "try again"), which beats
+    # saving a cut-off write-up onto the agent's listing.
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        raise RuntimeError("write-up truncated (hit max_tokens)")
     writeup = "".join(
         block.text for block in response.content if getattr(block, "type", None) == "text"
     ).strip()
