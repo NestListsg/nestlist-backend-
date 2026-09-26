@@ -455,6 +455,7 @@ def extract_comparable_transactions(projects: list, street_keyword: str, propert
         return 0 <= months_ago < window_months
 
     records = []
+    seen = set()  # de-dupe identical URA records (same sale reported twice)
     for project in projects:
         street = project.get("street", "")
         if not _matches_street_keyword(street, street_keyword):
@@ -474,6 +475,18 @@ def extract_comparable_transactions(projects: list, street_keyword: str, propert
                 continue
             if price <= 0 or area_sqm <= 0:
                 continue
+            # URA's PMI_Resi_Transaction carries some sales as exact-duplicate
+            # records (identical street+date+price+area -- observed and already
+            # de-duped in the GCB count path, commit 8627362). Without this the
+            # comparables table shows each such sale twice, padding the list and
+            # skewing the average/count. A full-signature key drops only records
+            # identical on every meaningful field, so genuinely distinct sales
+            # (which differ in land area and/or price) are never merged.
+            sig = (_norm_street(street), txn.get("contractDate", ""), price,
+                   round(area_sqm, 2), txn.get("propertyType", ""), txn.get("tenure", ""))
+            if sig in seen:
+                continue
+            seen.add(sig)
             area_sqft = area_sqm * SQM_TO_SQFT
             district_code = txn.get("district", "")
             records.append({
