@@ -12,6 +12,7 @@ import anthropic
 import requests
 import base64
 import io
+import zipfile
 import json
 import asyncio
 import httpx
@@ -25,7 +26,7 @@ import time
 import random
 import logging
 from datetime import datetime, timedelta, date, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from PIL import Image as PILImage, ImageEnhance, ImageOps, ImageStat
 import fitz
 import poster_renderer
@@ -6203,6 +6204,246 @@ def download_listing_images(listing_id: str, agent=Depends(get_current_agent)):
         zip_buffer,
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=listing-photos-{listing_id[:8]}.zip"}
+    )
+
+# ================================
+# SEND TO PROPERTYGURU -- EXPORT HELPER (#19)
+# ================================
+# SAFE by design: this NEVER touches PropertyGuru's website (automating it would breach
+# their terms). It only PREPARES the agent's OWN listing so they can paste + upload it
+# themselves in far fewer steps:
+#   (a) /propertyguru-export        -> a copy-paste-ready, clearly-labelled text block
+#   (b) /propertyguru-photos.zip    -> all the listing's photos in one streamed zip
+# Both endpoints are authenticated AND ownership-scoped (.eq agent_id) exactly like every
+# other agent-facing listing route, so an agent can only ever export their OWN listing --
+# no other agent's street, price or photos can leak. The full street IS included here
+# (unlike the buyer-facing payload) because this is the owning agent looking at their own
+# listing, which is the same data they typed in.
+
+
+def _pg_export_measure(value, suffix: str) -> str:
+    """Format a numeric listing measure for the export block, or "" to skip the line.
+    Blank/zero/negative/non-numeric all yield "" so we never print an empty-labelled or
+    "0 sqft" line. Reuses _fmt_writeup_num for thousands separators + trailing-.0 drop."""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    return f"{_fmt_writeup_num(n)}{suffix}"
+
+
+def _pg_export_price(raw) -> str:
+    """The asking price as the agent typed it. If it's a plain number (optionally with
+    commas/spaces) we normalise it to "S$5,350,000"; anything else (e.g. "5.35M",
+    "Price on request") is shown verbatim so we never mangle the agent's own wording.
+    Blank / non-positive -> "" (line skipped)."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    cleaned = s.replace(",", "").replace(" ", "").lstrip("S$").lstrip("$")
+    try:
+        n = float(cleaned)
+    except ValueError:
+        return s
+    if n <= 0:
+        return ""
+    return f"S${int(n):,}" if n == int(n) else f"S${n:,.2f}"
+
+
+def _build_propertyguru_text_block(listing: dict) -> str:
+    """Assemble the copy-paste-ready, labelled text block for ONE (owned) listing.
+    Fields are ordered to track a typical PropertyGuru "create listing" form (type ->
+    address -> price -> rooms -> areas -> landed extras), then the free-text Key Features
+    and the full write-up/Description. Every blank field is skipped rather than printed
+    with an empty value (skip, don't stub)."""
+    lines: list[str] = []
+
+    def add(label: str, value) -> None:
+        v = "" if value is None else str(value).strip()
+        if v:
+            lines.append(f"{label}: {v}")
+
+    ptypes = _listing_property_types(listing)
+    add("Property Type", " / ".join(ptypes) if ptypes else "")
+    add("Address", listing.get("location"))
+    add("District", _listing_district_label(listing))
+    add("Asking Price", _pg_export_price(listing.get("price")))
+    add("Bedrooms", listing.get("bedrooms"))
+    add("Bathrooms", listing.get("bathrooms"))
+    add("Built-up Area", _pg_export_measure(listing.get("built_up"), " sqft"))
+    add("Land Area", _pg_export_measure(listing.get("land_size"), " sqft"))
+    add("No. of Storeys", _pg_export_measure(listing.get("storeys"), ""))
+    add("Plot Frontage (Width)", _pg_export_measure(listing.get("plot_width"), " m"))
+    add("Plot Depth", _pg_export_measure(listing.get("plot_depth"), " m"))
+    add("Site Coverage", _pg_export_measure(listing.get("site_coverage"), "%"))
+    add("Listing Reference", listing.get("code"))
+
+    parts = ["\n".join(lines)] if lines else []
+
+    features = str(listing.get("features") or "").strip()
+    if features:
+        parts.append("Key Features\n------------\n" + features)
+
+    content = str(listing.get("content") or "").strip()
+    if content:
+        parts.append("Description\n-----------\n" + content)
+
+    return "\n\n".join(parts).strip()
+
+
+@app.get("/api/listings/{listing_id}/propertyguru-export")
+def propertyguru_export(listing_id: str, agent=Depends(get_current_agent)):
+    """PREPARE (never post) the agent's OWN listing for PropertyGuru. Returns the
+    copy-paste-ready text block plus the photo count and the URL of the one-click photo
+    zip. Does NOT contact PropertyGuru -- the agent pastes/uploads themselves."""
+    try:
+        result = get_db().table("listings").select("*") \
+            .eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    except Exception as e:
+        logger.error("propertyguru-export %s: lookup failed: %s", listing_id, e)
+        raise HTTPException(status_code=503,
+                            detail="Could not load listing — please try again in a moment")
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    listing = result.data[0]
+    photos = [u for u in (listing.get("images") or [])
+              if isinstance(u, str) and u.strip()][:MAX_LISTING_PHOTOS]
+    return {
+        "listing_id": listing["id"],
+        "text_block": _build_propertyguru_text_block(listing),
+        "photo_count": len(photos),
+        "photos_zip_url": f"/api/listings/{listing['id']}/propertyguru-photos.zip",
+    }
+
+
+# --- PropertyGuru photo bundle: streamed zip, bounded memory --------------------------
+# Reliability posture (50-agents-at-once safe):
+#  * We fetch ONE photo at a time, fully into memory (bounded by _PG_PHOTO_MAX_BYTES),
+#    write it into the zip, then yield that entry and release the bytes -- so peak memory
+#    per request is ~one photo, NOT all 15 + the finished zip (which is what the older
+#    /download-images route holds). The zip streams out entry-by-entry.
+#  * A photo that times out, 404s, errors or is oversized is SKIPPED (logged), never
+#    fails the whole bundle -- a half-download is worse than a missing photo.
+#  * Separate connect (fast) and read timeouts, so one stalled CDN fetch can't hang the
+#    request indefinitely.
+_PG_PHOTO_CONNECT_TIMEOUT = 5            # seconds to open the connection to the CDN
+_PG_PHOTO_READ_TIMEOUT = 20             # seconds for one photo's body
+_PG_PHOTO_MAX_BYTES = 25 * 1024 * 1024  # skip any single photo larger than 25 MB
+_PG_PHOTO_CHUNK = 65536
+
+_PG_ALLOWED_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif")
+
+
+def _pg_ext_from_url(url: str) -> str:
+    """Best-effort file extension from the photo URL; defaults to .jpg for anything
+    unrecognised so every entry has a sane, openable name."""
+    try:
+        ext = os.path.splitext(urlsplit(url).path)[1].lower()
+    except Exception:
+        ext = ""
+    return ext if ext in _PG_ALLOWED_EXTS else ".jpg"
+
+
+def _pg_fetch_photo_bytes(url: str):
+    """Fetch one photo fully (bounded). Returns bytes, or None to SKIP (non-200, timeout,
+    oversized, or any error) so one bad photo never breaks the bundle."""
+    try:
+        with requests.get(url, timeout=(_PG_PHOTO_CONNECT_TIMEOUT, _PG_PHOTO_READ_TIMEOUT),
+                           stream=True) as r:
+            if r.status_code != 200:
+                logger.warning("propertyguru photo skipped (HTTP %s): %s", r.status_code, url[:120])
+                return None
+            buf = bytearray()
+            for chunk in r.iter_content(_PG_PHOTO_CHUNK):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if len(buf) > _PG_PHOTO_MAX_BYTES:
+                    logger.warning("propertyguru photo skipped (>%d bytes): %s",
+                                   _PG_PHOTO_MAX_BYTES, url[:120])
+                    return None
+            return bytes(buf)
+    except Exception as e:
+        logger.warning("propertyguru photo skipped (fetch error): %s", e)
+        return None
+
+
+class _PgDrainableBuffer:
+    """Write-only, UNSEEKABLE file object for streaming a zip. Having no seek()/tell()
+    makes ZipFile emit streaming data descriptors instead of seeking back to patch each
+    entry header -- which is what lets us hand the archive out chunk-by-chunk. drain()
+    returns and clears whatever has accumulated since the last call."""
+    def __init__(self):
+        self._buf = bytearray()
+
+    def write(self, data) -> int:
+        self._buf.extend(data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def drain(self) -> bytes:
+        if not self._buf:
+            return b""
+        out = bytes(self._buf)
+        self._buf.clear()
+        return out
+
+
+def _pg_zip_generator(photo_urls):
+    """Yield a valid zip archive of the given photo URLs, one completed entry at a time.
+    Photos are STORED (not deflated): they're already-compressed JPEG/PNG/WebP, so
+    deflating wastes CPU under load for no size win. If every photo fails, a valid empty
+    zip is still produced (the endpoint guards against an empty photo list before this)."""
+    buf = _PgDrainableBuffer()
+    added = 0
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for url in photo_urls:
+            data = _pg_fetch_photo_bytes(url)
+            if data is None:
+                continue
+            added += 1
+            zf.writestr(f"property-photo-{added:02d}{_pg_ext_from_url(url)}", data)
+            chunk = buf.drain()
+            if chunk:
+                yield chunk
+    # close() (on `with` exit) writes the central directory into the buffer; flush it.
+    tail = buf.drain()
+    if tail:
+        yield tail
+
+
+@app.get("/api/listings/{listing_id}/propertyguru-photos.zip")
+def propertyguru_photos_zip(listing_id: str, agent=Depends(get_current_agent)):
+    """Stream ALL of the agent's OWN listing's photos as a single zip (bounded memory,
+    per-photo timeouts, bad photos skipped). Ownership-scoped like every listing route."""
+    from fastapi.responses import StreamingResponse
+
+    try:
+        result = get_db().table("listings").select("id,agent_id,images") \
+            .eq("id", listing_id).eq("agent_id", agent["id"]).execute()
+    except Exception as e:
+        logger.error("propertyguru-photos %s: lookup failed: %s", listing_id, e)
+        raise HTTPException(status_code=503,
+                            detail="Could not load listing — please try again in a moment")
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    listing = result.data[0]
+    photo_urls = [u for u in (listing.get("images") or [])
+                  if isinstance(u, str) and u.strip()][:MAX_LISTING_PHOTOS]
+    if not photo_urls:
+        raise HTTPException(status_code=404, detail="This listing has no photos to download")
+
+    filename = f"listing-{str(listing['id'])[:8]}-photos.zip"
+    return StreamingResponse(
+        _pg_zip_generator(photo_urls),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 # ================================
