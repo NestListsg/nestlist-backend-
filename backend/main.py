@@ -251,6 +251,9 @@ async def startup_event():
     asyncio.create_task(asyncio.to_thread(_probe_images_cas_encoding))
     # Detect whether the optional `district` column exists (gates district persistence).
     asyncio.create_task(asyncio.to_thread(_probe_district_column))
+    # Detect whether the optional `property_types` list column exists (gates multi-type
+    # persistence). Same probe-guard as district: absent -> single property_type only.
+    asyncio.create_task(asyncio.to_thread(_probe_property_types_column))
     # Background photo upscaling. Hands the module a storage-client factory rather than
     # a client, so it always picks up a fresh connection after _reset_db(). No worker
     # thread starts until the first photo is actually queued.
@@ -540,6 +543,15 @@ class ListingRequest(BaseModel):
     # blank/omitted or any unrecognised value -> falls back to the agent's profile tone,
     # exactly as before. Never persisted on the listing -- it only steers this generation.
     writing_style: str = Field(default="", max_length=50)
+    # OPTIONAL, backward-compatible (feature #7): MULTIPLE property types for one listing.
+    # The single `property_type` above stays the PRIMARY (first) value -- every exact-match
+    # consumer (buyer matching, GCB/terrace compliance, the poster) reads the primary
+    # unchanged. When this list is sent AND the DB has the `property_types text[]` column,
+    # the full list is persisted and served alongside the primary, and buyer matching then
+    # succeeds if ANY listing type matches a buyer's wanted types. Absent/empty, or before
+    # the column exists -> EXACTLY the single-type behaviour. Capped defensively; the primary
+    # is always folded in as the first entry (see _resolve_property_types).
+    property_types: list[str] = Field(default_factory=list, max_length=12)
 
 class ListingContentRequest(BaseModel):
     content: str
@@ -1463,6 +1475,9 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
     for row in rows:
         row["display_location"] = _strip_house_number(row.get("location"))
         row["agent_code"] = owner_code
+        # Feature #7: always expose a consistent property_types list (falls back to
+        # [property_type] before the column exists) so the edit form round-trips cleanly.
+        row["property_types"] = _listing_property_types(row)
         progress = active_video_jobs.get(str(row.get("id"))) or {}
         row["video_queue_position"] = progress.get("queue_position")
         row["video_eta_seconds"] = progress.get("eta_seconds")
@@ -1591,6 +1606,14 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
         "chestnut", "sunset", "upper bukit timah", "rifle range",
         "spring grove", "belmont", "windsor"
     ]
+    # Feature #7 -- reconcile the optional property_types list with the single PRIMARY type
+    # up front, so compliance, the write-up prompt and the stored primary all agree on one
+    # value. req.property_type STAYS the primary (only promoted from the list when the client
+    # sent just the list); resolved_property_types is the ordered, deduped list persisted to
+    # the property_types[] column when it exists. Both blank -> unchanged single-type path.
+    _primary_type, resolved_property_types = _resolve_property_types(req)
+    req.property_type = _primary_type
+
     issues, warnings, passed = [], [], []
     is_gcb = "gcb" in req.property_type.lower() or "bungalow" in req.property_type.lower()
 
@@ -1747,6 +1770,12 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
         _d = _normalize_district(req.district)
         if _d:
             insert_payload["district"] = _d
+    # Multiple property types (feature #7). Probe-gated EXACTLY like district so a
+    # not-yet-migrated DB can never break the (non-idempotent) insert. The single
+    # property_type column above already holds the PRIMARY; this ADDITIONALLY persists the
+    # full ordered list when the column exists.
+    if _property_types_column_supported and resolved_property_types:
+        insert_payload["property_types"] = resolved_property_types
     saved = await db_execute_async(lambda db: db.table("listings").insert(insert_payload), what="generate_listing listings insert", idempotent=False)
 
     listing_row = saved.data[0]
@@ -2047,6 +2076,67 @@ def _listing_district_label(listing) -> str:
     return f"District {m.group(1)}" if m else ""
 
 
+# Feature #7 -- MULTIPLE property types per listing. A listing is still one property; a
+# small handful of types (e.g. an ambiguous "Corner Terrace"/"Semi-Detached" pair, or a
+# mixed-use pairing) is the realistic ceiling. The cap only stops an abusive payload.
+MAX_PROPERTY_TYPES = 6
+
+
+def _clean_property_types(values) -> list[str]:
+    """Normalise a raw property-types value into a clean list: coerce each entry to a
+    stripped string, drop blanks, dedupe case-insensitively while PRESERVING first-seen
+    order and original casing, and cap the count. Never raises -- anything that isn't a
+    list/tuple (None, a bare string, junk) yields []."""
+    out, seen = [], set()
+    if isinstance(values, (list, tuple)):
+        for v in values:
+            s = str(v if v is not None else "").strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+            if len(out) >= MAX_PROPERTY_TYPES:
+                break
+    return out
+
+
+def _resolve_property_types(req) -> tuple[str, list[str]]:
+    """Reconcile the single `property_type` (the PRIMARY, backward-compatible value) with
+    the optional `property_types` list into (primary, ordered_list):
+
+      * primary = req.property_type if set, else the first cleaned list entry, else "".
+      * the returned list ALWAYS starts with the primary (deduped), so any consumer that
+        reads list[0] or the single `property_type` column stays exactly correct.
+      * both empty -> ("", []): identical to today's single-type behaviour.
+
+    Never forces a schema assumption: it only reconciles the request, it does not decide
+    whether the DB can store the list (that's the column probe's job)."""
+    primary = str(getattr(req, "property_type", "") or "").strip()
+    types = _clean_property_types(getattr(req, "property_types", None))
+    if primary:
+        # Primary first, without duplicating it (case-insensitive), then the rest.
+        types = [primary] + [t for t in types if t.lower() != primary.lower()]
+    elif types:
+        primary = types[0]
+    return primary, types[:MAX_PROPERTY_TYPES]
+
+
+def _listing_property_types(listing: dict) -> list[str]:
+    """The property types to MATCH against and SERVE for a stored listing. Uses the
+    `property_types` list column when it exists and is populated; otherwise falls back to
+    the single `property_type` -- so on a not-yet-migrated DB (no column) the behaviour is
+    byte-for-byte identical to before. Always returns a clean list (possibly empty)."""
+    src = listing if isinstance(listing, dict) else {}
+    types = _clean_property_types(src.get("property_types"))
+    if types:
+        return types
+    single = str(src.get("property_type") or "").strip()
+    return [single] if single else []
+
+
 # Whether the listings table has the new `district` column (the New Listing dropdown value).
 # Probed once at startup; until it is confirmed present we simply do NOT write district, so a
 # missing column can never break the (non-idempotent) listing insert. Once the column is added
@@ -2065,6 +2155,30 @@ def _probe_district_column():
         _district_column_supported = False
         logger.warning("listings.district column NOT present -- district not persisted yet "
                        "(add it: ALTER TABLE listings ADD COLUMN IF NOT EXISTS district text;)")
+
+
+# Feature #7 -- whether the listings table has the new `property_types` list column.
+# Probed once at startup, exactly like `district`: until it is confirmed present we simply
+# do NOT write property_types, so a missing column can never break the (non-idempotent)
+# listing insert. The single `property_type` column keeps carrying the PRIMARY type either
+# way, so matching, compliance and the poster are unaffected before the migration. Once the
+# column is added -- ALTER TABLE listings ADD COLUMN IF NOT EXISTS property_types text[]; --
+# a redeploy/restart flips this to True and multi-type persistence turns on with no further
+# code change.
+_property_types_column_supported = False
+
+
+def _probe_property_types_column():
+    global _property_types_column_supported
+    try:
+        get_db().table("listings").select("property_types").limit(1).execute()
+        _property_types_column_supported = True
+        logger.info("listings.property_types column present -- multi-type persistence enabled")
+    except Exception:
+        _property_types_column_supported = False
+        logger.warning("listings.property_types column NOT present -- multiple property types "
+                       "not persisted yet; the single property_type still carries the primary "
+                       "(add it: ALTER TABLE listings ADD COLUMN IF NOT EXISTS property_types text[];)")
 
 
 # Freshness metadata (day-precision refreshed_at + partial flag) needs two extra
@@ -5311,7 +5425,10 @@ def _public_listing_payload(listing) -> dict:
     public_signature_video_url = str(listing.get("signature_video_url") or "").strip() or None
     return {
         "id": listing["id"],
+        # Primary type stays the single value (backward-compatible); property_types serves
+        # the full list, falling back to [primary] before the column exists (feature #7).
         "property_type": listing["property_type"],
+        "property_types": _listing_property_types(listing),
         "district_label": district_label,
         "location": district_label,
         "display_location": district_label,
@@ -5820,6 +5937,10 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
     existing = db_execute(lambda db: db.table("listings").select("id, code").eq("id", listing_id).eq("agent_id", agent["id"]), what="update_listing listings select")
     if not existing.data:
         raise HTTPException(status_code=404, detail="Listing not found")
+    # Feature #7 -- same reconciliation as create: property_type stays the PRIMARY (promoted
+    # from the list only if the client sent just the list), resolved_property_types is the
+    # ordered list for the property_types[] column.
+    _primary_type, resolved_property_types = _resolve_property_types(req)
     update_payload = {
         # Saving here always promotes the row to "active" -- this is the same
         # endpoint used both for editing an existing active listing (already
@@ -5827,7 +5948,7 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
         # "Convert to Listing" flow (status was "lead", now graduates to
         # "active" the moment the agent fills in the rest and saves).
         "status": "active",
-        "property_type": req.property_type,
+        "property_type": _primary_type,
         "location": req.location,
         "land_size": req.land_size,
         "built_up": req.built_up,
@@ -5843,6 +5964,11 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
     # Persist the agent-selected district (guarded on the column probe, as in create).
     if _district_column_supported:
         update_payload["district"] = _normalize_district(req.district)
+    # Persist the full property_types list (guarded on the column probe, as in create).
+    # Set on every edit when the column exists -- including to [] -- so the stored list
+    # stays in sync with the form, mirroring how district always overwrites on update.
+    if _property_types_column_supported:
+        update_payload["property_types"] = resolved_property_types
     # Discreet buyer-link code. An override sets it; otherwise we only *fill in* a
     # code when the listing has none yet -- an ordinary field edit must never
     # clobber an existing code (e.g. the demo listing's YOE). Wrapped whole so it
@@ -6207,8 +6333,14 @@ def _compute_buyer_listing_match(buyer: dict, listing: dict) -> dict:
     buyer_types = [t for t in (buyer.get("property_types") or "").split(",") if t]
     if buyer_types:
         criteria_checked = True
-        if listing.get("property_type") in buyer_types:
-            reasons.append(f"Wants {listing.get('property_type')}")
+        # Feature #7: a listing can now carry multiple types -- it matches if ANY of its
+        # types is one the buyer wants. On a single-type listing (or before the column
+        # exists) _listing_property_types is just [property_type], so this is identical to
+        # the previous exact-match behaviour.
+        listing_types = _listing_property_types(listing)
+        matched = [lt for lt in listing_types if lt in buyer_types]
+        if matched:
+            reasons.append(f"Wants {matched[0]}")
         else:
             return {"is_match": False, "reasons": []}
 
@@ -6278,7 +6410,8 @@ def get_buyer_matches(buyer_id: str, agent=Depends(get_current_agent)):
         if result["is_match"]:
             matches.append({
                 "listing_id": listing["id"], "location": listing["location"], "price": listing["price"],
-                "property_type": listing["property_type"], "reasons": result["reasons"]
+                "property_type": listing["property_type"],
+                "property_types": _listing_property_types(listing), "reasons": result["reasons"]
             })
     return matches
 
