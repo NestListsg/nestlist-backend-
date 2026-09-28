@@ -2781,10 +2781,21 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list, app
 
     if upload_session:
         try:
+            # NOTE the content-type: the bytes are JSON, but this bucket is a
+            # media bucket whose allowed-MIME-types list only admits image/* and
+            # video/* -- it rejects "application/json" outright, which is why a
+            # clean single-batch append (photos upload fine, then this manifest
+            # write throws) surfaced to agents as a 503 "Couldn't save this batch
+            # of photos". The photo uploads a few lines up prove image/jpeg is
+            # accepted, so we label the manifest image/jpeg. Nothing downstream
+            # cares about the stored content-type: _read_staged_urls downloads
+            # the raw bytes and json.loads() them, the file is internal and never
+            # served, and it's cleared on finalize (swept if abandoned). Keeping
+            # the .json name so the read filter and human debugging still work.
             supabase.storage.from_("listings-images").upload(
                 f"{_staging_dir(listing_id, upload_session)}/{batch_index:04d}.json",
                 json.dumps(batch_urls).encode("utf-8"),
-                {"content-type": "application/json", "upsert": "true"},
+                {"content-type": "image/jpeg", "upsert": "true"},
             )
         except Exception:
             logger.exception("Could not stage upload batch %s for listing %s", batch_index, listing_id)
