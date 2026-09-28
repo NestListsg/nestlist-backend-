@@ -1763,8 +1763,12 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
         insert_payload["code"] = listing_code
     # Save the staged photos onto the listing in the SAME insert -- atomic, so there's
     # no window where the listing exists without its photos (no half-created listing).
-    if listing_images:
-        insert_payload["images"] = listing_images
+    # ALWAYS set images, even when empty: a listing created photoless would otherwise
+    # leave the column SQL NULL, and the first later photo append cannot compare-and-swap
+    # against NULL the way it can against [] (NULL = '[]' is never TRUE in SQL). The
+    # IS NULL branch in _try_images_cas still covers pre-existing NULL rows; this keeps
+    # any NEW row from ever being one.
+    insert_payload["images"] = listing_images or []
     # Persist the agent-selected district (drives the outward district_label). Guarded on the
     # column probe so a not-yet-migrated DB can never break the (non-idempotent) insert.
     if _district_column_supported:
@@ -2426,11 +2430,28 @@ def _try_images_cas(listing_id, agent_id, previous, new_images, encoding) -> boo
     updated, False if the array had already moved on. Raises if PostgREST
     rejects the filter (wrong encoding) or the database is unreachable.
 
+    `previous is None` means the row's images column is SQL NULL, not an empty
+    array. A NULL column can never satisfy `images = '[]'` (in SQL, NULL = <x> is
+    never TRUE), so pinning the previous state as an eq-filtered empty array
+    would match zero rows forever and the first photo could never be added to a
+    listing that was created without any -- the exact failure this branch fixes.
+    We pin `images IS NULL` instead, which matches the untouched row.
+
     Safe to retry on a transport error even though it is an UPDATE: the filter
-    pins the PREVIOUS array, so if our first attempt actually landed the retry
+    pins the PREVIOUS state, so if our first attempt actually landed the retry
     matches nothing and reports False ("someone got there first"). The caller
     then re-reads and the mutator's attempt-aware logic takes over -- which is
     the same path a genuinely concurrent write already takes."""
+    if previous is None:
+        resp = db_execute(
+            lambda db: db.table("listings")
+            .update({"images": new_images})
+            .eq("id", listing_id)
+            .eq("agent_id", agent_id)
+            .filter("images", "is", "null"),
+            what="images compare-and-swap (from null)",
+        )
+        return bool(resp.data)
     resp = db_execute(
         lambda db: db.table("listings")
         .update({"images": new_images})
@@ -2446,6 +2467,12 @@ def _cas_update_images(listing_id, agent_id, previous, new_images):
     """True = applied, False = someone else got there first, None = this table
     will not accept a compare-and-swap filter at all (caller falls back)."""
     global _IMAGES_CAS_ENCODING
+
+    # NULL previous is pinned with `images IS NULL`, which needs no array literal
+    # and so no encoding -- and a NULL match tells us nothing about how the column
+    # wants an array spelled, so we must not cache anything from it.
+    if previous is None:
+        return _try_images_cas(listing_id, agent_id, None, new_images, None)
 
     encoding = _IMAGES_CAS_ENCODING
     if encoding:
@@ -2566,12 +2593,19 @@ def _mutate_listing_images(listing_id: str, agent_id: str, mutate) -> list:
             if not result.data:
                 raise HTTPException(status_code=404, detail="Listing not found")
 
-            previous = result.data[0].get("images") or []
+            # Keep NULL distinct from an empty array: the mutator only ever needs
+            # a list to work with, but the compare-and-swap must know whether the
+            # stored value was SQL NULL (a photoless listing that never had its
+            # images column initialised) so it can pin `images IS NULL` instead of
+            # `images = '[]'`, which a NULL column can never satisfy.
+            raw_previous = result.data[0].get("images")
+            previous = raw_previous if isinstance(raw_previous, list) else []
+            cas_previous = raw_previous if isinstance(raw_previous, list) else None
             new_images = mutate(list(previous), {"attempt": attempt})
             if new_images is None:
                 return list(previous)
 
-            applied = _cas_update_images(listing_id, agent_id, previous, new_images)
+            applied = _cas_update_images(listing_id, agent_id, cas_previous, new_images)
             if applied:
                 return new_images
             if applied is None:
