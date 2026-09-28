@@ -25,6 +25,7 @@ import fcntl
 import time
 import random
 import logging
+import math
 from datetime import datetime, timedelta, date, timezone
 from urllib.parse import quote, urlsplit
 from PIL import Image as PILImage, ImageEnhance, ImageOps, ImageStat
@@ -6279,6 +6280,27 @@ def _pg_export_measure(value, suffix: str) -> str:
     return f"{_fmt_writeup_num(n)}{suffix}"
 
 
+def _pg_export_count(value) -> str:
+    """Format a room-count field (bedrooms/bathrooms) for the export block, or "" to skip
+    the line. Bedrooms/bathrooms come back from the backend as strings, so a plain
+    truthy/blank check does NOT catch "0" -- a non-empty string is always truthy. 0/"0"/
+    blank/unset here means "unknown, not asked", never a real fact, so it must never
+    print as "Bathrooms: 0". Mirrors the frontend's formatBathroomsBullet /
+    formatBedroomsBullet (MyListings.js): convert to a number, require a finite value > 0,
+    otherwise skip -- and when valid, show the value exactly as the agent typed it rather
+    than reformatting it."""
+    s = "" if value is None else str(value).strip()
+    if not s:
+        return ""
+    try:
+        n = float(s)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(n) or n <= 0:
+        return ""
+    return s
+
+
 def _pg_export_price(raw) -> str:
     """The asking price as the agent typed it. If it's a plain number (optionally with
     commas/spaces) we normalise it to "S$5,350,000"; anything else (e.g. "5.35M",
@@ -6315,8 +6337,8 @@ def _build_propertyguru_text_block(listing: dict) -> str:
     add("Address", listing.get("location"))
     add("District", _listing_district_label(listing))
     add("Asking Price", _pg_export_price(listing.get("price")))
-    add("Bedrooms", listing.get("bedrooms"))
-    add("Bathrooms", listing.get("bathrooms"))
+    add("Bedrooms", _pg_export_count(listing.get("bedrooms")))
+    add("Bathrooms", _pg_export_count(listing.get("bathrooms")))
     add("Built-up Area", _pg_export_measure(listing.get("built_up"), " sqft"))
     add("Land Area", _pg_export_measure(listing.get("land_size"), " sqft"))
     add("No. of Storeys", _pg_export_measure(listing.get("storeys"), ""))
