@@ -2728,6 +2728,21 @@ def _dedupe_urls(urls: list) -> list:
     return out
 
 
+def _upload_filename_for(listing_id: str, img_bytes: bytes) -> str:
+    """Content-addressed name for an uploaded photo (F-2 idempotency fix). Identical upload
+    bytes ALWAYS produce the identical object name, so a retried or duplicated upload/finalize
+    re-uploads to the SAME storage path and yields the SAME public URL. That is precisely what
+    lets the finalize/append dedup below collapse a replayed batch to a no-op, instead of
+    appending the same photos again under fresh uuids (the duplicate-photo gap).
+
+    The hash is of the ORIGINAL decoded upload bytes, not the re-encoded JPEG, so the name is
+    stable regardless of how Pillow re-encodes across versions. 20 hex chars (80 bits) makes an
+    accidental collision between two genuinely different photos astronomically unlikely; two
+    byte-identical photos mapping to one entry is correct dedup, not a loss."""
+    digest = hashlib.sha256(img_bytes).hexdigest()[:20]
+    return f"{listing_id}/{digest}_{listing_id[:8]}.jpg"
+
+
 def _process_and_upload_images(listing_id: str, agent_id: str, images: list, append: bool = False,
                                upload_session: str = None, batch_index: int = 0,
                                finalize: bool = True) -> dict:
@@ -2775,7 +2790,6 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list, app
     # uploaded so far, which is the exact failure this rewrite exists to remove.
     capped = len(images) > room
     images = images[:room]
-    start_index = len(existing_urls) + len(staged_urls)
 
     batch_urls = []
     for i, img in enumerate(images):
@@ -2794,17 +2808,22 @@ def _process_and_upload_images(listing_id: str, agent_id: str, images: list, app
         buffer.seek(0)
         compressed = buffer.read()
 
-        # The trailing random token is what makes this safe. The old name was
-        # f"{start_index + i}_{listing_id[:8]}.jpg", i.e. derived purely from how
-        # many photos the array currently held -- which collides the moment a
-        # photo has been deleted. A listing that once had 15 photos and lost one
-        # has 14 entries but still has files 0..14 sitting in storage, so the
-        # next appended photo computed "14_..." and, because the upload runs with
-        # upsert, silently overwrote the agent's existing photo 14 with the new
-        # image. The listing then rendered the same photo twice and the original
-        # was gone for good. A unique name can never overwrite an existing photo,
-        # and it also defuses two concurrent appends racing on the same index.
-        filename = f"{listing_id}/{start_index + i}_{listing_id[:8]}_{uuid.uuid4().hex[:8]}.jpg"
+        # Content-addressed name (F-2 idempotency). The old name was
+        # f"{start_index + i}_{listing_id[:8]}.jpg" -- derived purely from how many
+        # photos the array currently held -- which collided the moment a photo had
+        # been deleted (files 0..14 in storage but 14 entries -> the next append
+        # computed "14_..." and upsert silently overwrote an existing photo). A later
+        # fix bolted a random uuid onto that to stop the overwrite, but the uuid made
+        # a RETRIED upload land under a brand-new name, so the dedup below couldn't
+        # tell it apart from a fresh photo and appended the batch twice.
+        #
+        # A content hash fixes both at once: identical bytes always map to the same
+        # name, so a retry re-uploads to the same object (an upsert of identical bytes
+        # is a harmless rewrite) and produces the same URL, which the dedup then
+        # collapses to a no-op; and two DIFFERENT photos never collide, so it can
+        # never overwrite someone else's photo and it still defuses two concurrent
+        # appends racing on the same positional index.
+        filename = _upload_filename_for(listing_id, img_bytes)
         supabase.storage.from_("listings-images").upload(
             filename,
             compressed,
@@ -3353,6 +3372,53 @@ _enhancing_guard = threading.Lock()
 _ENHANCED_MARKER = "enhanced_"
 
 
+def _enhanced_filename_for(listing_id: str, original_url: str) -> str:
+    """Name the enhanced copy so the ORIGINAL it was made from can be recovered later
+    from the filename ALONE -- no DB column, no sidecar object, no extra storage read.
+    That is what makes undo durable across a page reload: after a refresh the listing
+    array only remembers the enhanced URL, but the enhanced URL now carries its own
+    original inside it.
+
+    The original's public URL is base64url-encoded (the urlsafe alphabet is
+    A-Za-z0-9-_ only, so every character is filename-safe) and carried as its own
+    dot-delimited segment. base64url never contains '.', so enhanced_{tok}.{b64}.jpg
+    always parses back into exactly three segments -- see _original_url_from_enhanced.
+    Keeps the 'enhanced_' prefix that _ENHANCED_MARKER and the already-enhanced guard
+    match on, so re-enhancing an enhanced photo is still blocked."""
+    token = base64.urlsafe_b64encode(original_url.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{listing_id}/{_ENHANCED_MARKER}{uuid.uuid4().hex[:8]}.{token}.jpg"
+
+
+def _original_url_from_enhanced(enhanced_url: str):
+    """Inverse of _enhanced_filename_for: the ORIGINAL public URL an enhanced photo was
+    made from, or None when it can't be recovered -- an enhanced file written by the
+    older scheme (enhanced_{8}_{8}.jpg, no embedded original), or any URL that isn't one
+    of our enhanced copies at all. Pure string work: no network, no storage, no DB, so
+    it is cheap to call once per photo on every listing load."""
+    path = _storage_path_from_url(enhanced_url)
+    if not path:
+        return None
+    basename = path.rsplit("/", 1)[-1]
+    if not basename.startswith(_ENHANCED_MARKER) or not basename.endswith(".jpg"):
+        return None
+    # Strip ".jpg"; a current-scheme name is "enhanced_{tok}.{b64}" -> two dot segments.
+    # The old scheme "enhanced_{8}_{8}" has none, so it yields one segment and we bail.
+    parts = basename[:-4].split(".")
+    if len(parts) != 2 or not parts[1]:
+        return None
+    token = parts[1]
+    token += "=" * (-len(token) % 4)  # restore the base64 padding we stripped at encode time
+    try:
+        original_url = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None  # binascii.Error subclasses ValueError
+    # Only ever hand back a URL that lives in OUR bucket -- the same guard /restore applies,
+    # so a decoded value that isn't a real listing photo is treated as "no original".
+    if not _storage_path_from_url(original_url):
+        return None
+    return original_url
+
+
 def _begin_enhance(url: str) -> bool:
     with _enhancing_guard:
         if url in _enhancing_urls:
@@ -3412,8 +3478,12 @@ def _enhance_listing_image(listing_id: str, agent_id: str, image_index, image_ur
         # (nothing to fall back to if the agent dislikes the result) and let a
         # second enhance read back the already-enhanced pixels and process them
         # again. A fresh name makes the operation non-destructive and means the
-        # URL itself tells us whether a photo has been swapped yet.
-        filename = f"{listing_id}/enhanced_{listing_id[:8]}_{uuid.uuid4().hex[:8]}.jpg"
+        # URL itself tells us whether a photo has been swapped yet. The name also
+        # carries the original's URL inside it (base64url) so undo survives a page
+        # reload -- see _enhanced_filename_for. If the source somehow isn't one of
+        # our bucket URLs the name still forms fine; recovery just returns None for
+        # it, exactly as before (no durable undo for that odd case, no regression).
+        filename = _enhanced_filename_for(listing_id, url)
         supabase.storage.from_("listings-images").upload(
             filename, enhanced_bytes, {"content-type": "image/jpeg", "upsert": "true"}
         )
@@ -3460,7 +3530,19 @@ async def enhance_listing_image_by_url(listing_id: str, image_url: str, agent=De
     return {"success": True, "image_url": new_url}
 
 
-def _restore_listing_image(listing_id: str, agent_id: str, enhanced_url: str, original_url: str) -> list:
+def _restore_listing_image(listing_id: str, agent_id: str, enhanced_url: str, original_url: str = None) -> list:
+    # Durable undo: when the caller doesn't carry the original URL -- e.g. the page was
+    # reloaded after enhancing, so the in-session memory of what it enhanced FROM is gone --
+    # recover it from the enhanced filename itself, which the enhancer encodes it into.
+    # Callers that still pass original_url (the in-session frontend) keep working unchanged.
+    if not original_url:
+        original_url = _original_url_from_enhanced(enhanced_url)
+    if not original_url:
+        raise HTTPException(
+            status_code=404,
+            detail="The original of this photo isn't available to restore",
+        )
+
     # Guard: only ever restore to an object that lives in OUR listings-images bucket, never an
     # arbitrary or foreign URL smuggled into the photo array.
     if not _storage_path_from_url(original_url):
@@ -3496,15 +3578,42 @@ def _restore_listing_image(listing_id: str, agent_id: str, enhanced_url: str, or
 
 
 @app.post("/api/listings/{listing_id}/images/restore")
-def restore_listing_image(listing_id: str, original_url: str, enhanced_url: str, agent=Depends(get_current_agent)):
+def restore_listing_image(listing_id: str, enhanced_url: str, original_url: str = None, agent=Depends(get_current_agent)):
     """Feature #1: undo a photo enhancement by pointing the listing's photo slot back at the
     ORIGINAL image. Enhancement is non-destructive -- it writes the enhanced photo to a NEW
     file and never deletes the original -- but afterwards the listing array only remembers the
-    enhanced URL, so the caller must supply the original_url it enhanced FROM (the frontend has
-    it in-session, as the URL it passed to /enhance). Swaps enhanced_url -> original_url in the
-    photo array in place; idempotent, and it never deletes the enhanced file."""
+    enhanced URL. original_url is now OPTIONAL: the in-session frontend may still pass the URL
+    it enhanced FROM, but after a page reload it can omit it and the server recovers the
+    original from the enhanced filename (see _enhanced_filename_for), which is what makes undo
+    durable across reloads. Swaps enhanced_url -> original_url in the photo array in place;
+    idempotent, and it never deletes the enhanced file."""
     images = _restore_listing_image(listing_id, agent["id"], enhanced_url, original_url)
     return {"success": True, "images": images}
+
+
+@app.get("/api/listings/{listing_id}/images/originals")
+def list_image_originals(listing_id: str, agent=Depends(get_current_agent)):
+    """Feature #1 (durable undo), discovery half: for each photo on this listing that is an
+    enhanced copy WITH a recoverable original, map its enhanced URL -> the original URL it was
+    made from. The frontend reads this once when rendering the photo manager so it can show
+    "Undo" on an enhanced photo even after a page reload, and knows exactly what to restore to.
+
+    Pure string work over the listing's own images array -- no per-photo storage or network
+    calls -- so it stays cheap even with 50 agents loading their listings at once. Enhanced
+    photos written by the older naming scheme simply don't appear here (their original can't be
+    recovered), which the frontend reads as "no durable undo available", same as today."""
+    result = db_execute(
+        lambda db: db.table("listings").select("images").eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="list_image_originals images read",
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    originals = {}
+    for url in (result.data[0].get("images") or []):
+        original = _original_url_from_enhanced(url)
+        if original:
+            originals[url] = original
+    return {"originals": originals}
 
 _CAPTION_REJECTION_REASONS = {
     "empty": "the caption is empty",
