@@ -21,8 +21,14 @@ What it does NOT permit (none of which NestList does):
   - Redistributing or selling the audio file on its own, or as part of a
     music/stock library.
   - Using it in a way that suggests Pixabay or the artist endorses NestList.
-  - Registering the track (or a video containing it) with a content-ID or
-    rights-management service.
+  - Claiming the track as your own work, or implying you wrote it.
+
+  Content ID: Pixabay does NOT forbid Content-ID registration outright -- it
+  offers its own flag for it, so some Pixabay tracks ARE registered with
+  Content-ID systems, and a registered track can get an agent's post muted or
+  claimed on Facebook/Instagram/YouTube. Being on Pixabay is therefore NOT proof
+  a track is safe. Only tracks verified as unregistered may be offered in the
+  agent-facing music picker (audio/tracks.json "mood" entries).
 
 This is the track validated during video prototyping; the file here is
 byte-identical to the one used in those tests (MD5 3052f5ca752ac6ee723c107b8877be62).
@@ -143,3 +149,24 @@ exists. Do not re-add without her say-so.
 Removing a track reassigns only the listings that had it; every other listing
 keeps the music it already had. Videos already rendered are untouched -- the
 file that shipped is the file the buyer keeps hearing.
+
+
+Added 2026-10-11 -- "choose your music" picker (Content-ID-clean tracks only)
+==============================================================================
+Agents can now pick their Classic video's music. Only tracks confirmed NOT
+registered with Content-ID are pickable; they carry a "mood" label in
+tracks.json. Everything else stays in the automatic pool only.
+
+  soft_piano.mp3     mood "Warm"  -- confirmed not Content-ID registered.
+
+  PENDING (file not yet in audio/):
+  Acoustic Upbeat by OctoSound -- mood "Upbeat". Free commercial, no
+  attribution, not registered. Source:
+  https://pixabay.com/music/happy-childrens-tunes-acoustic-upbeat-301015/
+  Needs: downloaded by Jane, trimmed to ~75s with a ~3s fade, levelled to about
+  -9.8 LUFS (see LEVELS above), saved as audio/acoustic_upbeat.mp3, MD5 and
+  LUFS recorded here, then the tracks.json entry below added:
+    "acoustic_upbeat.mp3": {"mood": "Upbeat", "auto": false,
+        "feel": "Bright, light acoustic guitar. Cheerful and friendly."}
+  ("auto": false keeps this happier track out of the automatic pick so it never
+  lands on a grand property by itself; it plays only when an agent chooses it.)

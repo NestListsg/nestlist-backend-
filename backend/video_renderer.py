@@ -419,12 +419,20 @@ def _music_tier(property_type):
     return TIER_WARM
 
 
-def _track_tiers():
-    """Filename -> tier, from audio/tracks.json. {} whenever it can't be trusted.
+def _load_manifest():
+    """audio/tracks.json -> {filename: {"tier", "mood", "feel", "auto"}}. {} if untrusted.
 
-    Every failure here is silent-but-logged and returns {}, which the caller reads
-    as "no opinion, every track is eligible". A typo in this file must never cost an
-    agent their music bed.
+    An entry is EITHER the original plain string ("minimal_piano.mp3": "warm", which is
+    a property-tier tag and nothing else) OR an object that can carry any of:
+      "tier"  "warm" | "grand"  -- the property-tier axis, exactly as before
+      "mood"  "Warm", "Upbeat"  -- the label an agent sees in the music picker; a track
+                                   is pickable only if it has one
+      "feel"  one line shown under the label in the picker
+      "auto"  false             -- keep this track out of the automatic pick, so it only
+                                   plays when an agent chooses it
+    Every failure returns {} (or skips the one bad entry) and is logged, which the
+    callers read as "no opinion". A typo in this file must never cost an agent their
+    music bed.
     """
     try:
         with open(TRACKS_MANIFEST, "rb") as f:
@@ -439,17 +447,70 @@ def _track_tiers():
         logger.warning("music manifest %s is not a JSON object; ignoring it",
                        TRACKS_MANIFEST)
         return {}
-    tiers = {}
-    for name, tier in raw.items():
-        tier = str(tier or "").strip().lower()
-        if tier in MUSIC_TIERS:
-            tiers[str(name)] = tier
+    entries = {}
+    for name, value in raw.items():
+        if str(name).startswith("_"):
+            continue          # "_comment" and friends: notes for humans, not tracks
+        if isinstance(value, dict):
+            tier, mood, feel = value.get("tier"), value.get("mood"), value.get("feel")
+            auto = value.get("auto", True) is not False
         else:
+            tier, mood, feel, auto = value, None, None, True
+        tier = str(tier or "").strip().lower()
+        if tier and tier not in MUSIC_TIERS:
             # An unrecognised tier name is treated as "untagged" rather than dropped,
             # so a typo widens that track's eligibility instead of silencing it.
             logger.warning("music manifest lists %r under unknown tier %r; leaving "
                            "that track eligible for every property type", name, tier)
-    return tiers
+            tier = ""
+        entries[str(name)] = {
+            "tier": tier or None,
+            "mood": str(mood).strip() if mood else None,
+            "feel": str(feel).strip() if feel else None,
+            "auto": auto,
+        }
+    return entries
+
+
+def _track_tiers():
+    """Filename -> tier, from audio/tracks.json. {} whenever it can't be trusted."""
+    return {name: e["tier"] for name, e in _load_manifest().items() if e["tier"]}
+
+
+def pickable_tracks():
+    """The tracks an agent may choose in the music picker, in filename order.
+
+    [{"id": "soft_piano.mp3", "mood": "Warm", "feel": "..."}, ...]. A track is listed
+    only if the manifest gives it a mood AND the file is actually in audio/ right now,
+    so a manifest line for a file that has not been dropped in yet (or was removed)
+    never shows up as a choice that cannot play. Never raises.
+    """
+    try:
+        present = {os.path.basename(p) for p in _music_library()}
+        manifest = _load_manifest()
+        return [
+            {"id": name, "mood": e["mood"], "feel": e["feel"] or ""}
+            for name, e in sorted(manifest.items())
+            if e["mood"] and name in present
+        ]
+    except Exception as e:
+        logger.warning("could not build the pickable music list (%s)", e)
+        return []
+
+
+def is_auto_music_choice(music_track):
+    """True for the 'let NestList choose' values: missing, blank or 'auto'."""
+    return str(music_track or "").strip().lower() in ("", "auto")
+
+
+def resolve_pickable_track(track_id):
+    """Full path of a pickable track, or None if the id is not one. Exact id match only,
+    so nothing outside the curated list (or outside audio/) can be reached."""
+    wanted = str(track_id or "").strip()
+    for t in pickable_tracks():
+        if t["id"] == wanted:
+            return os.path.join(AUDIO_DIR, wanted)
+    return None
 
 
 def _select_music_track(seed, property_type=None):
@@ -478,8 +539,14 @@ def _select_music_track(seed, property_type=None):
     tracks = _music_library()
     if not tracks:
         return None, None
+    manifest = _load_manifest()
+    # Tracks flagged "auto": false are picker-only. If that somehow excludes everything,
+    # use the whole library rather than ship a silent video.
+    auto_ok = [p for p in tracks
+               if manifest.get(os.path.basename(p), {}).get("auto", True)]
+    tracks = auto_ok or tracks
     tier = _music_tier(property_type)
-    tagged = _track_tiers()
+    tagged = {n: e["tier"] for n, e in manifest.items() if e["tier"]}
     # A track with no usable entry stays eligible everywhere. That way an untagged
     # file is over-used rather than unplayable, and a missing or broken manifest
     # degrades to exactly the behaviour we had before tiers existed.
@@ -1293,7 +1360,8 @@ def _build_card_clip(body_path, card_img, out_path, workdir):
 def render_property_video(image_urls, property_type=None, district=None, price_text=None,
                           stats=None, agent_name="", agent_contact_line="",
                           style="classic", photo_index=0, agent_photo_url=None,
-                          copy_guard=None, music_seed=None, caption_overrides=None):
+                          copy_guard=None, music_seed=None, caption_overrides=None,
+                          music_track=None):
     """Renders the Classic-tier listing video and returns (mp4_bytes, degradations, captions).
 
     `caption_overrides` maps a photo's URL to a caption the AGENT wrote. Keyed on the
@@ -1323,6 +1391,11 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     back the same track. The candidate list is first narrowed to the property's mood
     tier (audio/tracks.json, advisory). Omitting the seed is safe (every listing then
     shares one track); it only matters once audio/ holds more than one file.
+    music_track: the agent's own pick from the music picker (an id from
+    pickable_tracks()). None, blank or "auto" keeps the automatic selection above
+    exactly as it was. An id that is no longer pickable (file removed between the
+    request and the render) falls back to the automatic pick and is reported in
+    `degradations` -- a stale choice must never fail a render.
     copy_guard: optional callable(text, context=...) -> text. main.py passes
     apply_listing_copy_guards so captions go through the same house-number/price
     stripping as every other copy surface. Passed in rather than imported because
@@ -1481,7 +1554,17 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             # --- music bed (degrades to silence) ---
             final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
             wrote_final = False
-            track_path, music_tier = _select_music_track(music_seed, property_type)
+            track_path = None
+            if not is_auto_music_choice(music_track):
+                track_path = resolve_pickable_track(music_track)
+                music_tier = "chosen by agent"
+                if track_path is None:
+                    logger.warning("chosen music %r is not available; using the automatic pick",
+                                   music_track)
+                    degradations.append(
+                        "the music you picked was not available, so a matching track was used")
+            if track_path is None:
+                track_path, music_tier = _select_music_track(music_seed, property_type)
             if track_path:
                 fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
                 audio_filter = (

@@ -1,4 +1,7 @@
 {
+  "_comment": "Plain string = property tier only (warm/grand). Object form adds picker fields: mood+feel make a track pickable by agents; omit tier to leave it eligible in every tier; auto:false keeps it out of the automatic pick. Only Content-ID-clean (unregistered) tracks may carry a mood.",
+  "soft_piano.mp3": {"mood": "Warm", "feel": "Soft, unhurried solo piano. Gentle and homely."},
+
   "minimal_piano.mp3": "warm",
   "peaceful_piano.mp3": "warm",
   "soft_piano_leberch.mp3": "warm",
