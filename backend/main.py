@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -4052,6 +4052,25 @@ def get_music_tracks(agent=Depends(get_current_agent)):
     are ever listed (see audio/tracks.json). The "Auto" option is not in this list --
     the frontend adds it and sends music_track=auto (or omits the param)."""
     return {"tracks": video_renderer.pickable_tracks()}
+
+
+@app.get("/api/music-tracks/{track_id}/audio")
+def get_music_track_audio(track_id: str, agent=Depends(get_current_agent)):
+    """Serves a pickable track's mp3 for the in-app preview. Same login as the list.
+
+    Only ids that /api/music-tracks lists resolve (exact match against that list, so a
+    path trick cannot reach any other file); anything else is 404. FileResponse honours
+    HTTP Range requests, so seeking works. A browser <audio src> cannot send the login
+    header, so the frontend must fetch this with its Authorization header and play the
+    result as a blob URL.
+    """
+    path = video_renderer.resolve_pickable_track(track_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Music track not found")
+    return FileResponse(
+        path, media_type="audio/mpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 # Video renders take 40-70s+ -- far too long to ride on a single HTTP request.
 # Safari hard-kills any request around the 60s mark (agents saw 'Failed to

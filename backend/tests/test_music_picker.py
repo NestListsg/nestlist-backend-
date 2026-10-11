@@ -55,5 +55,12 @@ check("music-tracks endpoint exists", "get_music_tracks" in fns and '"/api/music
 check("queued payload and legacy path both carry the choice",
       'payload.get("music_track")' in src and "chosen_music_track,\n    ))" in src)
 
+check("audio preview endpoint exists and is login-gated",
+      "get_music_track_audio" in fns and '"/api/music-tracks/{track_id}/audio"' in src
+      and "get_current_agent" in ast.get_source_segment(src, fns["get_music_track_audio"]).split("\n")[0])
+check("audio endpoint 404s unless the track resolves as pickable",
+      "resolve_pickable_track(track_id)" in ast.get_source_segment(src, fns["get_music_track_audio"])
+      and "404" in ast.get_source_segment(src, fns["get_music_track_audio"]))
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)
