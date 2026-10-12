@@ -149,15 +149,17 @@ JOB_TYPES = {
     # for how long, not how much runs at once. Single-agent behaviour is unchanged.
     JOB_TYPE_CLASSIC: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=60),
     # Signature: the Classic film with the agent's own presenting clip as its opening
-    # slide, so it is the same CPU and memory shape as a Classic plus one more slide and
-    # one audio pass. The account-wide limit of 1 predates that design (it was written
-    # for a Replicate avatar pipeline, which was closed on evidence) and is KEPT
-    # deliberately until the reliability audit says otherwise: it is the conservative
-    # direction, it makes the queue position honest, and raising a number is a smaller
-    # change to make later than recovering from having run too many at once.
-    # default_seconds is a placeholder from that same era and is only an ETA before any
-    # real Signature has been timed -- see the note in the hand-off.
-    JOB_TYPE_SIGNATURE: JobTypeConfig(per_process_limit=1, account_limit=1, default_seconds=360),
+    # slide -- the same CPU and memory shape as a Classic, plus one more slide and one
+    # audio pass.
+    #
+    # It used to carry account_limit=1 and default_seconds=360. Both were inherited from
+    # a Replicate avatar pipeline that was closed on evidence and never shipped, and the
+    # audit found they cost three things and bought nothing: memory is already bounded by
+    # MAX_CONCURRENT_RENDERS x PER_PROCESS_RENDER_LIMIT x the worker count (~3.3GB)
+    # whatever the mix of tiers, so serialising Signatures fleet-wide only made agents
+    # queue behind each other, turned any one stuck render into a platform-wide stall,
+    # and quoted an ETA four to five times the real one.
+    JOB_TYPE_SIGNATURE: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=90),
 }
 
 # How many renders of ANY type one worker process may have in flight at once.
@@ -884,17 +886,25 @@ def sweep_stale():
     return reclaimed
 
 
-def _queue_is_draining(job_type, window_seconds):
-    """Has anything of this type actually finished recently?
+def _queue_is_draining(window_seconds):
+    """Has ANY job, of any type, actually finished recently?
 
     This is what separates "the queue is deep" from "the queue is dead". A backlog with
     workers chewing through it keeps producing finished jobs; a backlog with no consumer
-    produces none. Only the second one justifies failing an agent's job."""
+    produces none. Only the second one justifies failing an agent's job.
+
+    DELIBERATELY NOT PER TYPE. A type can be starved by a busier one, and a starved type
+    finishes nothing of its own -- so asking "has anything of THIS type finished" answers
+    "the rendering service is dead" and fails the agent's job with a message that is
+    simply untrue, while the failure then counts as that type draining and leaves the
+    jobs behind it stuck for another window. The question that matters is whether
+    anything at all is being drained: if it is, a long-queued job has not had its turn
+    yet, which is a wait and not a breakage."""
     since = _iso(_now() - timedelta(seconds=window_seconds))
     try:
         res = _exec(
             lambda db: db.table(TABLE).select("id")
-            .eq("job_type", job_type).in_("status", list(TERMINAL_STATUSES))
+            .in_("status", list(TERMINAL_STATUSES))
             .gt("finished_at", since).limit(1),
             what="video_jobs draining check")
         return bool(res.data)
@@ -930,16 +940,15 @@ def sweep_abandoned_queue():
     if not rows:
         return 0
 
+    # One question, asked once, about the whole table: is anything being drained at all?
+    # If it is, every one of these rows is waiting rather than abandoned -- including a
+    # row of a type that has been waiting behind a busier one.
+    if _queue_is_draining(QUEUED_ESCAPE_SECONDS):
+        return 0
+
     freed = 0
-    draining = {}
     for job in rows:
         job_type = job.get("job_type") or JOB_TYPE_CLASSIC
-        if job_type not in draining:
-            draining[job_type] = _queue_is_draining(job_type, QUEUED_ESCAPE_SECONDS)
-        if draining[job_type]:
-            # Deep but alive. Leave it alone -- it will get its turn.
-            continue
-
         attempt = int(job.get("attempts") or 0)
         now = _now()
         patch = {
@@ -1233,6 +1242,9 @@ async def run_consumer():
     tasks = set()
     last_sweep = 0.0
     last_prune = 0.0
+    # Which registered type gets first refusal on the next pass. Advanced ONLY when a
+    # job is actually claimed, so the types take turns; see the loop below.
+    rr_start = 0
     logger.info("video_jobs: consumer started (worker %s)", WORKER_ID)
 
     while not _shutting_down:
@@ -1248,8 +1260,23 @@ async def run_consumer():
                 last_prune = now
                 await asyncio.to_thread(prune_finished)
 
+            # TAKE TURNS. This loop used to run in alphabetical order, which with
+            # PER_PROCESS_RENDER_LIMIT = 1 is absolute priority and not a queue: it
+            # breaks as soon as it claims one job, "classic" sorts before "signature",
+            # so while any Classic work remained a Signature was never claimed at all.
+            # It then got worse than waiting -- the abandoned-queue sweep eventually
+            # failed the starved job and told the agent the rendering service was not
+            # picking up work, which was false.
+            #
+            # Round-robin instead: whichever type was served last goes to the back, and
+            # rr_start only moves when something is actually claimed, so a type with an
+            # empty queue never costs the other its turn. With one type registered this
+            # is the same single-element loop it has always been.
+            types = sorted(_RENDERERS)
+            rr_start %= max(1, len(types))
+            order = types[rr_start:] + types[:rr_start]
             has_capacity = False
-            for job_type in sorted(_RENDERERS):
+            for job_type in order:
                 cfg = JOB_TYPES[job_type]
                 if sum(running.values()) >= PER_PROCESS_RENDER_LIMIT:
                     # This process is already rendering all it can render. Leaving the
@@ -1263,6 +1290,7 @@ async def run_consumer():
                 if job is None:
                     continue
                 picked = True
+                rr_start = types.index(job_type) + 1
                 running[job_type] = running.get(job_type, 0) + 1
                 task = asyncio.create_task(asyncio.to_thread(execute_job, job))
                 tasks.add(task)

@@ -22,6 +22,9 @@ import re
 import secrets
 import hashlib
 import threading
+# For _abandon_response: shutting a socket down is the only thing that reliably
+# interrupts a stalled streaming read (see that function).
+import socket
 import fcntl
 import time
 import random
@@ -5331,7 +5334,74 @@ SIGNATURE_NO_PRESENTER_DETAIL = (
 PRESENTER_FETCH_MAX_BYTES = 64 * 1024 * 1024
 PRESENTER_FETCH_TIMEOUT = (5, 30)        # (connect, read-between-chunks)
 PRESENTER_FETCH_ATTEMPTS = 2             # one retry for a flaky read, then stop
-PRESENTER_FETCH_CHUNK = 256 * 1024
+
+# TOTAL WALL CLOCK, which is the bound that actually matters here.
+#
+# The timeout above limits the gap BETWEEN chunks, not the length of the download. A
+# server dribbling a kilobyte every two seconds never trips it, and never sends enough
+# to trip the byte cap either, so the fetch would run for hours -- holding this worker's
+# only render claim while the heartbeat kept proving the job was alive, so nothing could
+# reclaim it either. The audit measured a projected 36 hours per attempt.
+#
+# A deadline is the only thing that bounds a trickle, and it takes BOTH halves below to
+# enforce one. Measured against the audit's dribbling server: a check inside the chunk
+# loop alone never ran, because requests does not yield a chunk until the whole chunk
+# has been collected (and chunk_size=None is worse, not better -- urllib3 then reads to
+# end of body), so the loop sat inside one blocked read with the deadline long past.
+# Closing the response from a watchdog thread is what makes that read return.
+#
+# A normalised clip is a few megabytes, so 45 seconds is already far longer than a
+# healthy fetch needs, and the total bounds the retry as well.
+PRESENTER_FETCH_DEADLINE_SECONDS = 45
+PRESENTER_FETCH_TOTAL_SECONDS = 100
+PRESENTER_FETCH_CHUNK = 64 * 1024
+_PRESENTER_TOO_SLOW = ("your presenting clip was downloading too slowly (%%d bytes in "
+                       "%ds)" % PRESENTER_FETCH_DEADLINE_SECONDS)
+
+
+def _abandon_response(response, warn=False):
+    """Make a read that is blocked on this response return, now.
+
+    Measured against the audit's dribbling server, the obvious ways do not work, and
+    not merely by being slower:
+      * response.close() hands the connection back tidily, which means waiting out the
+        body that is still arriving in a trickle -- 80 seconds past the deadline.
+      * closing the buffered reader underneath it BLOCKS, because the stalled read holds
+        that object's own lock. The watchdog thread ends up waiting for exactly the read
+        it was supposed to interrupt (measured: 81.3 seconds inside close()).
+    Shutting the SOCKET down is a syscall on the file descriptor: it takes no Python
+    lock, returned in 0.000s, and the blocked read came back in the same instant.
+
+    This reaches into urllib3's internals, so every step is best-effort and the caller's
+    deadline stands behind it. The interrupted read may look like a clean end of body
+    rather than an error, which is why the caller checks the deadline AFTER the loop as
+    well -- a cut-short download must never be mistaken for a complete one.
+    """
+    sock = None
+    for path in (lambda: response.raw._fp.fp.raw._sock,
+                 lambda: response.raw._original_response.fp.raw._sock,
+                 lambda: response.raw._connection.sock):
+        try:
+            found = path()
+        except Exception:
+            continue
+        if isinstance(found, socket.socket):
+            sock = found
+            break
+    if sock is None:
+        # A shape of urllib3 we do not know, or -- the common case -- a finished
+        # download whose connection has already been released. Only the watchdog cares,
+        # and only then is it worth a line in the log. Do NOT fall back to
+        # response.close() here: from the watchdog thread that is the call that blocks.
+        # The caller's deadline still ends the attempt.
+        if warn:
+            logger.warning("could not reach the socket to abandon a slow download")
+        return
+    for action in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
+        try:
+            action()
+        except Exception:
+            pass
 
 
 def _download_presenter_clip(url: str, dest_path: str):
@@ -5343,10 +5413,21 @@ def _download_presenter_clip(url: str, dest_path: str):
     it is a Classic, and must never be delivered as one.
     """
     last_error = None
+    overall_deadline = time.monotonic() + PRESENTER_FETCH_TOTAL_SECONDS
     for attempt in range(1, PRESENTER_FETCH_ATTEMPTS + 1):
         written = 0
+        if time.monotonic() >= overall_deadline:
+            break
+        deadline = min(time.monotonic() + PRESENTER_FETCH_DEADLINE_SECONDS,
+                       overall_deadline)
         try:
-            with requests.get(url, timeout=PRESENTER_FETCH_TIMEOUT, stream=True) as r:
+            # NOT a `with` block. Leaving a streamed response through its context
+            # manager lets requests close it tidily, and closing a response whose body
+            # is still arriving in a trickle blocks until that body is done with --
+            # measured at 80 seconds past the deadline, which is exactly the thing this
+            # function must not do. The `finally` below abandons the connection instead.
+            r = requests.get(url, timeout=PRESENTER_FETCH_TIMEOUT, stream=True)
+            try:
                 if r.status_code in (401, 403, 404, 410):
                     # The agent replaced or deleted the clip, or the bucket moved. Three
                     # more attempts would all read the same missing object.
@@ -5359,16 +5440,54 @@ def _download_presenter_clip(url: str, dest_path: str):
                     raise video_jobs.PermanentJobError(
                         "Your presenting clip is too large to use. Please record a "
                         "shorter one in My Profile.")
-                with open(dest_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=PRESENTER_FETCH_CHUNK):
-                        if not chunk:
-                            continue
-                        written += len(chunk)
-                        if written > PRESENTER_FETCH_MAX_BYTES:
-                            raise video_jobs.PermanentJobError(
-                                "Your presenting clip is too large to use. Please record "
-                                "a shorter one in My Profile.")
-                        f.write(chunk)
+                # THE WATCHDOG. Interrupting the connection from another thread is what
+                # unblocks a read waiting on a chunk that is filling too slowly; the
+                # check inside the loop below cannot fire while that read is blocked.
+                # Cancelled below, so a healthy download never notices it.
+                watchdog = threading.Timer(
+                    max(0.1, deadline - time.monotonic()),
+                    _abandon_response, args=(r, True))
+                watchdog.daemon = True
+                watchdog.start()
+                try:
+                    with open(dest_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=PRESENTER_FETCH_CHUNK):
+                            if time.monotonic() > deadline:
+                                raise TimeoutError("deadline reached between chunks")
+                            if not chunk:
+                                continue
+                            written += len(chunk)
+                            if written > PRESENTER_FETCH_MAX_BYTES:
+                                raise video_jobs.PermanentJobError(
+                                    "Your presenting clip is too large to use. Please "
+                                    "record a shorter one in My Profile.")
+                            f.write(chunk)
+                except video_jobs.PermanentJobError:
+                    raise
+                except Exception:
+                    # A read the watchdog interrupted arrives here as a transport error.
+                    # Past the deadline it is one, and saying so is more use in the logs
+                    # than "connection closed".
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(_PRESENTER_TOO_SLOW % written)
+                    raise
+                finally:
+                    watchdog.cancel()
+            finally:
+                # Always, on every path: this connection is never reused, and a tidy
+                # close is the slow one.
+                _abandon_response(r)
+            if time.monotonic() > deadline:
+                # Either the watchdog cut the read, or the body ended as the deadline
+                # passed -- and a download that ran past its deadline cannot be trusted
+                # to be complete. Retryable; the total deadline bounds the retry.
+                raise TimeoutError(_PRESENTER_TOO_SLOW % written)
+            if declared and written != int(declared):
+                # Truncated: the connection ended early. Worth one retry, and far better
+                # than handing ffmpeg half a file and calling the clip unreadable.
+                raise RuntimeError(
+                    "your presenting clip arrived incomplete (%d of %s bytes)"
+                    % (written, declared))
             if written == 0:
                 raise RuntimeError("the presenting clip downloaded as an empty file")
             return dest_path
@@ -5378,7 +5497,7 @@ def _download_presenter_clip(url: str, dest_path: str):
             last_error = e
             logger.warning("presenter clip download failed (attempt %d/%d): %s: %s",
                            attempt, PRESENTER_FETCH_ATTEMPTS, type(e).__name__, e)
-            if attempt < PRESENTER_FETCH_ATTEMPTS:
+            if attempt < PRESENTER_FETCH_ATTEMPTS and time.monotonic() + 2.0 < overall_deadline:
                 time.sleep(2.0)
     raise RuntimeError("could not download your presenting clip: %s" % last_error)
 
@@ -6302,6 +6421,23 @@ async def get_signature_status(listing_id: str, agent=Depends(get_current_agent)
                 video_jobs.find_active, video_jobs.JOB_TYPE_SIGNATURE, listing_id)
             if job:
                 out.update(await asyncio.to_thread(video_jobs.describe, job))
+                # AN ACTIVE JOB OUTRANKS THE COLUMN, and it has to.
+                #
+                # The column is a best-effort mirror written AFTER the job row was
+                # committed, so a failed mirror write (logged, never fatal -- the render
+                # is already guaranteed) leaves the row reading 'done' from the PREVIOUS
+                # render. A screen that stops polling on 'done' would then stop on the
+                # first poll and show the agent the film they just asked to replace, as
+                # though it were the new one. The job row is the one that cannot lie
+                # about whether a render is in flight.
+                #
+                # The url goes with it: while a render is in flight there is no finished
+                # Signature to offer, and offering the last one is exactly the mistake
+                # above. A caller that wants to keep showing the old film meanwhile
+                # already has it from the poll before this one.
+                out["status"] = "rendering"
+                out["signature_video_url"] = None
+                out["error"] = None
         except Exception as e:
             # Queue metadata is a nicety; the status itself already came from the row.
             logger.warning("get_signature_status: queue lookup failed (%s)", e)

@@ -822,8 +822,12 @@ def _speech_start_seconds(path, duration, keep_at_least):
         # minimum-length check rejects. Not trimming is always safe.
         return 0.0
     try:
+        # -vn on both passes: these measure AUDIO, and without it ffmpeg decodes every
+        # video frame of the upload to throw it away. Measured on a 180MB phone clip:
+        # 0.60s with the video decode, 0.03s without, per pass, per upload.
         peak = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+            ["ffmpeg", "-hide_banner", "-i", path, "-vn",
+             "-af", "volumedetect", "-f", "null", "-"],
             capture_output=True, timeout=TIMEOUT_PROBE).stderr.decode("utf-8", "replace")
         loudest = re.search(r"max_volume:\s*(-?[\d.]+) dB", peak)
         if not loudest:
@@ -833,7 +837,7 @@ def _speech_start_seconds(path, duration, keep_at_least):
         low, high = PRESENTER_SILENCE_DB_RANGE
         threshold = min(high, max(low, float(loudest.group(1)) - PRESENTER_SILENCE_BELOW_PEAK))
         err = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-i", path, "-af",
+            ["ffmpeg", "-hide_banner", "-i", path, "-vn", "-af",
              f"silencedetect=noise={threshold:.1f}dB:d={PRESENTER_SILENCE_MIN}",
              "-f", "null", "-"],
             capture_output=True, timeout=TIMEOUT_PROBE).stderr.decode("utf-8", "replace")
@@ -2151,6 +2155,13 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             attempts = []
             for with_voice in ([True, False] if voice_path else [False]):
                 for normalize in ([True, False] if is_raw else [False]):
+                    if not track_path and not with_voice:
+                        # Nothing left to put in the soundtrack: that attempt would be an
+                        # empty -filter_complex with -map "[aout]", which cannot succeed
+                        # and only spends an ffmpeg call on the way to the silent
+                        # fallback below. Reached when the music file is missing from the
+                        # deploy and the voice layer has already failed.
+                        continue
                     attempts.append((normalize, with_voice))
             if not track_path and not voice_path:
                 attempts = []

@@ -202,5 +202,35 @@ finally:
     if os.path.exists(upload):
         os.remove(upload)
 
+print("\n[8] no music on disk: the silent fallback is reached without a doomed call")
+# With the music file missing and the voice layer failing, the ladder's last rung used
+# to be "no music, no voice" -- which builds -filter_complex "" with -map [aout] and
+# cannot succeed. It cost one ffmpeg call on the way to the silent fallback that was
+# always going to handle this.
+upload2 = os.path.join(BACKEND, "tests", "_fake_presenter2.mp4")
+with open(upload2, "wb") as f:
+    f.write(b"\0" * 4096)
+saved_select = vr._select_music_track
+vr._select_music_track = lambda seed, property_type=None: (None, "no music")
+try:
+    def fail_mix(cmd):
+        if "[aout]" in cmd:          # the soundtrack pass, not the slide builds
+            raise RuntimeError("ffmpeg exited 1: cannot mix")
+    cmds, result = capture(vr, ffmpeg=fail_mix, presenter_path=upload2, **CLASSIC_ARGS)
+    empty = [c for c in cmds
+             if "-filter_complex" in c and c[c.index("-filter_complex") + 1] == ""]
+    soundtrack = [c for c in cmds if "[aout]" in c]
+    check("no ffmpeg call is built with an empty filtergraph", not empty, str(empty))
+    check("exactly one soundtrack attempt was made (the voice)", len(soundtrack) == 1,
+          "%d attempts" % len(soundtrack))
+    data, degradations, _ = result
+    check("the film still ships", bool(data))
+    check("and the agent is told the music was missing",
+          any("music" in d for d in degradations), str(degradations))
+finally:
+    vr._select_music_track = saved_select
+    if os.path.exists(upload2):
+        os.remove(upload2)
+
 print("\n%d passed, %d failed" % (P, F))
 sys.exit(1 if F else 0)

@@ -211,6 +211,7 @@ def base_ns(**extra):
     ns = dict(
         logger=LOG, asyncio=asyncio, os=os, io=io, re=__import__("re"),
         time=__import__("time"), tempfile=__import__("tempfile"),
+        threading=__import__("threading"),
         uuid=__import__("uuid"), requests=None,
         datetime=__import__("datetime").datetime,
         timezone=__import__("datetime").timezone,
@@ -409,6 +410,11 @@ class FakeResponse:
         if self.status_code >= 400:
             raise RuntimeError("HTTP %d" % self.status_code)
 
+    def close(self):
+        # What the watchdog calls. The real one unblocks a stalled read; here the fake
+        # clock has already carried the loop past its deadline, so nothing needs to.
+        self.closed = True
+
     def iter_content(self, chunk_size=None):
         for c in self.chunks:
             if isinstance(c, Exception):
@@ -429,12 +435,36 @@ def fake_requests(responses):
     return types.SimpleNamespace(get=get), state
 
 
-def download(responses):
+class FakeClock:
+    """A clock the test moves on purpose, so testing a 45-second deadline is instant.
+
+    The download reads `time.monotonic()` for its deadlines and `time.sleep()` between
+    attempts; both come from here, and a dribbling response advances it per chunk.
+    """
+
+    def __init__(self):
+        self.t = 1000.0
+        self.start = 1000.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+    @property
+    def elapsed(self):
+        return self.t - self.start
+
+
+def download(responses, clock=None):
     req, state = fake_requests(responses)
     jobs = FakeVideoJobs()
     ns = with_prelude(video_jobs=jobs)
     ns["requests"] = req
-    ns["time"] = types.SimpleNamespace(sleep=lambda s: None)   # no real waiting
+    clock = clock or FakeClock()
+    ns["time"] = clock              # no real waiting, and a deadline we can drive
+    state["clock"] = clock
     with _tf.TemporaryDirectory() as d:
         dest = os.path.join(d, "p.mp4")
         try:
@@ -489,6 +519,58 @@ check("a flaky first read still gets the agent their Signature",
 
 kind, detail, _, _ = download([FakeResponse(chunks=[])])
 check("an empty download is an error, not a zero-byte 'clip'", kind == "RuntimeError", kind)
+
+# THE AUDIT'S F2. The read timeout only limits the gap BETWEEN chunks, so a server
+# dribbling a kilobyte every two seconds never trips it, never sends enough to trip the
+# byte cap either, and would hold this worker's only render claim for hours while the
+# heartbeat kept the job alive. A total deadline is the only thing that bounds it.
+check("there is a per-attempt wall-clock deadline",
+      0 < ns_probe["PRESENTER_FETCH_DEADLINE_SECONDS"] <= 120,
+      str(ns_probe["PRESENTER_FETCH_DEADLINE_SECONDS"]))
+check("...and a total one, covering the retry as well",
+      ns_probe["PRESENTER_FETCH_TOTAL_SECONDS"]
+      >= ns_probe["PRESENTER_FETCH_DEADLINE_SECONDS"]
+      and ns_probe["PRESENTER_FETCH_TOTAL_SECONDS"] <= 300,
+      str(ns_probe["PRESENTER_FETCH_TOTAL_SECONDS"]))
+
+slow_clock = FakeClock()
+
+
+def dribbling():
+    """1KB every 2 seconds, for ever -- inside the read timeout, below the byte cap."""
+    def gen():
+        while True:
+            slow_clock.t += 2.0
+            yield b"\0" * 1024
+    return FakeResponse(chunks=gen())
+
+
+kind, detail, state, _ = download([dribbling], clock=slow_clock)
+check("a dribbling server is given up on instead of being waited out",
+      kind == "RuntimeError", "%s %s" % (kind, detail))
+check("...within the total deadline, not hours",
+      slow_clock.elapsed <= ns_probe["PRESENTER_FETCH_TOTAL_SECONDS"] + 5,
+      "%.0fs of wall clock" % slow_clock.elapsed)
+check("...having tried no more times than allowed",
+      state["calls"] <= ns_probe["PRESENTER_FETCH_ATTEMPTS"], str(state["calls"]))
+check("...and the reason says it was too slow, not that the clip was bad",
+      "too slowly" in detail, detail)
+
+# A clip that arrives steadily but takes a few seconds is NOT a slow trickle.
+ok_clock = FakeClock()
+
+
+def steady():
+    def gen():
+        for _ in range(8):
+            ok_clock.t += 0.5            # 4 seconds in total
+            yield b"\0" * 512 * 1024     # 4MB, a realistic normalised clip
+    return FakeResponse(chunks=gen())
+
+
+kind, size, state, _ = download([steady], clock=ok_clock)
+check("a normal few-megabyte clip still downloads fine",
+      kind == "ok" and size == 8 * 512 * 1024, "%s %s" % (kind, size))
 
 # ===========================================================================
 print("\n[4] POST /generate-signature: the contract the frontend is built against")
@@ -722,6 +804,41 @@ out, _ = run_status({"id": "L1", "signature_video_status": "rendering",
 check("while rendering -> job_status and a position",
       out["status"] == "rendering" and out["job_status"] == "running"
       and out["queue_position"] == 1)
+# REGENERATE MUST NOT SHOW THE OLD FILM. The column is a best-effort mirror written
+# after the job is committed; if that write failed, the row still reads 'done' with the
+# PREVIOUS render's url, and a screen that stops polling on 'done' would stop on the
+# very first poll and present the old film as the new one.
+out, _ = run_status(DONE_ROW, column=[], active={"status": "queued", "degradations": []})
+check("a regenerate in flight reports 'rendering' even if the row still says 'done'",
+      out["status"] == "rendering", str(out["status"]))
+check("...and does not hand back the film being replaced",
+      out["signature_video_url"] is None, str(out["signature_video_url"]))
+check("...nor the previous render's error",
+      out["error"] is None)
+out, _ = run_status(dict(DONE_ROW, signature_video_status="failed",
+                         signature_video_error="old failure"),
+                    active={"status": "running", "degradations": []}, column=[])
+check("a retry after a failure reports 'rendering', not the old error",
+      out["status"] == "rendering" and out["error"] is None, str(out))
+out, _ = run_status(DONE_ROW, column=[])
+check("with nothing in flight, 'done' and the url stand",
+      out["status"] == "done" and out["signature_video_url"].endswith("L1.mp4?v=a"),
+      str(out))
+
+# The demo listing's shape: a hand-made film in signature_video_url, no status at all.
+HANDMADE = {"id": "L1", "signature_video_status": None,
+            "signature_video_url": "https://cdn/videos/signature_silent_v40.mp4?v=silent1",
+            "signature_video_error": None}
+out, _ = run_status(HANDMADE, column=[])
+check("the pre-existing hand-made film is reported, and NOT as a finished render",
+      out["status"] == "none"
+      and out["signature_video_url"].endswith("signature_silent_v40.mp4?v=silent1"),
+      str(out))
+out, _ = run_status(HANDMADE, active={"status": "queued", "degradations": []}, column=[])
+check("...and while a first automated render is queued for that row, the hand-made "
+      "film is not offered as its result",
+      out["status"] == "rendering" and out["signature_video_url"] is None, str(out))
+
 out, _ = run_status(DONE_ROW, column=[REAL_VR.PHOTO_NOTE_GONE], queue_raises=True)
 check("a queue read failure does not fail the poll or hide the notes",
       out["photo_choice_note"] == REAL_VR.PHOTO_NOTE_GONE)
@@ -892,8 +1009,11 @@ check("video_jobs caps renders per PROCESS across both types",
 check("...and that cap is checked BEFORE a job is claimed",
       vj.index("sum(running.values()) >= PER_PROCESS_RENDER_LIMIT")
       < vj.index("job = await asyncio.to_thread(claim_next, job_type)"))
-check("the Signature's fleet-wide limit of 1 is still enforced by the queue",
-      "JOB_TYPE_SIGNATURE: JobTypeConfig(per_process_limit=1, account_limit=1" in vj)
+check("the Signature carries no fleet-wide cap (the audit's F3: it bought nothing and "
+      "serialised every agent behind one render)",
+      "JOB_TYPE_SIGNATURE: JobTypeConfig(per_process_limit=1, account_limit=None" in vj)
+check("...and PER_PROCESS_RENDER_LIMIT, which is the real ceiling, is still 1",
+      "PER_PROCESS_RENDER_LIMIT = 1" in vj)
 
 print("\n[8] My Listings still shows the CLASSIC's queue position, not a Signature's")
 # A listing may now have both tiers in flight at once, and describe_active_for_agent is
@@ -927,6 +1047,114 @@ check("My Listings asks for the Classic by name",
       in seg("get_listings"))
 check("the unfiltered call still works, for any caller that wants everything",
       "l1" in VJ.describe_active_for_agent("a1"))
+
+# ===========================================================================
+print("\n[9] the audit's F1: the two tiers take turns, and a starved tier is never "
+      "blamed on a dead service")
+# ===========================================================================
+# Drives the REAL run_consumer() loop; only the DB-touching leaves are stubbed. Before
+# the fix this loop ran in alphabetical order and broke as soon as it claimed one job,
+# so with a Classic queue that never emptied a Signature was never claimed at all.
+spec2 = importlib.util.spec_from_file_location(
+    "video_jobs_consumer", os.path.join(BACKEND, "video_jobs.py"))
+CVJ = importlib.util.module_from_spec(spec2)
+spec2.loader.exec_module(CVJ)
+CVJ.available = lambda: True
+CVJ.sweep_stale = lambda: None
+CVJ.sweep_abandoned_queue = lambda: None
+CVJ.prune_finished = lambda: None
+CVJ.POLL_SECONDS = 0.005
+CVJ.POLL_SECONDS_BUSY = 0.01
+CVJ.POLL_JITTER = 0.0
+CVJ.register_renderer(CVJ.JOB_TYPE_CLASSIC, lambda job: ("u", []))
+CVJ.register_renderer(CVJ.JOB_TYPE_SIGNATURE, lambda job: ("u", []))
+
+
+def drive_consumer(supply, seconds=0.8):
+    """Run the consumer for a moment against a stubbed, bottomless queue."""
+    left = dict(supply)
+    claimed = {"classic": 0, "signature": 0}
+    seq = []
+
+    def claim_next(job_type):
+        if left.get(job_type, 0) > 0:
+            left[job_type] -= 1
+            claimed[job_type] += 1
+            seq.append(job_type[0].upper())
+            return {"id": "j%d" % sum(claimed.values()), "job_type": job_type}
+        return None
+
+    CVJ.claim_next = claim_next
+    CVJ.execute_job = lambda job: __import__("time").sleep(0.01)   # a "render"
+    CVJ._shutting_down = False
+
+    async def main():
+        task = asyncio.create_task(CVJ.run_consumer())
+        await asyncio.sleep(seconds)
+        CVJ._shutting_down = True
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(main())
+    return claimed, "".join(seq)
+
+
+claimed, seq = drive_consumer({"classic": 10 ** 9, "signature": 5})
+check("a Signature is claimed even while Classic work never stops arriving",
+      claimed["signature"] > 0, "classic=%d signature=%d" % (claimed["classic"],
+                                                             claimed["signature"]))
+check("all five Signatures got through", claimed["signature"] == 5, seq[:20])
+check("the tiers alternate rather than following the alphabet",
+      seq[:6] == "CSCSCS", seq[:20])
+claimed, seq = drive_consumer({"classic": 0, "signature": 4})
+check("an empty Classic queue costs the Signature nothing",
+      claimed["signature"] == 4, seq[:20])
+claimed, seq = drive_consumer({"classic": 4, "signature": 0})
+check("and the reverse: an empty Signature queue costs the Classic nothing",
+      claimed["classic"] == 4, seq[:20])
+claimed, seq = drive_consumer({"classic": 10 ** 9, "signature": 0})
+check("with nothing else queued, Classics still run back to back",
+      claimed["classic"] > 5, str(claimed["classic"]))
+
+# ... and the sweep that used to fail the starved job.
+sdb = FakeDB()
+sw = VJ          # a configured module instance; point it at this fresh DB
+told = []
+sw.configure(make_db_execute(sdb))
+sw.register_renderer(sw.JOB_TYPE_SIGNATURE, lambda job: ("u", []),
+                     on_final_failure=lambda job, err: told.append(err))
+sig_job, _ = sw.enqueue(sw.JOB_TYPE_SIGNATURE, "starved", "a1", {})
+for row in sdb.rows:
+    row["updated_at"] = __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc).replace(microsecond=0).isoformat()
+# Make the Signature look long-queued, and have a CLASSIC finish a moment ago.
+old = sw._iso(sw._now() - __import__("datetime").timedelta(
+    seconds=sw.QUEUED_ESCAPE_SECONDS + 60))
+for row in sdb.rows:
+    row["updated_at"] = old
+sdb.rows.append({
+    "id": "classic-just-finished", "job_type": "classic", "listing_id": "other",
+    "agent_id": "a1", "status": "done", "attempts": 1, "max_attempts": 3, "payload": {},
+    "created_at": sw._iso(sw._now()), "updated_at": sw._iso(sw._now()),
+    "finished_at": sw._iso(sw._now()), "run_after": sw._iso(sw._now()),
+    "claimed_by": None, "duration_seconds": 50.0,
+})
+freed = sw.sweep_abandoned_queue()
+check("a Signature waiting behind Classics is NOT failed while anything is draining",
+      freed == 0 and sdb.rows[0]["status"] == "queued",
+      "freed=%d status=%s" % (freed, sdb.rows[0]["status"]))
+check("...so the agent is never told the rendering service is down when it is not",
+      told == [], str(told))
+check("the draining check asks about the whole table, not one type",
+      "def _queue_is_draining(window_seconds)" in vj
+      and '.eq("job_type", job_type).in_("status", list(TERMINAL_STATUSES))' not in vj)
+
+# With nothing at all draining, the escape still works -- that is what it is for.
+sdb.rows = [r for r in sdb.rows if r["id"] != "classic-just-finished"]
+freed = sw.sweep_abandoned_queue()
+check("with nothing draining anywhere, the stuck job is still released",
+      freed == 1 and sdb.rows[0]["status"] == "failed",
+      "freed=%d status=%s" % (freed, sdb.rows[0]["status"]))
+check("...and the agent is told once", len(told) == 1, str(told))
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

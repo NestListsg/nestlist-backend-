@@ -393,14 +393,30 @@ check("30 renders, none duplicated", sorted(rendered) == sorted(set(rendered)))
 
 
 # ===========================================================================
-print("\n[8] Per-type concurrency: Signature is capped account-wide at 1")
+print("\n[8] Per-type concurrency policy, and the account-wide cap mechanism")
 # ===========================================================================
 db = FakeDB()
 workers = [load_worker(db, 800 + i) for i in range(4)]
 check("classic has no account-wide cap (CPU bound, per-process)",
       workers[0].JOB_TYPES["classic"].account_limit is None)
-check("signature is capped at 1 across the whole fleet (Replicate)",
-      workers[0].JOB_TYPES["signature"].account_limit == 1)
+# Signature carried account_limit=1 and default_seconds=360 while it was going to be a
+# Replicate avatar pipeline. It is now the Classic film with the agent's own clip as its
+# opening slide, so memory is bounded per PROCESS whatever the mix of tiers, and a
+# fleet-wide serialisation only made agents queue behind each other and inflated the
+# ETA four- to fivefold.
+check("signature has no account-wide cap either",
+      workers[0].JOB_TYPES["signature"].account_limit is None)
+check("the real ceiling is one render per worker process, across both types",
+      workers[0].PER_PROCESS_RENDER_LIMIT == 1)
+check("the Signature ETA default is a Classic-shaped number now",
+      workers[0].JOB_TYPES["signature"].default_seconds <= 120,
+      str(workers[0].JOB_TYPES["signature"].default_seconds))
+
+# The account-wide cap MECHANISM stays live for any type that needs one later, so it is
+# exercised below against a type configured with one. Each worker is its own module
+# instance, so each needs its own override.
+for wk in workers:
+    wk.JOB_TYPES["signature"].account_limit = 1
 
 for n in range(4):
     workers[0].enqueue(workers[0].JOB_TYPE_SIGNATURE, "sig-%d" % n, "agent-1", {})
@@ -423,11 +439,13 @@ for t in ts:
     t.start()
 for t in ts:
     t.join()
-check("at most one Signature job was allowed to proceed", len(claims) <= 1,
+check("with an account cap of 1, at most one job of that type proceeds", len(claims) <= 1,
       "proceeded=%d" % len(claims))
 check("the others were deferred, not failed",
       not any(r["status"] == "failed" for r in db.rows),
       str([r["status"] for r in db.rows]))
+for wk in workers:
+    wk.JOB_TYPES["signature"].account_limit = None      # back to the shipped policy
 
 # Signature has no renderer registered, so no worker will ever pick one up in production.
 fresh = load_worker(FakeDB(), 890)
