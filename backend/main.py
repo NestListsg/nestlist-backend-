@@ -4214,7 +4214,7 @@ def _store_rendered_video(filename: str, video_bytes: bytes) -> str:
             delay *= 2
 
 
-def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int, ownership_check=None, music_track: str = None, video_photos: list = None):
+def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int, ownership_check=None, music_track: str = None, video_photos: list = None, record_degradations=None):
     """Render one Classic video, store it, and write the finished URL onto the listing.
 
     Returns (video_url, degradations). Raises on failure -- deliberately, because the
@@ -4337,6 +4337,33 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
     if ownership_check is not None and not ownership_check():
         raise video_jobs.SupersededError(
             "this render was reclaimed by another worker before the listing was updated")
+
+    # PUBLISH THE RENDER'S NOTES BEFORE THE LISTING SAYS "DONE".
+    #
+    # `degradations` is where the renderer admits it could not do exactly what was asked
+    # -- most importantly, that it used other photos than the ones the agent picked. The
+    # agent's screen stops polling the moment the listing reads 'done', so anything they
+    # are meant to see has to be readable by then. Two copies, both best-effort (the
+    # video is the deliverable; a missing note must never cost the agent their video):
+    #   1. on the job row (queued path) -- /video-status reads it while the job is still
+    #      active and, after it finishes, from the latest completed job;
+    #   2. on the listing row as video_degradations -- the only copy the legacy
+    #      in-process path can have, and a durable one. Written only when the column
+    #      exists (the fresh row has the key), so there is no failing write before the
+    #      migration, and it is rewritten on EVERY render so a clean render clears an
+    #      old note.
+    if record_degradations is not None:
+        try:
+            record_degradations(list(degradations))
+        except Exception as e:
+            logger.warning("video %s: could not record degradations on the job (%s)", listing_id, e)
+    if "video_degradations" in listing:
+        try:
+            db_execute(
+                lambda db: db.table("listings").update({"video_degradations": list(degradations)}).eq("id", listing_id).eq("agent_id", agent["id"]),
+                what="_render_video_job degradations update")
+        except Exception as e:
+            logger.warning("video %s: could not store degradations on the listing (%s)", listing_id, e)
 
     update_payload = {"video_url": video_url, "video_status": "done", "video_error": None}
     if persist_video_template_id:
@@ -4461,6 +4488,7 @@ def _classic_job_run(job: dict):
             # at the attempt we claimed" question, so it answers this exactly, and it
             # doubles as a liveness beat at the two slowest moments of the job.
             ownership_check=lambda: video_jobs.heartbeat(job),
+            record_degradations=lambda degs: video_jobs.record_degradations(job, degs),
             # Absent from older jobs' payloads -> None -> automatic selection.
             music_track=payload.get("music_track"),
             # Likewise absent from older jobs' payloads -> None -> automatic photos.
@@ -4741,6 +4769,12 @@ async def get_video_status(listing_id: str, agent=Depends(get_current_agent)):
         "video_template_id": listing.get("video_template_id"),
         "queue_position": None,
         "eta_seconds": None,
+        # What the finished video did NOT do exactly as asked (plain-language strings;
+        # [] = a clean render). Populated on the 'done' poll. photo_choice_note is the
+        # one the agent must be shown: set when their photo pick was not honoured (other
+        # photos were used, or some picks were left out), otherwise null.
+        "degradations": [],
+        "photo_choice_note": None,
     }
     if video_jobs.available():
         try:
@@ -4752,7 +4786,42 @@ async def get_video_status(listing_id: str, agent=Depends(get_current_agent)):
             # Queue metadata is a nicety; the status itself already came from the
             # listing row, so a queue read failure must not fail the request.
             logger.warning("get_video_status: queue lookup failed (%s)", e)
+    if listing.get("video_status") == "done" and not out.get("degradations"):
+        # The job has left the active set by now (or never existed, on the legacy path),
+        # so look where the finished render's notes were kept.
+        try:
+            out["degradations"] = await _stored_video_degradations(
+                listing_id, agent["id"], listing.get("video_url"))
+        except Exception as e:
+            logger.warning("get_video_status: could not read degradations (%s)", e)
+    out["degradations"] = list(out.get("degradations") or [])
+    out["photo_choice_note"] = video_renderer.photo_choice_note(out["degradations"])
     return out
+
+
+async def _stored_video_degradations(listing_id: str, agent_id: str, video_url):
+    """Notes from the render that produced the listing's current video, or [].
+
+    Order: the listing's own video_degradations column (written by both the queued and
+    the legacy path; absent until its migration is run), then the latest completed
+    Classic job -- accepted only if it produced THIS video (result_url matches), so a
+    stale or unrelated job can never put another render's notes on this one."""
+    try:
+        res = await db_execute_async(
+            lambda db: db.table("listings").select("video_degradations")
+            .eq("id", listing_id).eq("agent_id", agent_id),
+            what="get_video_status degradations select")
+        stored = (res.data or [{}])[0].get("video_degradations")
+        if isinstance(stored, list):
+            return [str(x) for x in stored]
+    except Exception:
+        pass        # column not there yet (or a blip): fall through to the job row
+    if video_jobs.available() and video_url:
+        job = await asyncio.to_thread(
+            video_jobs.find_latest_done, video_jobs.JOB_TYPE_CLASSIC, listing_id)
+        if job and job.get("result_url") == video_url:
+            return [str(x) for x in (job.get("degradations") or [])]
+    return []
 
 def _wait_for_ig_container_ready(container_id: str, page_token: str, max_attempts: int = 10, delay_seconds: float = 1.5) -> bool:
     # Instagram fetches/processes the image asynchronously after the container is

@@ -538,43 +538,51 @@ def resolve_pickable_track(track_id):
 # ---------------------------------------------------------------------------
 # Agent-chosen photos (which listing photos go into the video, and in what order)
 # ---------------------------------------------------------------------------
+def _photo_choice_items(video_photos):
+    """The raw request value -> a flat list of stripped, non-blank identifiers (order
+    preserved, 'auto' still present). A client may send repeated params (list), one
+    string, or JSON-array strings (e.g. "[]" or '["a","b"]'); JSON arrays are spliced in.
+    Anything that is not a string or an iterable of strings yields []."""
+    if video_photos is None:
+        return []
+    if isinstance(video_photos, str):
+        video_photos = [video_photos]
+    try:
+        raw = [str(x).strip() for x in video_photos if x is not None]
+    except TypeError:
+        return []
+    items = []
+    for x in raw:
+        if x.startswith("["):
+            try:
+                parsed = json.loads(x)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                items.extend(str(y).strip() for y in parsed if y is not None)
+                continue
+        items.append(x)
+    return [x for x in items if x]
+
+
 def is_auto_photo_choice(video_photos):
     """True for the 'let NestList choose' values: missing, empty, or 'auto'.
 
-    Accepts None, "", "auto" (any case), [], [""], ["auto"]. Anything else is a real
-    choice. Kept deliberately tolerant on the 'auto' side: an unclear request must land
-    on today's behaviour, never on a half-interpreted custom one.
+    Accepts None, "", "auto" (any case), [], [""], ["auto"], and the JSON-array spellings
+    "[]" / '["auto"]'. Anything else is a real choice. Kept deliberately tolerant on the
+    'auto' side: an unclear request must land on today's behaviour, never on a
+    half-interpreted custom one.
     """
-    if video_photos is None:
-        return True
-    if isinstance(video_photos, str):
-        return video_photos.strip().lower() in ("", "auto")
-    try:
-        items = [str(x).strip() for x in video_photos if x is not None]
-    except TypeError:
-        return True
-    items = [x for x in items if x]
-    return not items or all(x.lower() == "auto" for x in items)
+    return all(x.lower() == "auto" for x in _photo_choice_items(video_photos))
 
 
 def normalize_photo_choice(video_photos):
     """The raw request value -> a flat list of non-blank identifiers, order preserved.
-
-    A client may send repeated params (list), a single string, or a single JSON-array
-    string; all three normalise the same way. Returns [] for any auto value."""
-    if is_auto_photo_choice(video_photos):
+    Returns [] for any auto value."""
+    items = _photo_choice_items(video_photos)
+    if all(x.lower() == "auto" for x in items):
         return []
-    if isinstance(video_photos, str):
-        video_photos = [video_photos]
-    items = [str(x).strip() for x in video_photos if x is not None]
-    if len(items) == 1 and items[0].startswith("["):
-        try:
-            parsed = json.loads(items[0])
-            if isinstance(parsed, list):
-                items = [str(x).strip() for x in parsed if x is not None]
-        except Exception:
-            pass
-    return [x for x in items if x and x.lower() != "auto"]
+    return [x for x in items if x.lower() != "auto"]
 
 
 def resolve_photo_choice(video_photos, image_urls):
@@ -605,6 +613,25 @@ def resolve_photo_choice(video_photos, image_urls):
     return urls, ignored
 
 
+# The plain-language lines the renderer adds to `degradations` when an agent's photo
+# pick could not be honoured exactly. Constants so main.py can recognise them and tell
+# the agent (photo_choice_note) rather than let a video quietly show other photos.
+PHOTO_NOTE_GONE = ("the photos you picked are no longer on this listing, "
+                   "so the automatic photo selection was used")
+PHOTO_NOTE_PARTIAL = "some of the photos you picked are no longer on this listing and were left out"
+PHOTO_NOTE_UNREADABLE = ("the photos you picked could not be read, "
+                         "so the automatic photo selection was used")
+
+
+def photo_choice_note(degradations):
+    """The first photo-pick note in a degradations list, or None if the pick was honoured
+    (or the agent chose Auto)."""
+    for d in degradations or []:
+        if d in (PHOTO_NOTE_GONE, PHOTO_NOTE_PARTIAL, PHOTO_NOTE_UNREADABLE):
+            return d
+    return None
+
+
 def choose_video_photos(video_photos, image_urls):
     """Render-time choice: (urls_or_None, note_or_None).
 
@@ -619,10 +646,9 @@ def choose_video_photos(video_photos, image_urls):
     urls, _ignored = resolve_photo_choice(wanted, image_urls)
     urls = urls[:MAX_VIDEO_PHOTOS]
     if not urls or (len(set(wanted)) >= 2 and len(urls) < 2):
-        return None, ("the photos you picked are no longer on this listing, "
-                      "so the automatic photo selection was used")
+        return None, PHOTO_NOTE_GONE
     if len(urls) < len(set(wanted)):
-        return urls, "some of the photos you picked are no longer on this listing and were left out"
+        return urls, PHOTO_NOTE_PARTIAL
     return urls, None
 
 
@@ -1578,8 +1604,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             # one-photo video they did not ask for is worse than the automatic one.
             logger.warning("chosen photos mostly unreadable (%d of %d); using the "
                            "automatic selection", len(photos), len(selected_urls))
-            degradations.append("the photos you picked could not be read, "
-                                "so the automatic photo selection was used")
+            degradations.append(PHOTO_NOTE_UNREADABLE)
             photos, photo_urls = [], []
             for url in _auto_selection():
                 try:

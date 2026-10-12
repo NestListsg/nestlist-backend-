@@ -447,6 +447,19 @@ def find_active(job_type, listing_id):
     return (res.data or [None])[0]
 
 
+def find_latest_done(job_type, listing_id):
+    """The most recently finished job of this type for the listing, or None. Lets
+    /video-status report a finished render's degradations after the job has left the
+    active set (find_active only ever returns queued/running jobs)."""
+    res = _exec(
+        lambda db: db.table(TABLE).select("*")
+        .eq("listing_id", str(listing_id).strip().lower()).eq("job_type", job_type)
+        .eq("status", STATUS_DONE)
+        .order("finished_at", desc=True).limit(1),
+        what="video_jobs find_latest_done")
+    return (res.data or [None])[0]
+
+
 def get_job(job_id):
     res = _exec(lambda db: db.table(TABLE).select("*").eq("id", str(job_id)).limit(1),
                 what="video_jobs get_job")
@@ -670,6 +683,15 @@ def _fenced_update(job, patch, what, require_status=STATUS_RUNNING):
 def heartbeat(job):
     """Prove this job is still alive. False means we have been superseded."""
     return _fenced_update(job, {"heartbeat_at": _iso(_now())}, "video_jobs heartbeat")
+
+
+def record_degradations(job, degradations):
+    """Write a running job's degradations onto its row BEFORE the listing is flipped to
+    'done', so there is no instant at which the agent can see a finished video whose
+    notes are not yet readable. Fenced like every other job write; complete() writes the
+    same list again at the end."""
+    return _fenced_update(job, {"degradations": list(degradations or [])},
+                          "video_jobs record degradations")
 
 
 def complete(job, result_url, degradations, duration_seconds):

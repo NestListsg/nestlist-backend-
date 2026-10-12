@@ -260,5 +260,90 @@ check("second press while one is in flight reports the render actually running",
 r, p = _run_endpoint(L, existing={"video_template_id": "classic"})
 check("an in-flight AUTO job reports auto", r["video_photos"] == [] and r["video_photos_mode"] == "auto")
 
+# ------------------------------------------- audit fix 2: "[]" is an Auto spelling
+print("\n[auto spellings] JSON-array strings")
+for v in ("[]", ["[]"], ' [ ] ', '["auto"]', ['["auto", ""]'], "[ ]", [" [] ", "auto"]):
+    check("JSON-ish auto %r" % (v,), new.is_auto_photo_choice(v) and new.normalize_photo_choice(v) == [])
+check("a real JSON array is still a choice", not new.is_auto_photo_choice('["https://x/b.jpg"]'))
+check("malformed JSON-looking string is a choice (not silently auto)", not new.is_auto_photo_choice("[oops"))
+r, p = _run_endpoint(L, video_photos=["[]"])
+check("endpoint: [\"[]\"] -> Auto, no 400, payload unchanged", p == base_payload and r["video_photos_mode"] == "auto")
+r, p = _run_endpoint(L, video_photos=['["%s","1"]' % urls[3]])
+check("endpoint: JSON-array string choice still works", p["video_photos"] == [urls[3], urls[1]])
+
+# ---------------------------- audit fix 1: the agent can SEE that a pick was not honoured
+print("\n[degradations reach the agent] real get_video_status / _stored_video_degradations")
+NOTE = new.PHOTO_NOTE_GONE
+def _run_status(listing_row, column=None, column_missing=False, jobs_available=True,
+                active=None, latest_done=None, queue_raises=False):
+    class FJ:
+        JOB_TYPE_CLASSIC = "classic"
+        @staticmethod
+        def available(): return jobs_available
+        @staticmethod
+        def find_active(t, lid):
+            if queue_raises: raise RuntimeError("queue down")
+            return active
+        @staticmethod
+        def describe(job): return {"job_status": job["status"], "degradations": job.get("degradations") or []}
+        @staticmethod
+        def find_latest_done(t, lid): return latest_done
+    async def db_exec(fn, what=""):
+        if what == "get_video_status degradations select":
+            if column_missing: raise RuntimeError("column video_degradations does not exist")
+            return types.SimpleNamespace(data=[{"video_degradations": column}])
+        return types.SimpleNamespace(data=[listing_row])
+    g = dict(asyncio=asyncio, HTTPException=HTTPException, Depends=Depends, video_jobs=FJ,
+             video_renderer=new, db_execute_async=db_exec, logger=logging.getLogger("t"),
+             get_current_agent=lambda: None)
+    for nm in ("get_video_status", "_stored_video_degradations"):
+        n = fns[nm]
+        exec(compile("\n".join(src.splitlines()[n.lineno - 1:n.end_lineno]), nm, "exec"), g)
+    return asyncio.run(g["get_video_status"]("L1", agent={"id": "a1"}))
+
+done_row = {"video_status": "done", "video_url": "https://v/1.mp4?v=a", "video_error": None, "video_template_id": "classic"}
+r = _run_status(done_row, column=[NOTE])
+check("done + note on the listing -> degradations and photo_choice_note returned",
+      r["degradations"] == [NOTE] and r["photo_choice_note"] == NOTE)
+r = _run_status(done_row, column=[])
+check("done + clean render -> [] and null", r["degradations"] == [] and r["photo_choice_note"] is None)
+r = _run_status(done_row, column_missing=True,
+                latest_done={"result_url": done_row["video_url"], "degradations": [NOTE, "x"]})
+check("column not migrated -> falls back to the finished job's notes (queued path)",
+      r["degradations"] == [NOTE, "x"] and r["photo_choice_note"] == NOTE)
+r = _run_status(done_row, column=None,
+                latest_done={"result_url": done_row["video_url"], "degradations": [new.PHOTO_NOTE_PARTIAL]})
+check("column null -> job fallback too", r["photo_choice_note"] == new.PHOTO_NOTE_PARTIAL)
+r = _run_status(done_row, column_missing=True,
+                latest_done={"result_url": "https://v/OTHER.mp4", "degradations": [NOTE]})
+check("a job that did not produce this video never lends its notes", r["degradations"] == [])
+r = _run_status(done_row, column=[NOTE], jobs_available=False)
+check("legacy path (no queue): notes come from the listing column", r["photo_choice_note"] == NOTE)
+r = _run_status(done_row, column_missing=True, jobs_available=False)
+check("legacy path before the migration: [] (cannot know), no crash", r["degradations"] == [] and r["video_status"] == "done")
+r = _run_status(done_row, column=[NOTE], queue_raises=True)
+check("queue lookup failing does not hide the notes or fail the request", r["photo_choice_note"] == NOTE)
+r = _run_status(done_row, column=[], active={"status": "running", "degradations": [NOTE]})
+check("finishing window: notes recorded on the still-active job are returned", r["photo_choice_note"] == NOTE)
+r = _run_status(dict(done_row, video_status="rendering"), column=[NOTE], active={"status": "running", "degradations": []})
+check("while rendering, an OLD video's notes are not shown", r["degradations"] == [] and r["photo_choice_note"] is None)
+r = _run_status(dict(done_row, video_status="failed"), column=[NOTE])
+check("failed -> no notes", r["degradations"] == [])
+check("photo_choice_note ignores unrelated degradations",
+      new.photo_choice_note(["the background music could not be added"]) is None)
+
+core = seg("_render_video_core")
+check("core publishes notes (job row + listing column) BEFORE flipping the listing to done",
+      core.index("record_degradations(list(degradations))") < core.index('update_payload = {"video_url"')
+      and core.index('"video_degradations": list(degradations)') < core.index('update_payload = {"video_url"'))
+check("core only writes the column when the row has it (no failing write pre-migration)",
+      'if "video_degradations" in listing:' in core)
+check("both note writes are best-effort (cannot cost the agent their video)",
+      core.count("except Exception as e:\n            logger.warning(\"video %s: could not") >= 2)
+check("queued run wires record_degradations to the fenced job write",
+      "record_degradations=lambda degs: video_jobs.record_degradations(job, degs)" in seg("_classic_job_run"))
+check("legacy job path reaches the same core (so the same column write)",
+      "_render_video_core(" in seg("_render_video_job"))
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)
