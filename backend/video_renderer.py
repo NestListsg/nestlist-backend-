@@ -122,6 +122,13 @@ CARD_TAIL_SECONDS = 1.6   # length of the frozen-frame input feeding the dissolv
 AUDIO_VOLUME = 0.22
 AUDIO_FADE_IN_SECONDS = 1.5
 AUDIO_FADE_OUT_SECONDS = 4.5
+# Loudness target for tracks flagged "raw": true in audio/tracks.json. This is the level
+# the pre-processed library was normalized to (see audio/LICENSE-music.txt, ~-9.8 LUFS),
+# so a raw track dropped in untouched sits at the same level once the shared AUDIO_VOLUME
+# is applied. Never applied to a track that is not flagged raw.
+RAW_TRACK_TARGET_LUFS = -9.8
+RAW_TRACK_TRUE_PEAK_DB = -1.5
+RAW_TRACK_LRA = 11
 
 # Each photo is one sequential ffmpeg encode. The previous renderer also folded clips
 # together with N-1 progressive xfade passes, each one re-encoding the whole
@@ -430,6 +437,10 @@ def _load_manifest():
       "feel"  one line shown under the label in the picker
       "auto"  false             -- keep this track out of the automatic pick, so it only
                                    plays when an agent chooses it
+      "raw"   true              -- the file is an unprocessed download: at render time it
+                                   is trimmed to the video length and loudness-normalized
+                                   to RAW_TRACK_TARGET_LUFS. Absent/false (every existing
+                                   track) means "already processed, use as-is".
     Every failure returns {} (or skips the one bad entry) and is logged, which the
     callers read as "no opinion". A typo in this file must never cost an agent their
     music bed.
@@ -454,8 +465,9 @@ def _load_manifest():
         if isinstance(value, dict):
             tier, mood, feel = value.get("tier"), value.get("mood"), value.get("feel")
             auto = value.get("auto", True) is not False
+            raw_track = value.get("raw", False) is True
         else:
-            tier, mood, feel, auto = value, None, None, True
+            tier, mood, feel, auto, raw_track = value, None, None, True, False
         tier = str(tier or "").strip().lower()
         if tier and tier not in MUSIC_TIERS:
             # An unrecognised tier name is treated as "untagged" rather than dropped,
@@ -468,6 +480,7 @@ def _load_manifest():
             "mood": str(mood).strip() if mood else None,
             "feel": str(feel).strip() if feel else None,
             "auto": auto,
+            "raw": raw_track,
         }
     return entries
 
@@ -496,6 +509,15 @@ def pickable_tracks():
     except Exception as e:
         logger.warning("could not build the pickable music list (%s)", e)
         return []
+
+
+def _is_raw_track(track_path):
+    """True only if the manifest explicitly flags this file "raw": true. Any doubt (no
+    manifest, unreadable manifest, no entry) answers False, i.e. the existing as-is path."""
+    try:
+        return bool(_load_manifest().get(os.path.basename(track_path), {}).get("raw"))
+    except Exception:
+        return False
 
 
 def is_auto_music_choice(music_track):
@@ -1567,34 +1589,59 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                 track_path, music_tier = _select_music_track(music_seed, property_type)
             if track_path:
                 fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
-                audio_filter = (
-                    f"[1:a]atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS,"
-                    f"volume={AUDIO_VOLUME},"
-                    f"afade=t=in:st=0:d={AUDIO_FADE_IN_SECONDS},"
-                    f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_OUT_SECONDS}[aout]"
-                )
-                try:
-                    _run_ffmpeg([
-                        "ffmpeg", "-y", "-i", silent_path,
-                        # -stream_loop so a track shorter than the video still covers it.
-                        "-stream_loop", "-1", "-i", track_path,
-                        "-filter_complex", audio_filter,
-                        "-map", "0:v", "-map", "[aout]",
-                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                        "-movflags", "+faststart", final_path,
-                    ], TIMEOUT_MUSIC)
-                    wrote_final = True
-                    # Logged on every render so "why does my video sound different
-                    # from my colleague's?" is answerable from Railway's logs alone.
-                    logger.info("music bed: %s (%s tier, property_type %r, seed %r)",
-                                os.path.basename(track_path), music_tier,
-                                str(property_type or ""), str(music_seed or ""))
-                except Exception as e:
-                    # Covers an unreadable or corrupt track as well as a mux failure:
-                    # either way the video ships, silent.
-                    logger.warning("music bed %s failed (%s); shipping a silent video",
-                                   os.path.basename(track_path), e)
-                    degradations.append("the background music could not be added")
+
+                def _audio_filter(normalize):
+                    # `normalize` is True ONLY for tracks flagged "raw" in tracks.json.
+                    # Without it the filter string is exactly what every existing
+                    # track has always used.
+                    norm = (
+                        f"loudnorm=I={RAW_TRACK_TARGET_LUFS}:TP={RAW_TRACK_TRUE_PEAK_DB}"
+                        f":LRA={RAW_TRACK_LRA},aresample=44100,"
+                    ) if normalize else ""
+                    return (
+                        f"[1:a]atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS,"
+                        f"{norm}"
+                        f"volume={AUDIO_VOLUME},"
+                        f"afade=t=in:st=0:d={AUDIO_FADE_IN_SECONDS},"
+                        f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_OUT_SECONDS}[aout]"
+                    )
+
+                # Attempts, best first. A raw track tries normalization, then falls back
+                # to the plain as-is filter, so a normalization problem costs loudness
+                # consistency, never the music (and never the video). A normal track has
+                # exactly one attempt, identical to before.
+                is_raw = _is_raw_track(track_path)
+                attempts = [True, False] if is_raw else [False]
+                for normalize in attempts:
+                    try:
+                        _run_ffmpeg([
+                            "ffmpeg", "-y", "-i", silent_path,
+                            # -stream_loop so a track shorter than the video still covers it.
+                            "-stream_loop", "-1", "-i", track_path,
+                            "-filter_complex", _audio_filter(normalize),
+                            "-map", "0:v", "-map", "[aout]",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                            "-movflags", "+faststart", final_path,
+                        ], TIMEOUT_MUSIC)
+                        wrote_final = True
+                        # Logged on every render so "why does my video sound different
+                        # from my colleague's?" is answerable from Railway's logs alone.
+                        logger.info("music bed: %s (%s tier, property_type %r, seed %r%s)",
+                                    os.path.basename(track_path), music_tier,
+                                    str(property_type or ""), str(music_seed or ""),
+                                    ", raw track loudness-normalized" if normalize else "")
+                        break
+                    except Exception as e:
+                        if normalize:
+                            logger.warning("loudness normalization of raw track %s failed "
+                                           "(%s); retrying with the track as-is",
+                                           os.path.basename(track_path), e)
+                            continue
+                        # Covers an unreadable or corrupt track as well as a mux failure:
+                        # either way the video ships, silent.
+                        logger.warning("music bed %s failed (%s); shipping a silent video",
+                                       os.path.basename(track_path), e)
+                        degradations.append("the background music could not be added")
             else:
                 logger.warning("no usable music track found in %s", AUDIO_DIR)
                 degradations.append("the background music file is missing from the deploy")

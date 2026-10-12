@@ -1,6 +1,7 @@
 {
-  "_comment": "Plain string = property tier only (warm/grand). Object form adds picker fields: mood+feel make a track pickable by agents; omit tier to leave it eligible in every tier; auto:false keeps it out of the automatic pick. Only Content-ID-clean (unregistered) tracks may carry a mood.",
+  "_comment": "Plain string = property tier only (warm/grand). Object form adds picker fields: mood+feel make a track pickable by agents; omit tier to leave it eligible in every tier; auto:false keeps it out of the automatic pick. Only Content-ID-clean (unregistered) tracks may carry a mood. raw:true = unprocessed download; trimmed + loudness-normalized (-9.8 LUFS) at render time. Leave it off for pre-processed files.",
   "soft_piano.mp3": {"mood": "Warm", "feel": "Soft, unhurried solo piano. Gentle and homely."},
+  "acoustic_upbeat.mp3": {"mood": "Upbeat", "auto": false, "raw": true, "feel": "Bright, light acoustic guitar. Cheerful and friendly."},
 
   "minimal_piano.mp3": "warm",
   "peaceful_piano.mp3": "warm",
