@@ -92,7 +92,7 @@ PostgREST. The interval is jittered so four workers restarting together after a 
 not synchronise into a thundering herd.
 
 NO CREDENTIALS IN JOB ROWS
-The payload column carries render OPTIONS only -- template id, photo index. The agent is
+The payload column carries render OPTIONS only -- template id, photo index, music track, chosen video photos (URLs). The agent is
 referenced by id and re-read at run time. The agent record contains Facebook and
 Instagram page tokens, and those must never be copied into a queue table.
 """

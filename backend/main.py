@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 from supabase import create_client
 import bcrypt
 import os
@@ -4214,7 +4214,7 @@ def _store_rendered_video(filename: str, video_bytes: bytes) -> str:
             delay *= 2
 
 
-def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int, ownership_check=None, music_track: str = None):
+def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int, ownership_check=None, music_track: str = None, video_photos: list = None):
     """Render one Classic video, store it, and write the finished URL onto the listing.
 
     Returns (video_url, degradations). Raises on failure -- deliberately, because the
@@ -4290,6 +4290,11 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
         music_seed=listing_id,
         # The agent's own pick from the music picker; None keeps the automatic choice.
         music_track=music_track,
+        # The agent's own photo pick (URLs, in order); None keeps the automatic
+        # selection. Resolved against the FRESH listing re-read above, so a photo
+        # deleted since the request is dropped, and a pick that no longer holds falls
+        # back to the automatic selection inside the renderer.
+        video_photos=video_photos,
         # Room captions are model-written and burned into the video, so they go
         # through exactly the same house-number/price stripping as every other
         # copy surface. Passed in rather than imported because video_renderer
@@ -4364,7 +4369,7 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
     return video_url, degradations
 
 
-def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int, music_track: str = None):
+def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int, music_track: str = None, video_photos: list = None):
     """The legacy in-process render path, behaviour-for-behaviour as it was.
 
     Still used whenever the video_jobs table is not available -- so the backend can be
@@ -4374,7 +4379,7 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
     try:
         _render_video_core(listing_id, agent, listing, chosen_video_template_id,
                            persist_video_template_id, photo_index,
-                           music_track=music_track)
+                           music_track=music_track, video_photos=video_photos)
     except Exception as e:
         try:
             db_execute(
@@ -4458,6 +4463,8 @@ def _classic_job_run(job: dict):
             ownership_check=lambda: video_jobs.heartbeat(job),
             # Absent from older jobs' payloads -> None -> automatic selection.
             music_track=payload.get("music_track"),
+            # Likewise absent from older jobs' payloads -> None -> automatic photos.
+            video_photos=payload.get("video_photos"),
         )
     except video_renderer.RenderSlotBusy as e:
         # Should not happen -- the queue hands out at most one Classic job per process,
@@ -4485,7 +4492,7 @@ def _classic_job_failed(job: dict, error_text: str):
 
 
 @app.post("/api/listings/{listing_id}/generate-video")
-async def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, music_track: str = None, agent=Depends(get_current_agent)):
+async def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, music_track: str = None, video_photos: Optional[List[str]] = Query(None), agent=Depends(get_current_agent)):
     result = await db_execute_async(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_video listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -4530,6 +4537,21 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
             raise HTTPException(status_code=400, detail="Unknown music track")
         chosen_music_track = str(music_track).strip()
 
+    # Photos: omitted / empty / "auto" means the automatic selection exactly as before
+    # (and adds NOTHING to the job payload, so an auto request is identical to what it
+    # was). Otherwise each identifier must be one of THIS listing's own photos (URL or
+    # zero-based index); unknown ones are ignored and reported back, and a choice that
+    # matches nothing at all is a 400 (a stale tab -- refresh, or choose Auto) rather
+    # than quietly delivering a video of photos the agent did not pick.
+    chosen_video_photos = []
+    ignored_video_photos = []
+    if not video_renderer.is_auto_photo_choice(video_photos):
+        chosen_video_photos, ignored_video_photos = video_renderer.resolve_photo_choice(video_photos, images)
+        if not chosen_video_photos:
+            raise HTTPException(status_code=400, detail="Unknown photo -- none of the chosen photos belong to this listing")
+        if len(chosen_video_photos) > video_renderer.MAX_VIDEO_PHOTOS:
+            raise HTTPException(status_code=400, detail=f"Choose at most {video_renderer.MAX_VIDEO_PHOTOS} photos for the video")
+
     # THE QUEUED PATH. The endpoint's whole job is now: write a row, return. It does no
     # rendering and waits for nothing, so it answers in the time of two database calls
     # whether one agent is generating or fifty are.
@@ -4550,6 +4572,8 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                     "photo_index": photo_index,
                     # Only present when the agent chose; absent == automatic.
                     **({"music_track": chosen_music_track} if chosen_music_track else {}),
+                    # Only present when the agent chose; absent == automatic.
+                    **({"video_photos": chosen_video_photos} if chosen_video_photos else {}),
                 },
             )
         except Exception as e:
@@ -4625,10 +4649,19 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                             "flight (template %s); returning its position",
                             listing_id, in_flight_template)
             in_flight_music_track = (job.get("payload") or {}).get("music_track") or "auto"
+            # Same honesty rule: report the photos the render in flight will use.
+            in_flight_video_photos = list((job.get("payload") or {}).get("video_photos") or [])
             return dict({
                 "status": "rendering",   # unchanged wire value: the existing app polls on this
                 # The music that will actually be used (same honesty rule as the template).
                 "music_track": in_flight_music_track,
+                # The photos that will actually be used, in order ([] + "auto" = the
+                # automatic selection), and what this press asked for if it differs.
+                "video_photos": in_flight_video_photos,
+                "video_photos_mode": "custom" if in_flight_video_photos else "auto",
+                "requested_video_photos": chosen_video_photos,
+                "video_photos_ignored": ignored_video_photos,
+                "max_video_photos": video_renderer.MAX_VIDEO_PHOTOS,
                 "video_template_id": in_flight_template,
                 # Set when this press did NOT start a new render. The template actually
                 # being made is video_template_id above; what this press asked for is
@@ -4671,12 +4704,18 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
         _render_video_job, listing_id, agent, listing,
         chosen_video_template_id, persist_video_template_id, photo_index,
         chosen_music_track,
+        chosen_video_photos or None,
     ))
     _video_render_tasks.add(task)
     task.add_done_callback(_video_render_tasks.discard)
 
     return {"status": "rendering", "video_template_id": chosen_video_template_id,
-            "music_track": chosen_music_track or "auto"}
+            "music_track": chosen_music_track or "auto",
+            "video_photos": chosen_video_photos,
+            "video_photos_mode": "custom" if chosen_video_photos else "auto",
+            "requested_video_photos": chosen_video_photos,
+            "video_photos_ignored": ignored_video_photos,
+            "max_video_photos": video_renderer.MAX_VIDEO_PHOTOS}
 
 
 @app.get("/api/listings/{listing_id}/video-status")

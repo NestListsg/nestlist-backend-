@@ -85,7 +85,7 @@ args = [a.arg for a in fns["generate_video"].args.args]
 check("generate_video accepts music_track", "music_track" in args)
 check("music-tracks endpoint exists", "get_music_tracks" in fns and '"/api/music-tracks"' in src)
 check("queued payload and legacy path both carry the choice",
-      'payload.get("music_track")' in src and "chosen_music_track,\n    ))" in src)
+      'payload.get("music_track")' in src and "chosen_music_track,\n        chosen_video_photos or None,\n    ))" in src)
 
 check("audio preview endpoint exists and is login-gated",
       "get_music_track_audio" in fns and '"/api/music-tracks/{track_id}/audio"' in src

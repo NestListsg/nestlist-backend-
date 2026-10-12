@@ -535,6 +535,97 @@ def resolve_pickable_track(track_id):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Agent-chosen photos (which listing photos go into the video, and in what order)
+# ---------------------------------------------------------------------------
+def is_auto_photo_choice(video_photos):
+    """True for the 'let NestList choose' values: missing, empty, or 'auto'.
+
+    Accepts None, "", "auto" (any case), [], [""], ["auto"]. Anything else is a real
+    choice. Kept deliberately tolerant on the 'auto' side: an unclear request must land
+    on today's behaviour, never on a half-interpreted custom one.
+    """
+    if video_photos is None:
+        return True
+    if isinstance(video_photos, str):
+        return video_photos.strip().lower() in ("", "auto")
+    try:
+        items = [str(x).strip() for x in video_photos if x is not None]
+    except TypeError:
+        return True
+    items = [x for x in items if x]
+    return not items or all(x.lower() == "auto" for x in items)
+
+
+def normalize_photo_choice(video_photos):
+    """The raw request value -> a flat list of non-blank identifiers, order preserved.
+
+    A client may send repeated params (list), a single string, or a single JSON-array
+    string; all three normalise the same way. Returns [] for any auto value."""
+    if is_auto_photo_choice(video_photos):
+        return []
+    if isinstance(video_photos, str):
+        video_photos = [video_photos]
+    items = [str(x).strip() for x in video_photos if x is not None]
+    if len(items) == 1 and items[0].startswith("["):
+        try:
+            parsed = json.loads(items[0])
+            if isinstance(parsed, list):
+                items = [str(x).strip() for x in parsed if x is not None]
+        except Exception:
+            pass
+    return [x for x in items if x and x.lower() != "auto"]
+
+
+def resolve_photo_choice(video_photos, image_urls):
+    """Map an agent's choice onto this listing's own photos.
+
+    Each identifier is either one of the listing's photo URLs (exact match) or a
+    zero-based index into `image_urls`. Returns (urls, ignored): `urls` are the listing's
+    own URLs in the order the agent gave them, first occurrence kept (a photo cannot be
+    in the video twice); `ignored` are identifiers that matched nothing on this listing.
+    Nothing outside `image_urls` can ever come back, so a choice can never pull in
+    another listing's (or another agent's) photo.
+    """
+    own = [u for u in (image_urls or []) if isinstance(u, str)]
+    own_set = set(own)
+    urls, ignored, seen = [], [], set()
+    for ident in normalize_photo_choice(video_photos):
+        url = None
+        if ident in own_set:
+            url = ident
+        elif ident.isdigit() and int(ident) < len(image_urls or []):
+            cand = (image_urls or [])[int(ident)]
+            url = cand if isinstance(cand, str) else None
+        if url is None:
+            ignored.append(ident)
+        elif url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls, ignored
+
+
+def choose_video_photos(video_photos, image_urls):
+    """Render-time choice: (urls_or_None, note_or_None).
+
+    urls is None whenever the automatic selection should be used -- either because the
+    agent chose Auto, or because the choice cannot be honoured (every chosen photo has
+    since been deleted, or the agent asked for two or more and fewer than two remain).
+    The note, when set, is a plain-language degradation line. A stale choice must never
+    fail a render."""
+    if is_auto_photo_choice(video_photos):
+        return None, None
+    wanted = normalize_photo_choice(video_photos)
+    urls, _ignored = resolve_photo_choice(wanted, image_urls)
+    urls = urls[:MAX_VIDEO_PHOTOS]
+    if not urls or (len(set(wanted)) >= 2 and len(urls) < 2):
+        return None, ("the photos you picked are no longer on this listing, "
+                      "so the automatic photo selection was used")
+    if len(urls) < len(set(wanted)):
+        return urls, "some of the photos you picked are no longer on this listing and were left out"
+    return urls, None
+
+
 def _select_music_track(seed, property_type=None):
     """Pick this listing's track. Same seed + same library -> always the same file.
 
@@ -1383,7 +1474,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                           stats=None, agent_name="", agent_contact_line="",
                           style="classic", photo_index=0, agent_photo_url=None,
                           copy_guard=None, music_seed=None, caption_overrides=None,
-                          music_track=None):
+                          music_track=None, video_photos=None):
     """Renders the Classic-tier listing video and returns (mp4_bytes, degradations, captions).
 
     `caption_overrides` maps a photo's URL to a caption the AGENT wrote. Keyed on the
@@ -1418,6 +1509,14 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     exactly as it was. An id that is no longer pickable (file removed between the
     request and the render) falls back to the automatic pick and is reported in
     `degradations` -- a stale choice must never fail a render.
+    video_photos: the agent's own choice of WHICH listing photos go in the video and in
+    what ORDER -- a list of photo URLs drawn from `image_urls` (see choose_video_photos).
+    None, empty or "auto" keeps the automatic selection exactly as it was (hero first,
+    then the rest in stored order, capped at MAX_VIDEO_PHOTOS). With a choice, those
+    photos are used in that order and photo_index is not consulted (the first chosen
+    photo opens the video). A choice that cannot be honoured -- chosen photos deleted
+    since the request, or too few of them readable -- falls back to the automatic
+    selection and is reported in `degradations`; it never fails the render.
     copy_guard: optional callable(text, context=...) -> text. main.py passes
     apply_listing_copy_guards so captions go through the same house-number/price
     stripping as every other copy surface. Passed in rather than imported because
@@ -1438,9 +1537,18 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     # Hero photo first, then the rest in their existing order, then truncate. Slicing
     # before honouring photo_index would silently drop the hero whenever the listing
     # has more photos than MAX_VIDEO_PHOTOS.
-    hero_url = image_urls[photo_index]
-    rest_urls = [u for i, u in enumerate(image_urls) if i != photo_index]
-    selected_urls = ([hero_url] + rest_urls)[:MAX_VIDEO_PHOTOS]
+    def _auto_selection():
+        hero_url = image_urls[photo_index]
+        rest_urls = [u for i, u in enumerate(image_urls) if i != photo_index]
+        return ([hero_url] + rest_urls)[:MAX_VIDEO_PHOTOS]
+
+    degradations = []
+    # The agent's own pick, when there is one and it still holds. Everything else
+    # (Auto, blank, a stale pick) takes the unchanged automatic selection below.
+    chosen_urls, choice_note = choose_video_photos(video_photos, image_urls)
+    if choice_note:
+        degradations.append(choice_note)
+    selected_urls = chosen_urls if chosen_urls else _auto_selection()
 
     # The dissolve is the house style. Every agent-facing id ("classic", the retired
     # "card", or nothing at all) renders it; only an explicit internal "driftcut"
@@ -1448,7 +1556,6 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     # template id gets today's look rather than an error or a stale one.
     dissolve = (style != STYLE_A_ID)
 
-    degradations = []
     started = time.monotonic()
 
     if not _RENDER_SLOTS.acquire(timeout=RENDER_SLOT_WAIT_SECONDS):
@@ -1466,6 +1573,21 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             except Exception as e:
                 logger.warning("skipping unreadable photo %s: %s", url, e)
                 degradations.append("a photo could not be read and was skipped")
+        if chosen_urls and len(photos) < min(2, len(selected_urls)):
+            # The agent's pick is mostly unreadable (zero, or one of two or more). A
+            # one-photo video they did not ask for is worse than the automatic one.
+            logger.warning("chosen photos mostly unreadable (%d of %d); using the "
+                           "automatic selection", len(photos), len(selected_urls))
+            degradations.append("the photos you picked could not be read, "
+                                "so the automatic photo selection was used")
+            photos, photo_urls = [], []
+            for url in _auto_selection():
+                try:
+                    photos.append(_fetch_listing_photo(url))
+                    photo_urls.append(url)
+                except Exception as e:
+                    logger.warning("skipping unreadable photo %s: %s", url, e)
+                    degradations.append("a photo could not be read and was skipped")
         if not photos:
             raise RuntimeError("None of this listing's photos could be downloaded")
 
