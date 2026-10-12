@@ -148,13 +148,31 @@ JOB_TYPES = {
     # is the same ceiling production already runs at -- the queue changes WHO waits and
     # for how long, not how much runs at once. Single-agent behaviour is unchanged.
     JOB_TYPE_CLASSIC: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=60),
-    # Signature: bound by Replicate, which allows ONE prediction at a time on Jane's
-    # whole account (the same constraint photo_upscale.py documents). Three avatar shots
-    # at ~2 minutes means ~6 minutes per video, serialised platform-wide, so the account
-    # limit is 1 and the ETA default reflects the real number rather than a hopeful one.
-    # The renderer is deliberately not built yet; see register_renderer().
+    # Signature: the Classic film with the agent's own presenting clip as its opening
+    # slide, so it is the same CPU and memory shape as a Classic plus one more slide and
+    # one audio pass. The account-wide limit of 1 predates that design (it was written
+    # for a Replicate avatar pipeline, which was closed on evidence) and is KEPT
+    # deliberately until the reliability audit says otherwise: it is the conservative
+    # direction, it makes the queue position honest, and raising a number is a smaller
+    # change to make later than recovering from having run too many at once.
+    # default_seconds is a placeholder from that same era and is only an ETA before any
+    # real Signature has been timed -- see the note in the hand-off.
     JOB_TYPE_SIGNATURE: JobTypeConfig(per_process_limit=1, account_limit=1, default_seconds=360),
 }
+
+# How many renders of ANY type one worker process may have in flight at once.
+#
+# The per-type limits above are not enough on their own: with two types registered at 1
+# each, a worker could claim a Classic and a Signature together, and both would then
+# contend for video_renderer's single render slot -- the second would sit inside a
+# claimed job for RENDER_SLOT_WAIT_SECONDS before deferring, heartbeating all the while
+# so nothing could reclaim it, while the agent's queue position quietly meant nothing.
+# One render per process is the memory ceiling video_renderer measured; this makes the
+# queue honour it when CHOOSING work rather than discovering it while rendering.
+#
+# With a single type registered this is exactly the old behaviour: the sum of what is
+# running is that one type's count, which per_process_limit already capped.
+PER_PROCESS_RENDER_LIMIT = 1
 
 # How often a running job proves it is still alive, and how long silence lasts before
 # another worker may take the job. Six missed beats is deliberately generous: reclaiming
@@ -267,9 +285,10 @@ def register_renderer(job_type, run, on_final_failure=None):
     on_final_failure(job, error_text) is called once, only when the job has exhausted
     its attempts, so the owning module can mirror the failure onto the listing row.
 
-    A job type with no registered renderer is never claimed -- which is exactly how
-    'signature' stays defined-but-inert until its pipeline is built. Wiring it up later
-    is one register_renderer() call, not a change to this queue.
+    A job type with no registered renderer is never claimed. That is how 'signature'
+    stayed defined-but-inert until its renderer existed, and wiring it up was indeed one
+    register_renderer() call rather than a change to this queue. Both types are
+    registered now (see main.py's startup).
     """
     if job_type not in JOB_TYPES:
         raise ValueError("unknown job type %r" % job_type)
@@ -1061,11 +1080,17 @@ def describe(job):
     return out
 
 
-def describe_active_for_agent(agent_id):
+def describe_active_for_agent(agent_id, job_type=None):
     """One round trip for everything this agent currently has in flight.
 
     Used to decorate the My Listings payload. An agent with nothing rendering costs one
-    indexed select that returns nothing, which is the common case by a wide margin."""
+    indexed select that returns nothing, which is the common case by a wide margin.
+
+    `job_type` narrows the result to one tier, and the caller should say which. The
+    result is keyed by LISTING, and one listing may legitimately have a Classic and a
+    Signature in flight at the same time (the unique index is over listing + type), so
+    without a tier the last row read would silently win -- and My Listings would show a
+    Classic the position of a Signature. Omitting it keeps the original behaviour."""
     if not available():
         return {}
     try:
@@ -1079,6 +1104,8 @@ def describe_active_for_agent(agent_id):
         return {}
     out = {}
     for job in (res.data or []):
+        if job_type is not None and (job.get("job_type") or JOB_TYPE_CLASSIC) != job_type:
+            continue
         try:
             out[str(job["listing_id"])] = describe(job)
         except Exception:
@@ -1224,6 +1251,11 @@ async def run_consumer():
             has_capacity = False
             for job_type in sorted(_RENDERERS):
                 cfg = JOB_TYPES[job_type]
+                if sum(running.values()) >= PER_PROCESS_RENDER_LIMIT:
+                    # This process is already rendering all it can render. Leaving the
+                    # work in the queue is the honest state: another worker can take it,
+                    # and the agent's position means what it says.
+                    break
                 if running.get(job_type, 0) >= cfg.per_process_limit:
                     continue
                 has_capacity = True

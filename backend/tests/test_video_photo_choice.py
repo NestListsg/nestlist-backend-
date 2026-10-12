@@ -333,11 +333,17 @@ check("photo_choice_note ignores unrelated degradations",
       new.photo_choice_note(["the background music could not be added"]) is None)
 
 core = seg("_render_video_core")
+# The column names moved behind `variant` when the Signature tier was wired up (one
+# core, two column sets -- see _VideoVariant). The GUARANTEES these two checks were
+# written for are unchanged and still checked here: the notes are published before the
+# listing is flipped to done, and the column is only written when the row has it.
+# tests/test_signature_wiring.py executes this function for both variants and asserts
+# which columns each one actually writes.
 check("core publishes notes (job row + listing column) BEFORE flipping the listing to done",
-      core.index("record_degradations(list(degradations))") < core.index('update_payload = {"video_url"')
-      and core.index('"video_degradations": list(degradations)') < core.index('update_payload = {"video_url"'))
+      core.index("record_degradations(list(degradations))") < core.index("update_payload = {variant.url_column")
+      and core.index("{variant.degradations_column: list(degradations)}") < core.index("update_payload = {variant.url_column"))
 check("core only writes the column when the row has it (no failing write pre-migration)",
-      'if "video_degradations" in listing:' in core)
+      "if variant.degradations_column in listing:" in core)
 check("both note writes are best-effort (cannot cost the agent their video)",
       core.count("except Exception as e:\n            logger.warning(\"video %s: could not") >= 2)
 check("queued run wires record_degradations to the fenced job write",
