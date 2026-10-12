@@ -737,6 +737,29 @@ PRESENTER_MAX_SECONDS = 12.0      # what we keep; the film uses ~5s of it
 PRESENTER_LONG_EDGE = 1280        # a phone's 4K is wasted here and costs upload time
 PRESENTER_MIN_SECONDS = 1.5       # shorter than this is a mis-tap, not a recording
 
+# WHERE the kept seconds start. People do not begin talking the instant they tap record:
+# measured on Janel's own recording, she is silent for the first 2 seconds and speaks
+# from about 2s to 9s. Taking the first SECONDS_PER_PHOTO from zero would therefore have
+# opened the film with two seconds of her standing there saying nothing and then cut her
+# off mid-sentence -- using the wrong five seconds of a perfectly good take.
+#
+# So the clip is trimmed to where the speech starts. This is deliberately automatic
+# rather than a "choose your start point" control: the agent has already done the work by
+# recording, and every manual step we add is one more thing for them to get wrong.
+# "Quiet" has to be measured against the clip's OWN loudness, not a fixed number. A
+# fixed -45dB threshold was tried first and never fired on Janel's recording: her room's
+# noise floor peaks at -42dB, so the opening silence was never quiet enough to count. A
+# fixed -40dB worked on that one clip and would simply have been tuned to that one room
+# -- a noisier street-side recording would fail it again, and a studio-quiet one would
+# have been trimmed too eagerly. So the threshold is set this far below the loudest
+# moment in the clip, which is their own voice.
+PRESENTER_SILENCE_BELOW_PEAK = 20.0
+# ...clamped, so a clip that is loud throughout (or almost silent throughout) cannot
+# produce an absurd threshold.
+PRESENTER_SILENCE_DB_RANGE = (-60.0, -25.0)
+PRESENTER_SILENCE_MIN = 0.4       # a gap has to last this long to count as a gap
+PRESENTER_LEAD_IN = 0.25          # kept in front of the first word, so it is not clipped
+
 # How the agent's voice sits against the music bed. Their clip is real footage of them
 # speaking, so the sound is the point of it -- a presenting clip with its audio stripped
 # is just a photo that moves. The music ducks under them and comes back up once the film
@@ -767,6 +790,61 @@ PRESENTER_VOICE_TO_STEREO = "aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0
 PRESENTER_MIX_FORMAT = "aformat=sample_fmts=fltp:sample_rates=44100"
 
 
+def _speech_start_seconds(path, duration, keep_at_least):
+    """How far into `path` the agent actually starts talking. 0.0 whenever unsure.
+
+    Every failure mode answers 0.0, which is exactly the behaviour this function
+    replaced -- so a clip that cannot be analysed is kept whole rather than refused or
+    trimmed on a guess.
+    """
+    if not duration or duration <= 0:
+        # Without a duration there is no way to guarantee the clamp below leaves enough
+        # material, and trimming past the end would turn a good recording into one the
+        # minimum-length check rejects. Not trimming is always safe.
+        return 0.0
+    try:
+        peak = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, timeout=TIMEOUT_PROBE).stderr.decode("utf-8", "replace")
+        loudest = re.search(r"max_volume:\s*(-?[\d.]+) dB", peak)
+        if not loudest:
+            logger.warning("could not measure the presenter clip's level; keeping it "
+                           "from the beginning")
+            return 0.0
+        low, high = PRESENTER_SILENCE_DB_RANGE
+        threshold = min(high, max(low, float(loudest.group(1)) - PRESENTER_SILENCE_BELOW_PEAK))
+        err = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path, "-af",
+             f"silencedetect=noise={threshold:.1f}dB:d={PRESENTER_SILENCE_MIN}",
+             "-f", "null", "-"],
+            capture_output=True, timeout=TIMEOUT_PROBE).stderr.decode("utf-8", "replace")
+    except Exception as e:
+        logger.warning("could not look for the start of speech in %s (%s); "
+                       "keeping the clip from the beginning", path, e)
+        return 0.0
+
+    # Only a silence that the clip OPENS with is of any interest. A pause in the middle
+    # is part of how they speak, and skipping to it would drop their first sentence.
+    opening = re.search(r"silence_start:\s*(-?[\d.]+)", err)
+    if not opening or float(opening.group(1)) > PRESENTER_SILENCE_MIN:
+        return 0.0
+    ends = re.search(r"silence_end:\s*([\d.]+)", err)
+    if not ends:
+        # Silent from start to finish: either a muted recording or one filmed somewhere
+        # very quiet. Trimming would leave nothing, and the clip may still be usable
+        # (the film has music over it either way), so keep it whole.
+        logger.info("presenter clip has no detectable speech; keeping it from the beginning")
+        return 0.0
+
+    start = max(0.0, float(ends.group(1)) - PRESENTER_LEAD_IN)
+    # Never trim so far in that the film has less than a full slide to open with.
+    start = min(start, max(0.0, duration - keep_at_least))
+    if start < PRESENTER_SILENCE_MIN:
+        return 0.0            # nothing worth skipping
+    logger.info("presenter clip: speech starts at %.2fs; trimming the lead-in", start)
+    return start
+
+
 def prepare_presenter_clip(raw_bytes, workdir):
     """Normalise an agent's uploaded clip into something the renderer can always read.
 
@@ -787,13 +865,23 @@ def prepare_presenter_clip(raw_bytes, workdir):
     with open(src, "wb") as f:
         f.write(raw_bytes)
 
+    # Skip the dead air before they start talking, so the kept seconds are the ones the
+    # film actually opens on. Answers 0.0 on any doubt, which is what this did before.
+    # Read from ffmpeg's banner, not ffprobe -- ffprobe is a separate binary and may not
+    # be installed on the worker at all.
+    start_at = _speech_start_seconds(src, _duration_via_ffmpeg(src), SECONDS_PER_PHOTO)
+
     # ffmpeg IS the validator. An earlier version probed the input first and treated a
     # failed probe as "not a video" -- which would have rejected every upload on a
     # worker where ffprobe was missing, while ffmpeg itself was working fine. Let the
     # transcode decide: if it cannot read the file, it is not a file we can use.
     try:
         _run_ffmpeg([
-            "ffmpeg", "-y", "-v", "error", "-i", src, "-t", "%.2f" % PRESENTER_MAX_SECONDS,
+            "ffmpeg", "-y", "-v", "error",
+            # Before -i: seek the INPUT, so -t below counts from the first word rather
+            # than from the start of the file.
+            ] + (["-ss", "%.3f" % start_at] if start_at else []) + [
+            "-i", src, "-t", "%.2f" % PRESENTER_MAX_SECONDS,
             # Scale the LONG edge, whichever way up it was filmed, and keep both
             # dimensions even -- H.264 refuses odd ones.
             "-vf", ("scale='if(gt(iw,ih),min(%d,iw),-2)':'if(gt(iw,ih),-2,min(%d,ih))',"
@@ -823,8 +911,8 @@ def prepare_presenter_clip(raw_bytes, workdir):
         logger.warning("could not determine presenter clip duration; assuming the cap")
         seconds = PRESENTER_MAX_SECONDS
     if seconds < PRESENTER_MIN_SECONDS:
-        raise ValueError("That clip is under two seconds. Record about fifteen seconds "
-                         "of yourself speaking to the camera.")
+        raise ValueError("That clip is too short. Record about ten seconds of yourself "
+                         "speaking to the camera, and we will use the best few.")
 
     with open(out, "rb") as f:
         data = f.read()

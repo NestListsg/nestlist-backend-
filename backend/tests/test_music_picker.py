@@ -22,6 +22,13 @@ vr.AUDIO_DIR = d
 vr.TRACKS_MANIFEST = os.path.join(d, "tracks.json")
 
 def manifest(obj):
+    # Always write the TEMP manifest, and point the renderer at it. This used to write
+    # wherever vr.TRACKS_MANIFEST happened to point -- and because the checks further
+    # down deliberately repoint it at the REAL audio/tracks.json, a manifest() call
+    # after that overwrote the shipped track list with two fake entries. Belt and
+    # braces: assert it, so the mistake cannot come back quietly.
+    vr.TRACKS_MANIFEST = os.path.join(d, "tracks.json")
+    assert vr.TRACKS_MANIFEST.startswith(d), "refusing to write outside the temp dir"
     json.dump(obj, open(vr.TRACKS_MANIFEST, "w"))
 
 manifest({"_comment": "x", "a.mp3": {"mood": "Warm", "feel": "soft"},
@@ -110,8 +117,12 @@ def soundtrack_graphs(track_id):
             setattr(vr, n, fn)
     return graphs
 
+real_manifest_path = vr.TRACKS_MANIFEST          # the real audio/tracks.json, set above
 manifest({"a.mp3": {"mood": "Warm"}, "raw.mp3": {"mood": "Upbeat", "raw": True}})
+check("the real track list was not written to",
+      vr.TRACKS_MANIFEST != real_manifest_path and vr.TRACKS_MANIFEST.startswith(d))
 open(os.path.join(d, "raw.mp3"), "wb").write(b"x")
+vr.AUDIO_DIR = d
 plain = soundtrack_graphs("a.mp3")
 check("a non-raw track gets exactly one attempt", len(plain) == 1, repr(len(plain)))
 check("and no loudnorm in it", plain and "loudnorm" not in plain[0])
