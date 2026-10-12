@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -323,12 +323,34 @@ async def shutdown_event():
     except Exception as e:
         logger.warning("could not release in-flight render claims on shutdown (%s)", e)
 
+# ================================
+# SLIDING SESSION CONFIG
+# ================================
+# A login token lives TOKEN_TTL_DAYS, but an ACTIVE session renews itself: when a
+# valid token is within TOKEN_REFRESH_WITHIN_DAYS of expiry, get_current_agent
+# mints a fresh one and returns it in the REFRESH_TOKEN_HEADER response header for
+# the client to swap in. Renewal is bounded: no refresh is issued once the session
+# is past its absolute cap (TOKEN_ABSOLUTE_CAP_DAYS from original login), so a
+# session can never be eternal -- past the cap the token simply expires and a real
+# re-login is forced. The cap rides in the token as the "abs_exp" claim (unix
+# seconds); tokens minted before this feature lack it and are grandfathered (see
+# get_current_agent). None of this touches the DB -- it is pure token arithmetic.
+TOKEN_TTL_DAYS = 30
+TOKEN_ABSOLUTE_CAP_DAYS = 90
+TOKEN_REFRESH_WITHIN_DAYS = 7
+REFRESH_TOKEN_HEADER = "X-Refresh-Token"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    # The frontend lives on nestlist.sg, a different origin from the Railway API,
+    # so a custom response header is invisible to browser JS unless it is named
+    # here -- allow_headers governs REQUEST headers only. Without this the sliding
+    # refresh header would be sent but silently unreadable by fetch().
+    expose_headers=[REFRESH_TOKEN_HEADER],
 )
 
 @app.options("/{path:path}")
@@ -737,8 +759,28 @@ def verify_password(password: str, hashed: str) -> bool:
         logger.warning("verify_password failed (%s: %s) -- refusing login", type(e).__name__, e)
         return False
 
-def create_token(agent_id: str) -> str:
-    payload = {"agent_id": agent_id, "exp": datetime.utcnow() + timedelta(days=30)}
+_EPOCH = datetime(1970, 1, 1)
+
+def _to_epoch_seconds(dt: datetime) -> int:
+    # dt is naive UTC (the codebase uses datetime.utcnow() throughout); treat it
+    # as UTC to match how PyJWT serialises the registered `exp` claim. This is the
+    # exact inverse of datetime.utcfromtimestamp used on the decode side.
+    return int((dt - _EPOCH).total_seconds())
+
+def create_token(agent_id: str, abs_exp: "Optional[datetime]" = None) -> str:
+    # exp slides forward TOKEN_TTL_DAYS on each mint, but is never allowed past the
+    # session's absolute cap. On a FRESH login (abs_exp is None) the cap is set
+    # TOKEN_ABSOLUTE_CAP_DAYS out; on a sliding refresh the caller passes the
+    # existing cap through so it stays fixed to the original login.
+    now = datetime.utcnow()
+    if abs_exp is None:
+        abs_exp = now + timedelta(days=TOKEN_ABSOLUTE_CAP_DAYS)
+    exp = min(now + timedelta(days=TOKEN_TTL_DAYS), abs_exp)
+    payload = {
+        "agent_id": agent_id,
+        "exp": exp,  # PyJWT serialises a datetime here and enforces it on decode
+        "abs_exp": _to_epoch_seconds(abs_exp),
+    }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 _last_alert_times = {}
@@ -751,7 +793,7 @@ async def send_telegram_alert_throttled(key: str, message: str, cooldown_seconds
     _last_alert_times[key] = now
     await send_telegram_alert(message)
 
-async def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def get_current_agent(response: Response, credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
     except jwt.ExpiredSignatureError:
@@ -781,6 +823,43 @@ async def get_current_agent(credentials: HTTPAuthorizationCredentials = Depends(
 
     if not result.data:
         raise HTTPException(status_code=401, detail="Agent not found. Please log in again.")
+
+    # Sliding refresh (pure token arithmetic, no DB call): this token is valid and
+    # the agent exists. If it is within TOKEN_REFRESH_WITHIN_DAYS of expiring, hand
+    # back a fresh token in the REFRESH_TOKEN_HEADER on the injected Response --
+    # UNLESS the session has reached its absolute cap, in which case we deliberately
+    # let it expire and force a real re-login so no session is eternal. Wrapped so a
+    # refresh hiccup can never turn a good login into a failed one, and so an older
+    # frontend that ignores the header is completely unaffected.
+    #
+    # The header is set via the injected Response, which FastAPI merges onto the
+    # normal (serialised) JSON responses -- all we need, since the token refreshes
+    # on ordinary authed API calls. It intentionally does NOT ride on endpoints that
+    # return a FileResponse/StreamingResponse directly (FastAPI does not merge the
+    # dependency's headers onto a directly-returned Response); the refresh simply
+    # happens on the next JSON call. This is deliberate: it keeps the poster/video
+    # download byte path off BaseHTTPMiddleware's anyio stream bridge.
+    try:
+        now = datetime.utcnow()
+        exp_dt = datetime.utcfromtimestamp(payload["exp"])
+        abs_exp_ts = payload.get("abs_exp")
+        if abs_exp_ts is None:
+            # Grandfathered pre-sliding-session token: only a 30-day exp, no cap.
+            # Such tokens were always minted with TOKEN_TTL_DAYS of life, so the
+            # original login was exp - TOKEN_TTL_DAYS. Seed the cap as if minted
+            # under the new scheme (original login + TOKEN_ABSOLUTE_CAP_DAYS) so an
+            # active agent is carried across the old hard 30-day cliff rather than
+            # hitting it mid-use.
+            abs_exp_dt = exp_dt - timedelta(days=TOKEN_TTL_DAYS) + timedelta(days=TOKEN_ABSOLUTE_CAP_DAYS)
+        else:
+            abs_exp_dt = datetime.utcfromtimestamp(abs_exp_ts)
+        near_expiry = (exp_dt - now) <= timedelta(days=TOKEN_REFRESH_WITHIN_DAYS)
+        before_cap = now < abs_exp_dt
+        if near_expiry and before_cap and response is not None:
+            response.headers[REFRESH_TOKEN_HEADER] = create_token(agent_id, abs_exp=abs_exp_dt)
+    except Exception as e:
+        logger.warning("sliding refresh skipped (%s: %s)", type(e).__name__, e)
+
     return result.data[0]
 
 # ================================
