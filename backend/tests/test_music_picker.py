@@ -73,10 +73,55 @@ check("real manifest: Upbeat never in the automatic pick",
       all(os.path.basename(vr._select_music_track("s%d" % i, pt)[0]) != "acoustic_upbeat.mp3"
           for i in range(200) for pt in ("", "Bungalow", "Condo")))
 
-rsrc = io.open(os.path.join(os.path.dirname(_HERE), "video_renderer.py"), encoding="utf-8").read()
-check("non-raw filter text is the original string (no loudnorm unless normalize)",
-      'f"[1:a]atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS,"\n                        f"{norm}"' in rsrc
-      and "attempts = [True, False] if is_raw else [False]" in rsrc)
+# The raw-track loudness ladder, checked by running a render rather than by matching the
+# source text. The text form of this check broke the moment the soundtrack stage was
+# refactored for Signature, while the behaviour it cared about was entirely intact --
+# and a string match could never have told the difference. The stronger guarantee that
+# a Classic render issues the IDENTICAL ffmpeg commands it issued before the refactor
+# now lives in tests/test_signature_render.py, which diffs them against git HEAD.
+def soundtrack_graphs(track_id):
+    """The audio filter strings a render would hand ffmpeg, in attempt order."""
+    from PIL import Image
+    graphs = []
+
+    def fake_run_ffmpeg(cmd, timeout):
+        if "-filter_complex" in cmd:
+            g = cmd[cmd.index("-filter_complex") + 1]
+            if "[1:a]" in g:
+                graphs.append(g)
+                raise RuntimeError("ffmpeg exited 1: forced, to see the next attempt")
+        out = cmd[-1]
+        if not out.startswith("-"):
+            open(out, "wb").write(b"\0" * 2048)
+
+    saved = {n: getattr(vr, n) for n in ("_run_ffmpeg", "_fetch_listing_photo",
+                                         "_generate_room_captions", "_probe_duration")}
+    vr._run_ffmpeg = fake_run_ffmpeg
+    vr._fetch_listing_photo = lambda url: Image.new("RGB", (1200, 800), (150, 150, 150))
+    vr._generate_room_captions = lambda photos, copy_guard=None: ([None] * len(photos), None)
+    vr._probe_duration = lambda path, fallback: fallback
+    try:
+        vr.render_property_video(image_urls=["https://example.test/a.jpg"],
+                                 agent_name="A", music_track=track_id, music_seed="s")
+    except Exception:
+        pass
+    finally:
+        for n, fn in saved.items():
+            setattr(vr, n, fn)
+    return graphs
+
+manifest({"a.mp3": {"mood": "Warm"}, "raw.mp3": {"mood": "Upbeat", "raw": True}})
+open(os.path.join(d, "raw.mp3"), "wb").write(b"x")
+plain = soundtrack_graphs("a.mp3")
+check("a non-raw track gets exactly one attempt", len(plain) == 1, repr(len(plain)))
+check("and no loudnorm in it", plain and "loudnorm" not in plain[0])
+rawg = soundtrack_graphs("raw.mp3")
+check("a raw track tries loudness normalization first", len(rawg) == 2 and "loudnorm" in rawg[0],
+      repr([("loudnorm" in g) for g in rawg]))
+check("then falls back to the track as-is", len(rawg) == 2 and "loudnorm" not in rawg[1])
+check("the fallback is otherwise the same filter as a non-raw track",
+      len(rawg) == 2 and plain and rawg[1] == plain[0].replace("a.mp3", "raw.mp3"))
+os.remove(os.path.join(d, "raw.mp3"))
 
 src = io.open(os.path.join(os.path.dirname(_HERE), "main.py"), encoding="utf-8").read()
 tree = ast.parse(src)

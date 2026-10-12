@@ -1,15 +1,1 @@
-{
-  "_comment": "Plain string = property tier only (warm/grand). Object form adds picker fields: mood+feel make a track pickable by agents; omit tier to leave it eligible in every tier; auto:false keeps it out of the automatic pick. Jane accepted the small Content-ID risk for the registered tracks given a mood (2026-10-12); test/swap over time. A tier kept alongside a mood leaves auto-selection exactly as before. raw:true = unprocessed download; trimmed + loudness-normalized (-9.8 LUFS) at render time. Leave it off for pre-processed files.",
-  "soft_piano.mp3": {"mood": "Warm", "feel": "Soft, unhurried solo piano. Gentle and homely."},
-  "acoustic_upbeat.mp3": {"mood": "Upbeat", "auto": false, "raw": true, "feel": "Bright, light acoustic guitar. Cheerful and friendly."},
-
-  "minimal_piano.mp3": {"tier": "warm", "mood": "Warm", "feel": "Sparse, soft piano — calm and hopeful."},
-  "peaceful_piano.mp3": "warm",
-  "soft_piano_leberch.mp3": "warm",
-  "reading.mp3": {"tier": "warm", "mood": "Elegant", "feel": "Unhurried solo piano — steady and refined."},
-  "reflected_light.mp3": "warm",
-
-  "the_way_home.mp3": "grand",
-  "boundless_hope.mp3": {"tier": "grand", "mood": "Cinematic", "feel": "Building, hopeful main-title feel."},
-  "ambient_piano_strings.mp3": {"tier": "grand", "mood": "Elegant", "feel": "Soft piano with gentle strings — calm and bright."}
-}
+{"a.mp3": {"mood": "Warm"}, "raw.mp3": {"mood": "Upbeat", "raw": true}}

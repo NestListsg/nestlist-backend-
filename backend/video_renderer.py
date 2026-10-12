@@ -737,6 +737,35 @@ PRESENTER_MAX_SECONDS = 12.0      # what we keep; the film uses ~5s of it
 PRESENTER_LONG_EDGE = 1280        # a phone's 4K is wasted here and costs upload time
 PRESENTER_MIN_SECONDS = 1.5       # shorter than this is a mis-tap, not a recording
 
+# How the agent's voice sits against the music bed. Their clip is real footage of them
+# speaking, so the sound is the point of it -- a presenting clip with its audio stripped
+# is just a photo that moves. The music ducks under them and comes back up once the film
+# moves on to the rooms.
+PRESENTER_VOICE_VOLUME = 0.92     # leaves headroom so voice + ducked music cannot clip
+PRESENTER_MUSIC_DUCK = 0.30       # music multiplier while they are speaking
+PRESENTER_DUCK_RELEASE = 0.9      # seconds the music takes to come back to full
+PRESENTER_VOICE_FADE = 0.25       # so their last syllable is not cut off mid-word
+# Phones record mono or stereo depending on the handset, and that difference silently
+# changed how loud the agent was. MEASURED on a mono source (a 4.5s window, mean volume):
+#
+#     no conversion                                       -21.1 dB
+#     aformat=channel_layouts=stereo                      -24.1 dB   <- 3dB lost
+#     aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0 -21.1 dB
+#
+# The 3dB is the resampler's power-preserving rematrix: spreading one channel across two
+# halves the power in each. aformat does NOT avoid it -- it asks for stereo and gets the
+# same rematrix -- so pan is the fix, duplicating the channel verbatim instead. Forcing
+# mono FIRST makes the same string correct for a stereo recording (a downmix of
+# correlated channels keeps its level; measured at -21.1 dB too), which matters because
+# we cannot know what the agent filmed on.
+#
+# A single speaking voice has no stereo image worth preserving, so collapsing it costs
+# nothing. The music is NOT put through this -- it is a real stereo mix.
+PRESENTER_VOICE_TO_STEREO = "aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0"
+# Shared sample rate so the two layers meet amix already agreeing, rather than through
+# whichever conversion it would have inserted. Deliberately says nothing about channels.
+PRESENTER_MIX_FORMAT = "aformat=sample_fmts=fltp:sample_rates=44100"
+
 
 def prepare_presenter_clip(raw_bytes, workdir):
     """Normalise an agent's uploaded clip into something the renderer can always read.
@@ -1278,6 +1307,56 @@ def _caption_filters(caption, caption_size, workdir, index, alpha_expr=None,
     return out
 
 
+def _presenter_opening_clip(src_path, out_path, timeout=TIMEOUT_CLIP):
+    """The agent's own footage, as the opening slide of a Signature.
+
+    Exactly SECONDS_PER_PHOTO long and encoded with _ENCODE_ARGS, because that is what
+    makes it just another slide: _dissolve_segments cuts every clip at fixed offsets
+    derived from SECONDS_PER_PHOTO, so a clip of any other length would be silently
+    truncated or run short. Matching the encode also keeps the assembly a stream copy.
+
+    Given the same contain-over-blur treatment the photos get -- shown WHOLE over a
+    blurred copy of itself -- so the opening looks like the rest of the film rather than
+    a different video bolted on the front. Containing is also the only treatment that is
+    SAFE here: an earlier cut cover-cropped to fill the frame and took the top of Janel's
+    head off, because phone footage is portrait and the agent is close to the lens. A
+    contain can crop nothing, whichever way up the clip was filmed.
+
+    Silent (_ENCODE_ARGS carries -an). Their voice is mixed back over the finished film,
+    where it can duck the music rather than fight it.
+    """
+    # Backdrop: cover-scale, then crop. force_original_aspect_ratio=increase guarantees
+    # the scaled frame is at least as large as the crop in BOTH dimensions -- the first
+    # cut used `scale=1080:-1,crop=1080:1920`, which on any clip squarer than 9:16
+    # (a 3:4 portrait, a landscape held sideways) produced a frame shorter than 1920 and
+    # ffmpeg refused the crop outright, failing the whole render.
+    #
+    # Blurred small and scaled back up, as the photo path does: a wide-radius blur over
+    # a full-resolution frame is enormously expensive and, since blurring is destroying
+    # detail, indistinguishable from blurring a thumbnail. Per FRAME of video that
+    # saving is 120x what it is for a still.
+    bg = (f"scale=w={VW // 4}:h={VH // 4}:force_original_aspect_ratio=increase,"
+          f"crop={VW // 4}:{VH // 4},"
+          f"boxblur={CONTAIN_BLUR_RADIUS - 2}:2,"
+          f"scale={VW}:{VH},"
+          f"eq=brightness=-{CONTAIN_BG_DARKEN / 2:.3f}")
+    # Foreground: contain. decrease fits the clip INSIDE 1080x1920 whole, so a portrait
+    # clip fills the frame, a squarer one gets blurred bands, and nothing is ever cut.
+    fg = f"scale=w={VW}:h={VH}:force_original_aspect_ratio=decrease:flags=lanczos"
+    _run_ffmpeg([
+        "ffmpeg", "-y", "-v", "error",
+        # -stream_loop so a clip shorter than a slide still fills one rather than
+        # freezing on a black tail.
+        "-stream_loop", "-1", "-i", src_path, "-t", "%.3f" % SECONDS_PER_PHOTO,
+        "-filter_complex",
+        (f"[0:v]fps={FPS},split=2[bgin][fgin];"
+         f"[bgin]{bg}[b];"
+         f"[fgin]{fg}[f];"
+         f"[b][f]overlay=(W-w)/2:(H-h)/2:shortest=0,setsar=1,format=yuv420p[v]"),
+        "-map", "[v]",
+    ] + _ENCODE_ARGS + [out_path], timeout)
+
+
 def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=None,
                   zoom_in=True, first=True, last=True):
     """STYLE B: one photo -> one 5s contain-over-blur clip with a gentle zoom.
@@ -1608,7 +1687,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                           stats=None, agent_name="", agent_contact_line="",
                           style="classic", photo_index=0, agent_photo_url=None,
                           copy_guard=None, music_seed=None, caption_overrides=None,
-                          music_track=None, video_photos=None):
+                          music_track=None, video_photos=None, presenter_path=None):
     """Renders the Classic-tier listing video and returns (mp4_bytes, degradations, captions).
 
     `caption_overrides` maps a photo's URL to a caption the AGENT wrote. Keyed on the
@@ -1761,6 +1840,28 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
 
         with tempfile.TemporaryDirectory() as workdir:
             clip_paths = []
+            # --- the Signature tier's opening slide: the agent themselves ---
+            # Built here, into this render's workdir, so the file the timeline consumes
+            # is OURS. An earlier cut took a caller-owned path straight into clip_paths,
+            # where the single-clip shortcut below (os.replace) would have MOVED the
+            # agent's stored clip out from under them.
+            #
+            # This is the one stage of a Signature that does not degrade. A Signature
+            # without the agent in it is a Classic, and quietly shipping one as the other
+            # means an agent posts a film believing they are in it. Better to fail and
+            # say why.
+            opening_clip = None
+            if presenter_path:
+                opening_clip = os.path.join(workdir, "clip_presenter.mp4")
+                try:
+                    _presenter_opening_clip(presenter_path, opening_clip)
+                except Exception as e:
+                    logger.error("presenter opening clip failed (%s)", e)
+                    raise RuntimeError(
+                        "Your presenting clip could not be read. Try uploading it again "
+                        "in My Profile, or record a new one."
+                    ) from e
+                clip_paths.append(opening_clip)
             for i, photo in enumerate(photos):
                 if i > 0 and time.monotonic() - started > RENDER_BUDGET_SECONDS:
                     logger.warning("render budget reached after %d photos; finishing early", i)
@@ -1774,7 +1875,12 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                             caption=captions[i] if i < len(captions) else None,
                             caption_size=caption_size,
                             zoom_in=(i % 2 == 0),
-                            first=(i == 0),
+                            # `first` means "this clip is not dissolved INTO", which
+                            # decides when the caption may appear. On a Signature the
+                            # first PHOTO is the second CLIP, so its caption has to wait
+                            # out the dissolve from the presenter or it double-strikes
+                            # through it.
+                            first=(i == 0 and opening_clip is None),
                             last=(i == len(photos) - 1),
                         )
                     else:
@@ -1797,7 +1903,10 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                     continue
                 clip_paths.append(clip_path)
 
-            if not clip_paths:
+            photo_clips = len(clip_paths) - (1 if opening_clip else 0)
+            if not photo_clips:
+                # Also the guard that keeps the os.replace shortcut below from being
+                # handed the presenter clip as the entire film.
                 raise RuntimeError("No photo could be rendered into the video")
 
             body_path = os.path.join(workdir, "body.mp4")
@@ -1828,7 +1937,10 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                 logger.warning("contact card failed (%s); shipping the slideshow without it", e)
                 degradations.append("the closing contact card could not be built")
 
-            # --- music bed (degrades to silence) ---
+            # --- soundtrack: music bed, plus the agent's voice on a Signature ---
+            # Everything here degrades. The ladder, best first: voice over ducked music
+            # -> music alone -> silence. A problem with one layer never costs the other
+            # and never costs the video.
             final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
             wrote_final = False
             track_path = None
@@ -1842,64 +1954,140 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                         "the music you picked was not available, so a matching track was used")
             if track_path is None:
                 track_path, music_tier = _select_music_track(music_seed, property_type)
-            if track_path:
-                fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
 
-                def _audio_filter(normalize):
-                    # `normalize` is True ONLY for tracks flagged "raw" in tracks.json.
-                    # Without it the filter string is exactly what every existing
-                    # track has always used.
-                    norm = (
-                        f"loudnorm=I={RAW_TRACK_TARGET_LUFS}:TP={RAW_TRACK_TRUE_PEAK_DB}"
-                        f":LRA={RAW_TRACK_LRA},aresample=44100,"
-                    ) if normalize else ""
-                    return (
-                        f"[1:a]atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS,"
-                        f"{norm}"
-                        f"volume={AUDIO_VOLUME},"
-                        f"afade=t=in:st=0:d={AUDIO_FADE_IN_SECONDS},"
-                        f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_OUT_SECONDS}[aout]"
-                    )
+            # The voice comes from the agent's stored clip, not from the opening slide --
+            # the slide is silent by construction (_ENCODE_ARGS carries -an). Only offered
+            # when that slide actually made it into the film, so the voice can never play
+            # over a video the agent is not in.
+            voice_path = presenter_path if opening_clip else None
+            fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
+            voice_end = min(SECONDS_PER_PHOTO, silent_duration)
+            duck_release = max(0.1, PRESENTER_DUCK_RELEASE)
 
-                # Attempts, best first. A raw track tries normalization, then falls back
-                # to the plain as-is filter, so a normalization problem costs loudness
-                # consistency, never the music (and never the video). A normal track has
-                # exactly one attempt, identical to before.
-                is_raw = _is_raw_track(track_path)
-                attempts = [True, False] if is_raw else [False]
-                for normalize in attempts:
-                    try:
-                        _run_ffmpeg([
-                            "ffmpeg", "-y", "-i", silent_path,
-                            # -stream_loop so a track shorter than the video still covers it.
-                            "-stream_loop", "-1", "-i", track_path,
-                            "-filter_complex", _audio_filter(normalize),
-                            "-map", "0:v", "-map", "[aout]",
-                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                            "-movflags", "+faststart", final_path,
-                        ], TIMEOUT_MUSIC)
-                        wrote_final = True
-                        # Logged on every render so "why does my video sound different
-                        # from my colleague's?" is answerable from Railway's logs alone.
-                        logger.info("music bed: %s (%s tier, property_type %r, seed %r%s)",
-                                    os.path.basename(track_path), music_tier,
-                                    str(property_type or ""), str(music_seed or ""),
-                                    ", raw track loudness-normalized" if normalize else "")
-                        break
-                    except Exception as e:
-                        if normalize:
-                            logger.warning("loudness normalization of raw track %s failed "
-                                           "(%s); retrying with the track as-is",
-                                           os.path.basename(track_path), e)
-                            continue
-                        # Covers an unreadable or corrupt track as well as a mux failure:
-                        # either way the video ships, silent.
-                        logger.warning("music bed %s failed (%s); shipping a silent video",
-                                       os.path.basename(track_path), e)
-                        degradations.append("the background music could not be added")
-            else:
+            def _music_chain(normalize):
+                """[1:a] -> [music]. `normalize` is True ONLY for tracks flagged "raw" in
+                tracks.json; without it this is byte-for-byte the filter every existing
+                track has always used."""
+                norm = (
+                    f"loudnorm=I={RAW_TRACK_TARGET_LUFS}:TP={RAW_TRACK_TRUE_PEAK_DB}"
+                    f":LRA={RAW_TRACK_LRA},aresample=44100,"
+                ) if normalize else ""
+                return (
+                    f"[1:a]atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS,"
+                    f"{norm}"
+                    f"volume={AUDIO_VOLUME},"
+                    f"afade=t=in:st=0:d={AUDIO_FADE_IN_SECONDS},"
+                    f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_OUT_SECONDS}"
+                )
+
+            def _duck():
+                """A second volume stage that holds the music down while the agent speaks
+                and eases it back up over PRESENTER_DUCK_RELEASE once the film reaches the
+                rooms. Multiplies the stage before it, so AUDIO_VOLUME still sets the
+                ceiling and nothing about the music's own level changes."""
+                return (
+                    f",volume='min(1,max({PRESENTER_MUSIC_DUCK},"
+                    f"{PRESENTER_MUSIC_DUCK}+(1-{PRESENTER_MUSIC_DUCK})"
+                    f"*(t-{voice_end:.3f})/{duck_release:.3f}))':eval=frame"
+                )
+
+            def _voice_chain(index):
+                """[index:a] -> [voice]: the opening slide's worth of the agent speaking,
+                padded with silence to the full length of the film.
+
+                Padded rather than mixed short because amix's own normalisation is what
+                the volume=2 below undoes, and a stream that drops out mid-mix makes that
+                correction wrong for the rest of the film."""
+                fade = min(PRESENTER_VOICE_FADE, voice_end / 2)
+                return (
+                    f"[{index}:a]atrim=0:{voice_end:.3f},asetpts=PTS-STARTPTS,"
+                    f"volume={PRESENTER_VOICE_VOLUME},"
+                    f"afade=t=out:st={voice_end - fade:.3f}:d={fade:.3f},"
+                    f"apad,atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS"
+                )
+
+            def _soundtrack(normalize, with_voice):
+                """(extra ffmpeg inputs, filter_complex) for one attempt."""
+                inputs, filters = [], []
+                both = bool(track_path) and with_voice
+                if track_path:
+                    # -stream_loop so a track shorter than the video still covers it.
+                    inputs += ["-stream_loop", "-1", "-i", track_path]
+                    filters.append(_music_chain(normalize)
+                                   + (_duck() if with_voice else "")
+                                   + (f",{PRESENTER_MIX_FORMAT}[music]" if both else "[aout]"))
+                if with_voice:
+                    inputs += ["-i", voice_path]
+                    filters.append(_voice_chain(2 if track_path else 1)
+                                   + (f",{PRESENTER_VOICE_TO_STEREO}"
+                                      f",{PRESENTER_MIX_FORMAT}[voice]"
+                                      if both else "[aout]"))
+                if both:
+                    # amix scales by 1/inputs, so volume=2 puts both layers back at the
+                    # level their own chains set. Worst case is the ducked music under
+                    # the voice, which lands just under full scale -- see
+                    # PRESENTER_VOICE_VOLUME.
+                    filters.append("[music][voice]amix=inputs=2:duration=first,volume=2[aout]")
+                # A music-only soundtrack is therefore the exact filter string, and the
+                # exact command, that shipped before Signature existed.
+                return inputs, ";".join(filters)
+
+            # Attempts, best first, deduplicated. A raw track tries normalization first,
+            # so a normalization problem costs loudness consistency rather than the music.
+            # A normal Classic has exactly one attempt, identical to before this change.
+            is_raw = _is_raw_track(track_path) if track_path else False
+            attempts = []
+            for with_voice in ([True, False] if voice_path else [False]):
+                for normalize in ([True, False] if is_raw else [False]):
+                    attempts.append((normalize, with_voice))
+            if not track_path and not voice_path:
+                attempts = []
                 logger.warning("no usable music track found in %s", AUDIO_DIR)
                 degradations.append("the background music file is missing from the deploy")
+
+            used_voice = False
+            for attempt_no, (normalize, with_voice) in enumerate(attempts):
+                extra_inputs, filter_complex = _soundtrack(normalize, with_voice)
+                try:
+                    _run_ffmpeg([
+                        "ffmpeg", "-y", "-i", silent_path,
+                    ] + extra_inputs + [
+                        "-filter_complex", filter_complex,
+                        "-map", "0:v", "-map", "[aout]",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                        "-movflags", "+faststart", final_path,
+                    ], TIMEOUT_MUSIC)
+                    wrote_final = True
+                    used_voice = with_voice
+                    # Logged on every render so "why does my video sound different from my
+                    # colleague's?" is answerable from Railway's logs alone.
+                    logger.info("soundtrack: %s (%s tier, property_type %r, seed %r)%s%s",
+                                os.path.basename(track_path) if track_path else "no music",
+                                music_tier if track_path else "n/a",
+                                str(property_type or ""), str(music_seed or ""),
+                                ", raw track loudness-normalized" if normalize else "",
+                                ", agent's voice over ducked music" if with_voice else "")
+                    break
+                except Exception as e:
+                    last = attempt_no == len(attempts) - 1
+                    if with_voice and not last:
+                        logger.warning("could not mix the agent's voice in (%s); "
+                                       "trying the next soundtrack option", e)
+                        continue
+                    if normalize and not last:
+                        logger.warning("loudness normalization of raw track %s failed "
+                                       "(%s); retrying with the track as-is",
+                                       os.path.basename(track_path), e)
+                        continue
+                    # Covers an unreadable or corrupt track as well as a mux failure:
+                    # either way the video ships, silent.
+                    logger.warning("soundtrack failed (%s); shipping a silent video", e)
+                    degradations.append("the background music could not be added")
+
+            # Said once, from what actually shipped, rather than once per failed attempt.
+            if voice_path and wrote_final and not used_voice:
+                degradations.append(
+                    "your voice could not be added, so the video has music only")
 
             if not wrote_final:
                 _run_ffmpeg(["ffmpeg", "-y", "-i", silent_path, "-c", "copy",
@@ -1911,8 +2099,9 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
         if degradations:
             logger.warning("video rendered with degradations: %s", "; ".join(degradations))
         logger.info(
-            "video rendered: %d photo(s), %.1fs, %.1fMB, %.0fs wall clock",
-            len(clip_paths), silent_duration, len(data) / 1024 / 1024,
+            "video rendered: %d photo(s)%s, %.1fs, %.1fMB, %.0fs wall clock",
+            photo_clips, " + the agent's own clip" if opening_clip else "",
+            silent_duration, len(data) / 1024 / 1024,
             time.monotonic() - started,
         )
         return data, degradations, captions_used
