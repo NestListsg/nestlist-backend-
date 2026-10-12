@@ -170,3 +170,5 @@ tracks.json. Everything else stays in the automatic pool only.
         "feel": "Bright, light acoustic guitar. Cheerful and friendly."}
   ("auto": false keeps this happier track out of the automatic pick so it never
   lands on a grand property by itself; it plays only when an agent chooses it.)
+
+acoustic_upbeat.mp3 - "Acoustic Upbeat" by OctoSound, Pixabay (https://pixabay.com/music/happy-childrens-tunes-acoustic-upbeat-301015/). Free for commercial use under the Pixabay Content License; no attribution required. Not Content-ID registered (checked 2026-10-11). RAW track (raw:true): trimmed + loudness-normalized at render time. Downloaded 2026-10-12.
