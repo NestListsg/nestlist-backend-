@@ -760,6 +760,25 @@ PRESENTER_SILENCE_DB_RANGE = (-60.0, -25.0)
 PRESENTER_SILENCE_MIN = 0.4       # a gap has to last this long to count as a gap
 PRESENTER_LEAD_IN = 0.25          # kept in front of the first word, so it is not clipped
 
+# How loud the agent ends up is otherwise decided by how they filmed: phone at arm's
+# length in a quiet room is a FAR lower level than one held close. Measured on Janel's
+# own recording, her voice landed at -33.5dB in the finished film while the music -- even
+# ducked to PRESENTER_MUSIC_DUCK -- sat at -25.4dB, so the music was comfortably louder
+# than the person speaking. No fixed duck can fix that, because the problem is the source
+# level, not the balance.
+#
+# So the voice is normalised ONCE, on upload, to a speech loudness target -- the same
+# treatment the "raw" music tracks get, and for the same reason. Baking it into the
+# stored clip rather than doing it per render means the work happens once, and the render
+# path needs to know nothing about it.
+#
+# -18 rather than a broadcast -16: it is a little conservative on purpose. Normalisation
+# lifts the room tone along with the voice, and a quiet recording needs a lot of gain to
+# reach -16.
+PRESENTER_VOICE_LUFS = -18.0
+PRESENTER_VOICE_TRUE_PEAK_DB = -2.0
+PRESENTER_VOICE_LRA = 11
+
 # How the agent's voice sits against the music bed. Their clip is real footage of them
 # speaking, so the sound is the point of it -- a presenting clip with its audio stripped
 # is just a photo that moves. The music ducks under them and comes back up once the film
@@ -887,6 +906,11 @@ def prepare_presenter_clip(raw_bytes, workdir):
             "-vf", ("scale='if(gt(iw,ih),min(%d,iw),-2)':'if(gt(iw,ih),-2,min(%d,ih))',"
                     "format=yuv420p" % (PRESENTER_LONG_EDGE, PRESENTER_LONG_EDGE)),
             "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+            # Even out how loud they recorded, so the film's balance does not depend on
+            # how they held the phone. Single-pass loudnorm: approximate, but the gap it
+            # is closing is tens of dB, not tenths.
+            "-af", (f"loudnorm=I={PRESENTER_VOICE_LUFS}:TP={PRESENTER_VOICE_TRUE_PEAK_DB}"
+                    f":LRA={PRESENTER_VOICE_LRA}"),
             "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
             "-movflags", "+faststart", out,
         ], timeout=240)
