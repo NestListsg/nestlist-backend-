@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -16,6 +16,7 @@ import zipfile
 import json
 import asyncio
 import httpx
+import tempfile
 import uuid
 import re
 import secrets
@@ -5001,6 +5002,81 @@ def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_age
     except Exception:
         logger.exception("Profile photo upload failed for agent %s", agent["id"])
         raise HTTPException(status_code=500, detail="Something went wrong uploading that photo -- please try again")
+
+PRESENTER_MAX_UPLOAD_MB = 200     # a 15s phone clip is ~30-60MB; 200 leaves room for 4K
+
+
+@app.post("/api/profile/presenter-video")
+async def upload_presenter_video(file: UploadFile = File(...), agent=Depends(get_current_agent)):
+    """The agent's own clip of themselves speaking -- the opening of a Signature video.
+
+    REAL FOOTAGE, uploaded once, reused for every Signature they order. Not a generated
+    avatar: every attempt at synthesising an agent either lost their likeness within two
+    seconds or required inventing the room to keep them convincing, and inventing a room
+    is not something a property video may do.
+
+    Multipart rather than the base64 JSON the photo endpoints use, because base64
+    inflates by a third and a phone clip is tens of megabytes -- that request would be
+    refused or time out.
+    """
+    raw = await file.read()
+    size_mb = len(raw) / (1024 * 1024)
+    if not raw:
+        raise HTTPException(status_code=400, detail="That upload arrived empty -- please try again.")
+    if size_mb > PRESENTER_MAX_UPLOAD_MB:
+        raise HTTPException(
+            status_code=413,
+            detail=("That file is %.0fMB, over the %dMB limit. A fifteen-second clip is "
+                    "usually well under that -- check you have not sent a long recording."
+                    % (size_mb, PRESENTER_MAX_UPLOAD_MB)),
+        )
+
+    try:
+        with tempfile.TemporaryDirectory() as workdir:
+            clip, seconds = await asyncio.to_thread(
+                video_renderer.prepare_presenter_clip, raw, workdir)
+    except ValueError as e:
+        # Raised deliberately with wording meant for the agent, not a stack trace.
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("presenter clip transcode failed for agent %s (%.1fMB)", agent["id"], size_mb)
+        raise HTTPException(
+            status_code=500,
+            detail="We could not read that video. An MP4 or MOV straight from your phone works best.",
+        )
+
+    try:
+        supabase = get_db()
+        filename = f"agents/{agent['id']}/presenter/{uuid.uuid4().hex[:12]}.mp4"
+        supabase.storage.from_("listings-images").upload(
+            filename, clip, {"content-type": "video/mp4", "upsert": "true"})
+        url = supabase.storage.from_("listings-images").get_public_url(filename)
+    except Exception:
+        logger.exception("presenter clip upload failed for agent %s", agent["id"])
+        raise HTTPException(status_code=502, detail="We could not save that video -- please try again.")
+
+    db_execute(
+        lambda db: db.table("agents").update({
+            "presenter_video_url": url,
+            "presenter_video_seconds": round(seconds, 2),
+        }).eq("id", agent["id"]),
+        what="upload_presenter_video agents update",
+    )
+    return {"presenter_video_url": url, "seconds": round(seconds, 2)}
+
+
+@app.delete("/api/profile/presenter-video")
+def delete_presenter_video(agent=Depends(get_current_agent)):
+    """Forget the clip. The file is left in storage: a Signature already rendered from
+    it is still correct, and deleting the bytes buys nothing."""
+    db_execute(
+        lambda db: db.table("agents").update({
+            "presenter_video_url": None, "presenter_video_seconds": None,
+        }).eq("id", agent["id"]),
+        what="delete_presenter_video agents update",
+    )
+    return {"presenter_video_url": None}
+
 
 AVATAR_PHOTO_MAX = 8
 AVATAR_PHOTO_LONG_EDGE = 1600

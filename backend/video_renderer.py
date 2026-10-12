@@ -725,6 +725,103 @@ def _run_ffmpeg(cmd, timeout):
         raise RuntimeError(f"ffmpeg timed out after {timeout}s") from e
 
 
+# ---------------------------------------------------------------------------
+# The agent's presenting clip
+# ---------------------------------------------------------------------------
+# The Signature tier opens with the agent themselves, speaking to camera. That clip
+# is REAL FOOTAGE the agent uploads once -- not a generated avatar. Every attempt to
+# synthesise an agent into a property failed the same way: the likeness drifts within
+# two seconds, or the room has to be invented to keep the person convincing. Real
+# footage has neither problem, and it is unarguably them.
+PRESENTER_MAX_SECONDS = 12.0      # what we keep; the film uses ~5s of it
+PRESENTER_LONG_EDGE = 1280        # a phone's 4K is wasted here and costs upload time
+PRESENTER_MIN_SECONDS = 1.5       # shorter than this is a mis-tap, not a recording
+
+
+def prepare_presenter_clip(raw_bytes, workdir):
+    """Normalise an agent's uploaded clip into something the renderer can always read.
+
+    Phones produce HEVC in a .MOV at whatever resolution they feel like; some of that
+    will not decode on the render worker, and none of it should be trusted to be a
+    sensible length. So the upload is transcoded ONCE, here, rather than hoping at
+    render time: trimmed, scaled, re-encoded to H.264/AAC.
+
+    Doing it on upload rather than per render also means a bad file fails while the
+    agent is still looking at the screen, instead of silently breaking a video they
+    ordered three days later.
+
+    Returns (mp4_bytes, seconds). Raises ValueError with a sentence the agent can act
+    on -- this runs on a path where a human is waiting.
+    """
+    src = os.path.join(workdir, "presenter_in")
+    out = os.path.join(workdir, "presenter_out.mp4")
+    with open(src, "wb") as f:
+        f.write(raw_bytes)
+
+    # ffmpeg IS the validator. An earlier version probed the input first and treated a
+    # failed probe as "not a video" -- which would have rejected every upload on a
+    # worker where ffprobe was missing, while ffmpeg itself was working fine. Let the
+    # transcode decide: if it cannot read the file, it is not a file we can use.
+    try:
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-v", "error", "-i", src, "-t", "%.2f" % PRESENTER_MAX_SECONDS,
+            # Scale the LONG edge, whichever way up it was filmed, and keep both
+            # dimensions even -- H.264 refuses odd ones.
+            "-vf", ("scale='if(gt(iw,ih),min(%d,iw),-2)':'if(gt(iw,ih),-2,min(%d,ih))',"
+                    "format=yuv420p" % (PRESENTER_LONG_EDGE, PRESENTER_LONG_EDGE)),
+            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+            "-movflags", "+faststart", out,
+        ], timeout=240)
+    except RuntimeError as e:
+        logger.warning("presenter clip rejected: %s", str(e)[:300])
+        raise ValueError("That file does not look like a video we can read. "
+                         "An MP4 or MOV straight from your phone works best.")
+
+    if not os.path.exists(out) or os.path.getsize(out) < 1000:
+        raise ValueError("That file does not look like a video we can read. "
+                         "An MP4 or MOV straight from your phone works best.")
+
+    # Duration from the OUTPUT, which we know is readable. ffprobe first, then
+    # ffmpeg's own banner -- NOT a constant, because falling back to the cap would
+    # quietly disable the minimum-length check below on any worker without ffprobe.
+    seconds = _probe_duration(out, -1.0)
+    if seconds <= 0:
+        seconds = _duration_via_ffmpeg(out)
+    if not seconds or seconds <= 0:
+        # Both readers failed. Let it through at the cap rather than refuse a clip
+        # that transcoded perfectly well; the film trims to what it needs anyway.
+        logger.warning("could not determine presenter clip duration; assuming the cap")
+        seconds = PRESENTER_MAX_SECONDS
+    if seconds < PRESENTER_MIN_SECONDS:
+        raise ValueError("That clip is under two seconds. Record about fifteen seconds "
+                         "of yourself speaking to the camera.")
+
+    with open(out, "rb") as f:
+        data = f.read()
+    return data, seconds
+
+
+def _duration_via_ffmpeg(path):
+    """Duration parsed out of ffmpeg's own banner. Returns None if it cannot tell.
+
+    Exists because _probe_duration needs ffprobe, and ffprobe is a SEPARATE binary --
+    a worker can have a perfectly good ffmpeg and no ffprobe. When that happened the
+    duration silently fell back to the cap, which quietly disabled the minimum-length
+    check and let a half-second mis-tap through as if it were a recording.
+    """
+    try:
+        err = subprocess.run(["ffmpeg", "-hide_banner", "-i", path],
+                             capture_output=True, timeout=TIMEOUT_PROBE).stderr
+        m = re.search(rb"Duration: (\d+):(\d\d):(\d\d(?:\.\d+)?)", err)
+        if m:
+            h, mi, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            return h * 3600 + mi * 60 + s
+    except Exception as e:
+        logger.warning("could not read duration from ffmpeg for %s (%s)", path, e)
+    return None
+
+
 def _probe_duration(path, fallback):
     """Real duration of a rendered file. Concat and xfade both shift duration slightly
     off the arithmetic estimate, and the music fade-out has to start 4.5s before the
