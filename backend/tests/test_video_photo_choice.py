@@ -123,7 +123,12 @@ if old is not None:
     cases = 0; same = 0
     auto_forms = [{}, {"video_photos": None}, {"video_photos": ""}, {"video_photos": "auto"},
                   {"video_photos": []}, {"video_photos": ["auto"]}, {"video_photos": [""]}]
-    for n in range(0, 11):
+    # Up to the OLD cap only. Past it the auto path deliberately diverges: the cap rose
+    # from 6 to 10 on 2026-10-17, so an 8-photo listing now renders 8 shots where the
+    # baseline rendered 6. Below the old cap nothing about Auto has moved, and that is
+    # still worth proving, because it is where this feature could have broken it.
+    # The new behaviour above the old cap is pinned separately, just below.
+    for n in range(0, old.MAX_VIDEO_PHOTOS + 1):
         urls = ["https://x/%d.jpg" % i for i in range(n)]
         for pi in (-1, 0, 1, n // 2, n - 1, n, n + 3):
             for bad in ((), tuple(random.sample(urls, min(len(urls), 1 + n // 4))) if urls else ()):
@@ -135,14 +140,34 @@ if old is not None:
                         same += 1
                     else:
                         print("   MISMATCH n=%d pi=%d bad=%s form=%s\n    old=%r\n    new=%r" % (n, pi, bad, form, ref[:4], got[:4]))
-    check("%d auto-path renders identical to baseline" % cases, same == cases, "%d/%d" % (same, cases))
+    check("%d auto-path renders identical to baseline (up to the old cap)" % cases,
+          same == cases, "%d/%d" % (same, cases))
     check("harness is not vacuous (a 7-photo render really caps at 6 with hero first)",
           render(old, ["u%d" % i for i in range(7)], 3)[1].count(b"[P:") == 6)
 
+def order(r):
+    """The photo urls that actually reached a clip, in clip order."""
+    return [c[0][2:] for c in r[4]]
+
+print("\n[auto path, new] the raised cap, and smart selection falling back safely")
+# The vision call cannot run here: there is no API key and the stubbed photos are
+# strings, not images. That is the point -- this is the degraded path, and it must come
+# out as plain upload order, silently, with no degradation shown to the agent.
+for n, expected in ((7, 7), (10, 10), (12, 10), (15, 10)):
+    r = render(new, ["https://x/%d.jpg" % i for i in range(n)], 0)
+    check("%d photos -> %d shots (cap is now %d)" % (n, expected, new.MAX_VIDEO_PHOTOS),
+          r[0] == "ok" and r[1].count(b"[P:") == expected,
+          "got %d" % r[1].count(b"[P:"))
+r = render(new, ["https://x/%d.jpg" % i for i in range(12)], 3)
+check("the hero still opens a 12-photo listing", order(r)[0] == "https://x/3.jpg", str(order(r)[:2]))
+check("a failed survey is never reported to the agent as a degradation",
+      not any("photo" in d and "select" in d for d in r[2]), str(r[2]))
+r6 = render(new, ["https://x/%d.jpg" % i for i in range(6)], 0)
+check("a listing at or under MIN_VIDEO_PHOTOS does not even try to select",
+      r6[0] == "ok" and r6[1].count(b"[P:") == 6)
+
 print("\n[chosen path] full stubbed render")
 urls = ["https://x/%d.jpg" % i for i in range(8)]
-def order(r):
-    return [c[0][2:] for c in r[4]]
 r = render(new, urls, 0, video_photos=[urls[5], urls[2], urls[7]])
 check("exactly the chosen photos, in the chosen order", r[0] == "ok" and order(r) == [urls[5], urls[2], urls[7]], str(order(r)))
 check("no degradation on a clean choice", r[2] == [] or r[2] == ["the background music file is missing from the deploy"], str(r[2]))
@@ -152,8 +177,10 @@ check("photo_index is ignored when photos are chosen", order(r) == [urls[1], url
 check("captions come back for exactly the chosen photos", set(r[3]) == {urls[1], urls[0]})
 r = render(new, urls, 0, video_photos=[urls[3]])
 check("single chosen photo renders a one-photo video", r[0] == "ok" and order(r) == [urls[3]])
-r = render(new, urls, 0, video_photos=[urls[7], urls[6], urls[5], urls[4], urls[3], urls[2], urls[1], urls[0]])
-check("an oversized choice is capped at MAX_VIDEO_PHOTOS in order", order(r) == [urls[7], urls[6], urls[5], urls[4], urls[3], urls[2]])
+over = ["https://x/o%d.jpg" % i for i in range(new.MAX_VIDEO_PHOTOS + 3)]
+r = render(new, over, 0, video_photos=list(reversed(over)))
+check("an oversized choice is capped at MAX_VIDEO_PHOTOS in order",
+      order(r) == list(reversed(over))[:new.MAX_VIDEO_PHOTOS], str(len(order(r))))
 
 auto = render(new, urls, 0)
 r = render(new, urls, 0, video_photos=["https://deleted/1.jpg", "https://deleted/2.jpg"])
@@ -245,15 +272,20 @@ check("custom: payload carries the validated urls in order (index resolved)",
       p["video_photos"] == [urls[3], urls[1], urls[2]], str(p))
 check("custom: response reflects the choice",
       r["video_photos"] == [urls[3], urls[1], urls[2]] and r["video_photos_mode"] == "custom"
-      and r["video_photos_ignored"] == [] and r["max_video_photos"] == 6 and r["status"] == "rendering")
+      and r["video_photos_ignored"] == [] and r["status"] == "rendering"
+      and r["max_video_photos"] == new.MAX_VIDEO_PHOTOS)
 r, p = _run_endpoint(L, video_photos=[urls[0], "https://not-mine/z.jpg"])
 check("partial unknown: ignored, reported, the rest used",
       p["video_photos"] == [urls[0]] and r["video_photos_ignored"] == ["https://not-mine/z.jpg"])
 r, p = _run_endpoint(L, video_photos=["https://not-mine/z.jpg", "99"])
 check("nothing valid -> 400 Unknown photo, no job queued", r[0] == "HTTP" and r[1] == 400 and "Unknown photo" in r[2] and p is None)
-big = {"id": "L1", "images": ["https://x/b%d.jpg" % i for i in range(9)]}
-r, p = _run_endpoint(big, video_photos=big["images"][:7])
+# One photo past whatever the cap is, so this keeps testing the cap and not the number 6.
+over_cap = new.MAX_VIDEO_PHOTOS + 1
+big = {"id": "L1", "images": ["https://x/b%d.jpg" % i for i in range(over_cap + 2)]}
+r, p = _run_endpoint(big, video_photos=big["images"][:over_cap])
 check("more than the cap -> 400, no job queued", r[0] == "HTTP" and r[1] == 400 and p is None)
+r, p = _run_endpoint(big, video_photos=big["images"][:new.MAX_VIDEO_PHOTOS])
+check("exactly the cap is accepted", p is not None and len(p["video_photos"]) == new.MAX_VIDEO_PHOTOS)
 r, p = _run_endpoint(L, video_photos=[urls[2]], existing={"video_template_id": "classic", "video_photos": [urls[4]]})
 check("second press while one is in flight reports the render actually running",
       r["video_photos"] == [urls[4]] and r["requested_video_photos"] == [urls[2]] and r["already_in_flight"] is True)

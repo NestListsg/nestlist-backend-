@@ -96,13 +96,57 @@ STYLE_A_ID = "driftcut"
 # transition length that isn't a whole number of frames cannot be cut cleanly.
 XFADE_SECONDS = 1.25
 XFADE_FRAMES = int(XFADE_SECONDS * FPS)  # 30
-# The zoom here is deliberately far gentler than style A's 1.13. It magnifies the
-# WHOLE composite, so every extra percent crops a little off the edges of a photo
-# whose entire point is being shown whole. At 1.06 the photo is complete at one end
-# of every clip and loses 3% a side at the other -- motion without visibly eating
-# the picture.
-CONTAIN_ZOOM_MAX = 1.06
+# --- the house move: a zoom combined with a horizontal drift ---
+# This replaces the 1.06 centred zoom the Classic shipped with until 2026-10-17. Jane
+# watched competitors' property videos and ours read as entry-level next to them; the
+# cause was specific, a 6% push from a fixed centre is barely motion at all. She
+# approved the bolder look on a prototype and asked for the horizontal drift over the
+# prototype's vertical tilts ("make the whole video like that").
+#
+# THE RULE THIS OBEYS: the camera moves across a real photograph. Nothing is
+# generated, interpolated or invented -- every frame is a crop of pixels the agent
+# actually uploaded, scaled. That is why this is allowed where an AI camera move is
+# not (closed September 2026).
+#
+# Geometry. zoompan's window is iw/zoom wide, so the spare width it can slide across
+# is iw*(1-1/zoom) -- zero at zoom 1.0 and growing as the shot pushes in. The drift is
+# expressed as a FRACTION of that spare (0 = hard left, 1 = hard right), which means:
+#   * nothing can ever drift past the edge of the composite, at any zoom, by
+#     construction rather than by a clamp that has to be got right;
+#   * the end of the clip that sits at zoom 1.0 still shows the photo WHOLE, which is
+#     the property the 1.06 comment prized and the reason the contain style exists;
+#   * the move accelerates out of the dissolve instead of starting at full speed.
+#
+# 1.20 is the value Jane approved on the prototype, and it is kept deliberately rather
+# than re-tuned. MEASURED, because the obvious question is whether more would be
+# better, and the answer is that the dial is nearly free on size but not free on the
+# picture:
+#
+#     zoom   pan of frame centre   % of width   crop window -> 1080 wide   10-photo film
+#     1.06        61px                2.83%         1.89x downsample        (the old look)
+#     1.20       180px                8.33%         1.67x downsample          26.2MB
+#     1.22       195px                9.02%         1.64x downsample          26.4MB
+#     1.26       223px               10.32%         1.59x downsample          26.6MB
+#
+# So raising it buys drift for almost no bits -- but at the far end of the move the
+# window sits against one edge, and at 1.20 that already leaves 17% of the photo's
+# width off-frame on the other side (20% at 1.26). That, not file size and not
+# sharpness, is the thing being spent, and it is spent on a style whose whole premise
+# is showing the photo whole. Jane signed off 1.20 having watched it; moving it without
+# her watching again would be trading her judgement for mine.
+#
+# SHARPNESS IS NOT THE LIMIT at any of these: at 1.20 the crop window is still
+# 1800x3200 feeding a 1080x1920 output, i.e. downsampling 1.67x, so the frame cannot go
+# soft from the zoom itself. What a strong zoom DOES expose is a weak SOURCE, which is
+# why _fetch_listing_photo prefers the 4x upscaled twin -- that is the headroom this
+# setting spends.
+CONTAIN_ZOOM_MAX = 1.20
 CONTAIN_ZOOM_STEP = round((CONTAIN_ZOOM_MAX - 1.0) / FRAMES_PER_PHOTO, 6)
+# How much of the available spare width a shot actually travels. 1.0 means it runs
+# from one edge of the spare to the other. Kept as a constant rather than inlined
+# because it is the one dial that trades drift against how much of the photo's side
+# is off-frame at the far end of the move.
+CONTAIN_DRIFT_SPAN = 1.0
 # Backdrop tuning. The first cut used radius 28 at quarter scale (~112px at full
 # resolution) plus 42% black, which turned every bright interior into the same flat
 # grey -- the backdrop stopped reading as the photo at all. A moderate blur with only
@@ -137,7 +181,30 @@ RAW_TRACK_LRA = 11
 # all), so the same CPU budget comfortably covers the 6 shots the prototype was
 # validated at. Still deliberately well below the listing's 15-photo upload cap
 # (MAX_LISTING_PHOTOS in main.py), which has no per-photo rendering cost.
-MAX_VIDEO_PHOTOS = 6
+#
+# Raised 6 -> 10 on 2026-10-17. The 6 was a leftover from the re-encode cascade above
+# and had stopped paying for itself: with the stream-copy concat each extra photo is
+# one more sequential clip encode and nothing else. MEASURED here, real ffmpeg, the
+# same fifteen 3200x1800 sources, Classic with music and contact card:
+#     6 photos  -> 11.1s render, 30.0s of video
+#    10 photos  -> 18.0s render, 45.3s of video      (~1.7s per extra photo)
+# That is the same ~2s-per-photo slope Jane measured on the demo listing. A ten-photo
+# Classic therefore still finishes inside RENDER_BUDGET_SECONDS with the whole budget
+# to spare, and the budget check in the clip loop remains the real backstop. File size
+# is the constraint that actually moves (see DELIVERY_CRF).
+MAX_VIDEO_PHOTOS = 10
+
+# A Classic that drops below this many shots is too short to be worth posting -- six
+# was the shipped length, so it is the floor the smart selection is allowed to reach
+# before it starts accepting a second photo of a space it has already shown. See
+# _smart_auto_selection.
+MIN_VIDEO_PHOTOS = 6
+
+# How many of a listing's photos the selection pass will look at. MAX_LISTING_PHOTOS
+# in main.py is 15, so this is "all of them" -- stated as its own constant because it
+# sets the cost and the latency of the vision call, which is the thing to think about
+# if the upload cap ever rises.
+MAX_SELECTION_CANDIDATES = 15
 
 # Ceiling on renders running at once *in this worker process*. Railway runs 4 uvicorn
 # workers, so the fleet ceiling is 4x this. Renders are background jobs, so waiting is
@@ -304,9 +371,11 @@ def _clarity_filter():
                 _clarity_filter_cache = ""
         return _clarity_filter_cache
 
-# Delivery quality. SETTLED AT 22 -- measured on real style B output, not inferred.
-# The banding question below has now been asked three times; the answer is in the table,
-# please do not re-litigate it from first principles a fourth time.
+# Delivery quality. SETTLED AT 24 (was 22) -- measured on real style B output, not
+# inferred. The banding question below has now been asked three times; the answer is in
+# the table, please do not re-litigate it from first principles a fourth time. The 22
+# -> 24 move at the bottom of this comment is a SEPARATE measurement on different
+# footage, not a reopening of the banding question.
 #
 # The worry was legitimate: _contain_over_blur puts a large smooth darkened field behind
 # every photo, and a big flat dark gradient in every frame is the textbook 8-bit banding
@@ -351,7 +420,52 @@ def _clarity_filter():
 # findings are conservative and do transfer; the sizes do not. Expect roughly 11-13MB at
 # 22, and check the contact card too, not just the backdrop -- it is a second large flat
 # field and it carries fine serif type and a phone number that have to stay legible.
-DELIVERY_CRF = "22"
+#
+# ---------------------------------------------------------------------------
+# 2026-10-17: RE-MEASURED ON DIRECT RENDERS, AND MOVED 22 -> 24.
+#
+# This is not the banding question being reopened. The FOOTAGE changed underneath the
+# setting, so the old number no longer describes the same signal: the shots now
+# actually move (the zoom had been silently dead for the whole life of style B -- see
+# _contain_clip) and a film is now up to 10 photos instead of 6. Real motion means
+# almost no two frames are alike, which is exactly the redundancy an inter-frame codec
+# was living on before.
+#
+# Direct single-pass renders, same ten 3200x1800 sources, real ffmpeg, 45.3s of video.
+# This also answers the "STILL TO CONFIRM" note above: these are not re-encodes.
+# VMAF is measured over a clean 30s window (six shots, no contact card) against a
+# CRF 14 reference of the SAME footage, so it reads as "what the encoder threw away"
+# rather than as a comparison between two different videos. The last column is Jane's
+# own 50 agents x 10 listings:
+#
+#     CRF    size    VMAF    vs 22    500 videos
+#      22   35.5MB   94.82       0%      17.4GB
+#      24   26.2MB   93.18     -26%      12.8GB     <-- chosen
+#      25   22.7MB   92.23     -36%      11.1GB
+#      26   19.7MB   91.18     -45%       9.6GB
+#      28   15.0MB   88.64     -58%       7.3GB
+#
+# For scale, same sources throughout: the film this replaces (6 photos, no working
+# zoom) measured 15.6MB at CRF 22, and the same 10 photos WITHOUT the motion fix
+# measured 25.2MB. The motion costs the bits, not the extra photos.
+#
+# Why 24 and not 22: a 26% saving for 1.7 VMAF points, and 93+ is the usual line for
+# "a viewer cannot tell on a phone". Why not further: at 2x magnification on a
+# high-frequency crop (foliage, a perforated screen), 24 and 25 are hard to separate
+# from the CRF 14 reference, but at 26 the foliage visibly flattens and at 28 it is
+# plainly mushy. 24 also lands storage at 12.8GB, which is the ~14GB Jane already
+# expected this change to cost.
+#
+# CHECKED, because the comment above asks for it: both large flat fields are fine at
+# every setting tested. The blurred backdrop shows no banding at 22, 24, 25, 26 or even
+# 28, and the contact card -- fine serif name, italic invitation, gold phone number --
+# is indistinguishable from 22 all the way to 28. Both are near-static, so the encoder
+# spends almost nothing keeping them clean. Neither is the constraint any more; the
+# moving photograph is.
+#
+# IF STORAGE EVER GETS TIGHT: 25 is the next step and costs about one VMAF point.
+# ---------------------------------------------------------------------------
+DELIVERY_CRF = "24"
 
 # Identical encoder settings on every clip, so the final concat can be a stream copy
 # (no re-encode) without mismatched stream parameters.
@@ -1084,9 +1198,18 @@ def _prepare_frame(img, centering=(0.5, 0.42)):
 
 def _contain_over_blur(img):
     """STYLE B frame: the whole photo, centred over a blurred, darkened copy of
-    itself. Nothing is cropped out of the foreground -- the sides a 9:16 cover-crop
+    itself. Returns (composite, foreground_fills_width).
+
+    Nothing is cropped out of the foreground -- the sides a 9:16 cover-crop
     would lose are all still there, and the backdrop fills the frame so there are no
     bars.
+
+    The second return value tells the clip builder whether the sharp photo reaches
+    both edges of the composite. It normally does; it does not for a source TALLER
+    than 9:16, which is bounded by height and leaves blurred margins at the sides.
+    Drifting such a frame sideways would slide the sharp photo off-centre inside its
+    own margins, which reads as a layout mistake rather than a camera move, so those
+    shots keep the centred zoom.
 
     The blur is done at thumbnail size and then scaled up, not applied at full
     resolution. A 28px Gaussian over a 2160x3840 canvas is enormously expensive and
@@ -1114,7 +1237,7 @@ def _contain_over_blur(img):
         fg_w = max(1, round(h * src_w / src_h))
     foreground = img.resize((fg_w, fg_h), Image.LANCZOS)
     background.paste(foreground, ((w - fg_w) // 2, (h - fg_h) // 2))
-    return background
+    return background, fg_w >= w
 
 
 # ---------------------------------------------------------------------------
@@ -1216,6 +1339,90 @@ def _caption_is_safe(caption):
     return True, ""
 
 
+def _anthropic_keys():
+    """The keys to try, in order. Empty means the feature is off, not broken."""
+    return [k for k in (os.environ.get("ANTHROPIC_API_KEY", ""),
+                        os.environ.get("ANTHROPIC_API_KEY_BACKUP", "")) if k]
+
+
+def _photo_content(photos, prompt):
+    """The message body for a batched vision call, or None if there is no key to send
+    it with. Numbered so the model's "n" refers to a photo we can identify."""
+    if not _anthropic_keys():
+        return None
+    content = []
+    for i, photo in enumerate(photos):
+        content.append({"type": "text", "text": f"Photo {i + 1}:"})
+        content.append(_photo_to_block(photo))
+    content.append({"type": "text", "text": prompt})
+    return content
+
+
+def _vision_call(content, timeout, max_tokens=1024, budget=None):
+    """One batched vision call -> (raw text, last error). Never raises.
+
+    Shared by the caption pass and the survey pass so there is one place that knows
+    about keys, timeouts and retry policy.
+
+    `budget`, when set, is a wall-clock ceiling in seconds for the WHOLE attempt
+    sequence: once it is spent we stop rather than start another key. Without it, two
+    keys x (timeout + one SDK retry) can burn four minutes against a degraded API
+    before the caller gets to fall back.
+    """
+    started = time.monotonic()
+    raw = None
+    last_error = None
+    for key in _anthropic_keys():
+        if budget is not None and time.monotonic() - started > budget:
+            logger.warning("vision call: budget of %ss spent, not trying another key", budget)
+            break
+        try:
+            import anthropic
+            # max_retries=1: the render already has a wall-clock budget, and the SDK's
+            # default of 2 retries on top of the timeout can burn three minutes on a
+            # degraded API before we fall back.
+            client = anthropic.Anthropic(api_key=key, timeout=timeout, max_retries=1)
+            response = client.messages.create(
+                model=CAPTION_MODEL,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": content}],
+            )
+            raw = "".join(b.text for b in response.content if getattr(b, "type", "") == "text")
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    return raw, last_error
+
+
+def _clean_caption(value, copy_guard, index=0):
+    """One model-written caption -> a caption safe to burn into a video, or None.
+
+    Pulled out of _generate_room_captions so the survey pass (which writes captions in
+    the same call that classifies the rooms) goes through EXACTLY these guards rather
+    than a second copy of them that can drift.
+    """
+    try:
+        text = str(value).strip().lower()
+    except Exception:
+        return None
+    text = re.sub(r"\s*\.\.\.\s*", CAPTION_SEPARATOR, text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    if copy_guard:
+        # The same guard every other copy surface runs through (house/unit numbers,
+        # price leaks). It never raises and never returns empty.
+        try:
+            text = (copy_guard(text, context="video-caption") or "").strip().lower()
+        except Exception as e:
+            logger.warning("caption copy guard failed (%s); dropping caption", e)
+            return None
+    ok, reason = _caption_is_safe(text)
+    if not ok:
+        logger.warning("caption %d rejected (%s): %r", index + 1, reason, text)
+        return None
+    return text
+
+
 def _generate_room_captions(photos, copy_guard=None):
     """One batched vision call for the whole video: all photos in, one caption each
     out. Returns a list the same length as `photos`, with None wherever no safe caption
@@ -1224,40 +1431,12 @@ def _generate_room_captions(photos, copy_guard=None):
     Batching matters for more than cost: it is one network dependency and one timeout
     for the whole render, instead of one per photo, and it lets the model see the
     property as a set so it does not caption three different rooms "the living hall"."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    backup_key = os.environ.get("ANTHROPIC_API_KEY_BACKUP", "")
-    if not api_key and not backup_key:
+    content = _photo_content(photos, _CAPTION_PROMPT.format(n=len(photos)))
+    if content is None:
         logger.warning("captions skipped: no Anthropic API key configured")
         return [None] * len(photos), "no API key"
 
-    content = []
-    for i, photo in enumerate(photos):
-        content.append({"type": "text", "text": f"Photo {i + 1}:"})
-        content.append(_photo_to_block(photo))
-    content.append({"type": "text", "text": _CAPTION_PROMPT.format(n=len(photos))})
-
-    raw = None
-    last_error = None
-    for key in [k for k in (api_key, backup_key) if k]:
-        try:
-            import anthropic
-            # max_retries=1: the render already has a wall-clock budget, and the SDK's
-            # default of 2 retries on top of a 60s timeout can burn three minutes on a
-            # degraded API before we fall back to no captions.
-            client = anthropic.Anthropic(
-                api_key=key, timeout=CAPTION_TIMEOUT_SECONDS, max_retries=1
-            )
-            response = client.messages.create(
-                model=CAPTION_MODEL,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": content}],
-            )
-            raw = "".join(b.text for b in response.content if getattr(b, "type", "") == "text")
-            break
-        except Exception as e:
-            last_error = e
-            continue
-
+    raw, last_error = _vision_call(content, CAPTION_TIMEOUT_SECONDS)
     if raw is None:
         logger.warning("captions skipped: Claude call failed (%s)", last_error)
         return [None] * len(photos), f"AI call failed ({type(last_error).__name__})"
@@ -1275,27 +1454,14 @@ def _generate_room_captions(photos, copy_guard=None):
     for entry in entries:
         try:
             index = int(entry["n"]) - 1
-            text = str(entry["caption"]).strip().lower()
         except Exception:
             dropped += 1
             continue
         if not 0 <= index < len(photos):
             dropped += 1
             continue
-        text = re.sub(r"\s*\.\.\.\s*", CAPTION_SEPARATOR, text)
-        text = re.sub(r"\s+", " ", text).strip(" .")
-        if copy_guard:
-            # The same guard every other copy surface runs through (house/unit numbers,
-            # price leaks). It never raises and never returns empty.
-            try:
-                text = (copy_guard(text, context="video-caption") or "").strip().lower()
-            except Exception as e:
-                logger.warning("caption copy guard failed (%s); dropping caption", e)
-                dropped += 1
-                continue
-        ok, reason = _caption_is_safe(text)
-        if not ok:
-            logger.warning("caption %d rejected (%s): %r", index + 1, reason, text)
+        text = _clean_caption(entry.get("caption"), copy_guard, index)
+        if text is None:
             dropped += 1
             continue
         captions[index] = text
@@ -1306,6 +1472,310 @@ def _generate_room_captions(photos, copy_guard=None):
     if all(c is None for c in captions):
         note = "every caption was rejected"
     return captions, note
+
+
+# ---------------------------------------------------------------------------
+# Smart photo selection (the same batched call that writes the captions)
+# ---------------------------------------------------------------------------
+# What this fixes: _auto_selection is "hero photo, then everything else in upload
+# order, truncate". It has no idea what is in any photo, so on the demo listing it put
+# TWO SWIMMING POOL SHOTS in and left the dining room out. A film that shows the same
+# space twice while missing a room the buyer cares about is the single most visible
+# quality problem the Classic had after the motion.
+#
+# The fix reuses a capability we already paid for. Captions already require a batched
+# vision call that works out what each room is; selection needs exactly the same
+# knowledge. So rather than add a second call, the AUTO path makes ONE call over all of
+# the listing's photos that returns a space label AND a caption for each, picks a
+# varied set from the labels, and keeps the captions it already has. The caption-only
+# path (_generate_room_captions) is untouched and still serves the agent's explicit
+# pick, where there is nothing to select.
+#
+# WHAT IT COSTS, measured on the real prompts and real 768px thumbnails (the vision
+# token estimate is width*height/750, and _photo_to_block sends 768x432 for a 16:9
+# listing photo), at claude-sonnet-4-5 prices:
+#
+#     today, captions only, 6 photos      3409 in +  310 out   $0.0149/video
+#     survey, 7-photo listing             4052 in +  355 out   $0.0175/video
+#     survey, 10-photo listing            5380 in +  490 out   $0.0235/video
+#     survey, full 15-photo listing       7592 in +  715 out   $0.0335/video
+#
+# So the worst case is 2.3x today's cost, and Jane's 50 agents x 10 listings goes from
+# about $7.44 to about $16.75 in total. The request itself grows from 0.4MB to 1.1MB.
+# This is cheap because it is ONE call that does BOTH jobs -- classifying every photo
+# and writing the captions for the ones it keeps. Two separate calls would have cost
+# more and, worse, doubled the number of things that have to be up for a render to go
+# at full quality. The explicit-pick path still makes the old caption-only call.
+#
+# The vocabulary is fixed rather than free text. "living hall" and "living room" are
+# the same space and must dedupe, which they cannot do reliably as free strings.
+# SPACE_UNKNOWN is deliberately never deduped: if the model cannot tell what a space
+# is, two of them are not evidence of repetition.
+SPACE_UNKNOWN = "other"
+_SPACE_VOCABULARY = (
+    "living", "dining", "kitchen", "bedroom", "bathroom", "study", "balcony",
+    "terrace", "garden", "pool", "gym", "view", "entrance", "stairs", "carpark",
+    "exterior", SPACE_UNKNOWN,
+)
+
+# Built from _CAPTION_PROMPT rather than written out again, so the caption RULES have
+# exactly one home. If someone tightens the no-superlatives rule or the "never name a
+# room you cannot see" rule, both passes get it; a second copy would drift, and the
+# rule that matters most here is the one about not claiming a room that isn't there.
+_SURVEY_PROMPT = _CAPTION_PROMPT.split("Reply with JSON only")[0] + """Also label each
+photo with the kind of space it shows, chosen from exactly this list:
+
+    """ + ", ".join(_SPACE_VOCABULARY) + """
+
+The label is used to pick a varied set of photos for the video, so it matters that two
+photos of the same space get the SAME label and two photos of different spaces get
+DIFFERENT ones. Apply the same honesty rule as the caption: the label must be
+something you can actually see evidence for. Use "{unknown}" whenever you are not
+sure -- an honest "{unknown}" is always better than a guess, because a wrong label
+drops a photo the agent wanted or keeps one they did not.
+
+Reply with JSON only, no other text, in exactly this shape:
+{{"photos": [{{"n": 1, "space": "...", "caption": "..."}}, {{"n": 2, "space": "...", "caption": "..."}}]}}
+with one entry per photo, in order, for all {n} photos.""".replace(
+    "{unknown}", SPACE_UNKNOWN)
+
+# Longer than CAPTION_TIMEOUT_SECONDS because this call carries up to 15 photos rather
+# than 6. The budget is the ceiling on the WHOLE pass including a second key, and it is
+# the number that matters: past it we stop and use upload order, which is a perfectly
+# good video. Selection is never worth making an agent wait.
+SURVEY_TIMEOUT_SECONDS = 75
+SURVEY_BUDGET_SECONDS = 100
+# Wall-clock ceiling on downloading the candidates to look at them. These are the
+# ORIGINAL photos (not the 4x upscaled twins), so they are small, but a slow CDN must
+# not be able to stall a render on a step that is only an optimisation.
+SURVEY_FETCH_BUDGET_SECONDS = 45
+# Below this many readable candidates there is nothing to choose BETWEEN, so the call
+# is not worth making.
+SURVEY_MIN_CANDIDATES = 3
+# Must match _photo_to_block's own max_side: the candidates are shrunk to this as soon
+# as they are downloaded so that fifteen decoded listing photos never sit in memory at
+# once, and _photo_to_block then has nothing left to do.
+SURVEY_THUMB_PX = 768
+
+
+def _normalise_space(value):
+    """A model-written label -> one of _SPACE_VOCABULARY. Anything unrecognised becomes
+    SPACE_UNKNOWN, which never dedupes, so a bad label can only cost variety -- it can
+    never silently drop a photo as a duplicate of something it is not."""
+    try:
+        text = str(value).strip().lower()
+    except Exception:
+        return SPACE_UNKNOWN
+    if text in _SPACE_VOCABULARY:
+        return text
+    # "living hall", "master bedroom", "swimming pool" -- the vocabulary word is in
+    # there somewhere. Checked longest-first so "bathroom" never matches as "bath".
+    for word in sorted(_SPACE_VOCABULARY, key=len, reverse=True):
+        if word != SPACE_UNKNOWN and word in text:
+            return word
+    return SPACE_UNKNOWN
+
+
+def _survey_photos(photos, copy_guard=None):
+    """One batched vision call: (list of (space, caption), note). Never raises.
+
+    The list is always len(photos) long. A (SPACE_UNKNOWN, None) entry means the model
+    said nothing usable about that photo; it stays eligible for the film.
+    """
+    blank = [(SPACE_UNKNOWN, None)] * len(photos)
+    content = _photo_content(photos, _SURVEY_PROMPT.format(n=len(photos)))
+    if content is None:
+        logger.warning("photo survey skipped: no Anthropic API key configured")
+        return blank, "no API key"
+
+    # max_tokens scales with the photo count: 15 entries of space + caption do not fit
+    # in the 1024 the six-photo caption call was sized for, and a reply truncated
+    # mid-JSON parses as nothing at all.
+    raw, last_error = _vision_call(
+        content, SURVEY_TIMEOUT_SECONDS,
+        max_tokens=256 + 110 * len(photos), budget=SURVEY_BUDGET_SECONDS)
+    if raw is None:
+        logger.warning("photo survey skipped: Claude call failed (%s)", last_error)
+        return blank, f"AI call failed ({type(last_error).__name__})"
+
+    try:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        parsed = json.loads(match.group(0) if match else raw)
+        entries = parsed["photos"]
+    except Exception as e:
+        logger.warning("photo survey skipped: could not parse model reply (%s)", e)
+        return blank, "AI reply unparseable"
+
+    out = list(blank)
+    dropped = 0
+    for entry in entries:
+        try:
+            index = int(entry["n"]) - 1
+        except Exception:
+            dropped += 1
+            continue
+        if not 0 <= index < len(photos):
+            dropped += 1
+            continue
+        caption = _clean_caption(entry.get("caption"), copy_guard, index)
+        if caption is None:
+            dropped += 1
+        out[index] = (_normalise_space(entry.get("space")), caption)
+
+    note = None
+    if dropped:
+        note = f"{dropped} caption(s) rejected by the copy guards"
+    if all(c is None for _space, c in out):
+        note = "every caption was rejected"
+    return out, note
+
+
+def _varied_order(spaces, limit, minimum):
+    """Indices of a varied set of photos, hero (index 0) first and always kept.
+
+    `spaces` is in the order the photos should be considered -- hero first, then the
+    listing's own order. Returns indices INTO that list.
+
+    One photo per distinct space, in the agent's own order, which is the rule Jane
+    asked for. The one place it yields is at the bottom: if being strict would leave a
+    film SHORTER than `minimum` (today's six shots), the spaces already shown are
+    opened up again until it is long enough. That is deliberate -- a listing whose
+    photos only cover three spaces would otherwise drop from a 30-second film to a
+    15-second one, which is a worse product than a second angle on the living room,
+    and it means this change can never make a video shorter than the one it replaces.
+
+    The top-up goes round the spaces in turn -- every space's second photo before any
+    space's third -- rather than straight down the list. Taking them in list order
+    re-creates the exact bug this function exists to fix: a listing with four living
+    room shots first would spend its whole top-up on the living room and still never
+    reach the kitchen.
+    """
+    chosen, seen, held_back = [], set(), []
+    for i, space in enumerate(spaces):
+        if len(chosen) >= limit:
+            held_back.extend(range(i, len(spaces)))
+            break
+        # The hero is never judged against the rule: it is the agent's own pick of the
+        # photo that opens the film (My Listings' star picker) and it always leads.
+        if i == 0:
+            chosen.append(i)
+            seen.add(space)
+            continue
+        if space != SPACE_UNKNOWN and space in seen:
+            held_back.append(i)
+            continue
+        chosen.append(i)
+        seen.add(space)
+
+    # Round-robin the leftovers by space, keeping each space's own photos in order.
+    by_space = {}
+    for i in held_back:
+        by_space.setdefault(spaces[i], []).append(i)
+    target = min(limit, minimum)
+    while len(chosen) < target and by_space:
+        for space in list(by_space):
+            if len(chosen) >= target:
+                break
+            chosen.append(by_space[space].pop(0))
+            if not by_space[space]:
+                del by_space[space]
+    # Back into the agent's own order, with the hero still leading. Agents order their
+    # photos as a walkthrough, and a film that jumps around that order reads as
+    # shuffled even when every individual photo is a good choice.
+    return [0] + sorted(i for i in chosen if i != 0)
+
+
+def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
+    """The AUTO path's photo choice: (selected urls, {url: caption}) or (None, None).
+
+    (None, None) means "use the plain upload-order selection" and is the answer
+    whenever anything at all goes wrong -- no key, a slow or failed model call, a
+    reply that does not parse, too few readable photos, an unexpected exception. THAT
+    IS THE WHOLE DESIGN: a worse-chosen video is a small loss, a failed render is a
+    large one, and this feature is never allowed to turn the second into the first.
+    Nothing here is reported to the agent as a degradation, because from their side
+    nothing degraded -- they get the video the old code would have given them.
+
+    Only ever called for AUTO. An agent who picked their own photos has already said
+    what they want, and choose_video_photos decides that case before this runs.
+
+    DELIBERATELY OUTSIDE THE RENDER SLOT. This runs before _RENDER_SLOTS.acquire, so a
+    model call that takes a minute does not sit on one of the four ffmpeg slots the
+    whole fleet has. What bounds the concurrency here instead is video_jobs, which
+    admits at most PER_PROCESS_RENDER_LIMIT Classic jobs per worker, so the number of
+    surveys in flight is already capped before this function is reached. The job's
+    heartbeat runs on its own thread for the whole job, so the extra latency cannot
+    make a claim look stale (STALE_AFTER_SECONDS) and trigger a second render.
+    """
+    try:
+        hero = image_urls[photo_index]
+        candidates = ([hero] + [u for i, u in enumerate(image_urls) if i != photo_index]
+                      )[:MAX_SELECTION_CANDIDATES]
+        if len(candidates) <= MIN_VIDEO_PHOTOS:
+            # Every photo is going in anyway, so there is nothing to choose and no
+            # reason to spend a vision call working that out. The captions still get
+            # written by the normal caption pass downstream.
+            return None, None
+
+        started = time.monotonic()
+        photos, urls = [], []
+        for url in candidates:
+            if time.monotonic() - started > SURVEY_FETCH_BUDGET_SECONDS:
+                logger.warning("photo survey: fetch budget spent after %d of %d photos",
+                               len(urls), len(candidates))
+                break
+            try:
+                # The ORIGINAL, not the 4x upscaled twin _fetch_listing_photo prefers:
+                # this image is only ever thumbnailed down to 768px to be looked at, so
+                # the big one would be bytes and memory spent for nothing. attempts=1
+                # because a flaky read on a candidate should cost that candidate, not
+                # the render's time budget.
+                img = _fetch_image(url, attempts=1)
+            except Exception as e:
+                logger.debug("photo survey: skipping unreadable candidate (%s)", e)
+                continue
+            try:
+                # Thumbnail now and drop the full image immediately: holding 15
+                # decoded listing photos would be hundreds of MB on an instance that
+                # also has to run ffmpeg. _photo_to_block downstream thumbnails to the
+                # same 768px, so this costs nothing and bounds the memory here.
+                small = img.convert("RGB").copy()
+                small.thumbnail((SURVEY_THUMB_PX, SURVEY_THUMB_PX), Image.LANCZOS)
+                photos.append(small)
+            finally:
+                img.close()
+            urls.append(url)
+
+        if hero not in urls or len(urls) < SURVEY_MIN_CANDIDATES:
+            # Without the hero this cannot honour "the agent's star photo opens the
+            # film", and with two or three candidates there is nothing to choose.
+            logger.info("photo survey: not enough readable candidates (%d); using "
+                        "upload order", len(urls))
+            return None, None
+
+        survey, _note = _survey_photos(photos, copy_guard)
+        spaces = [s for s, _c in survey]
+        if all(s == SPACE_UNKNOWN for s in spaces):
+            # The call came back but told us nothing we can select on. Upload order is
+            # a better answer than a set chosen from labels we do not believe.
+            logger.info("photo survey: no usable room labels; using upload order")
+            return None, None
+
+        # urls[0] is the hero: the candidate list was built with it first, and the
+        # fetch loop keeps `urls` and `photos` in step, so index 0 survives a skip.
+        picked = _varied_order(spaces, MAX_VIDEO_PHOTOS, MIN_VIDEO_PHOTOS)
+        selected = [urls[i] for i in picked]
+        # Keyed by URL, not by position. The render re-fetches these photos (at hires)
+        # and may drop one it cannot read, which shifts every position after it -- a
+        # caption on the wrong photo is a caption that lies about the property.
+        captions = {urls[i]: survey[i][1] for i in picked if survey[i][1]}
+        logger.info("photo survey: chose %d of %d photos covering %d distinct spaces",
+                    len(selected), len(urls),
+                    len({spaces[i] for i in picked if spaces[i] != SPACE_UNKNOWN}))
+        return selected, captions
+    except Exception as e:
+        logger.warning("photo survey failed (%s); using upload order", e)
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -1474,26 +1944,72 @@ def _presenter_opening_clip(src_path, out_path, timeout=TIMEOUT_CLIP):
 
 
 def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=None,
-                  zoom_in=True, first=True, last=True):
-    """STYLE B: one photo -> one 5s contain-over-blur clip with a gentle zoom.
+                  zoom_in=True, drift_right=True, first=True, last=True):
+    """STYLE B: one photo -> one 5s contain-over-blur clip that pushes in (or pulls
+    out) while drifting sideways across the photo.
 
     Every clip, the first included, opens fully composed -- sharp photo already in
     place over its backdrop. Jane rejected the earlier fade-up-over-backdrop opening
     ("i don't want the video to open with a blur screen"): the video starts cold on
     slide one.
+
+    zoom_in / drift_right are alternated by the caller so a ten-shot film has rhythm
+    instead of ten copies of one effect. Both senses belong to the SAME family of move
+    -- a zoom plus a lateral drift -- which is what makes the sequence read as one
+    camera rather than a bag of tricks.
     """
-    composite = _contain_over_blur(photo)
+    composite, fills_width = _contain_over_blur(photo)
     comp_path = os.path.join(workdir, f"b_comp_{index:02d}.bmp")
     composite.save(comp_path, format="BMP")
 
+    # THE ZOOM IS WRITTEN AS A FUNCTION OF THE FRAME NUMBER, NOT AS A FEEDBACK LOOP.
+    # This matters, and it is why the Classic looked static before 2026-10-17.
+    #
+    # The idiom this replaces -- z='min(zoom+step,max)' -- reads zoompan's `zoom`
+    # variable, which holds the zoom of the PREVIOUS OUTPUT FRAME OF THE SAME INPUT
+    # FRAME. With d=1 every input frame produces exactly one output frame, so there is
+    # no previous output frame to read and `zoom` resets to 1.0 every time: the
+    # expression evaluates to 1+step on all 120 frames and the shot never moves. The
+    # d=120 form in _kenburns_clip does accumulate, which is why style A moved and the
+    # style B that actually ships did not. MEASURED on a ruler frame, shipped
+    # expression, frames 0 / 59 / 119: the crop window was 2158px wide at all three.
+    # Nobody saw it because a 6% zoom that fails is indistinguishable from a 6% zoom.
+    #
+    # `on` is the output frame index and does count 0..FRAMES_PER_PHOTO-1 correctly, so
+    # a linear ramp over it is both frame-exact and immune to the trap above.
+    amplitude = round(CONTAIN_ZOOM_MAX - 1.0, 6)
+    span = FRAMES_PER_PHOTO - 1
     if zoom_in:
-        z = f"min(zoom+{CONTAIN_ZOOM_STEP},{CONTAIN_ZOOM_MAX})"
+        z = f"1+{amplitude}*on/{span}"
     else:
-        z = f"if(lte(zoom,1.0),{CONTAIN_ZOOM_MAX},max(zoom-{CONTAIN_ZOOM_STEP},1.0))"
+        z = f"{CONTAIN_ZOOM_MAX}-{amplitude}*on/{span}"
+    # The horizontal drift. `on` is the output frame index (0..FRAMES_PER_PHOTO-1), so
+    # `p` ramps linearly from 0 to 1 across the clip (or 1 to 0 drifting the other way)
+    # and is multiplied by whatever spare width the CURRENT zoom leaves:
+    #
+    #     x = p * (iw - iw/zoom)        p in [0,1]
+    #
+    # p=0 puts the window hard against the left of the composite, p=1 hard against the
+    # right, and at zoom 1.0 the spare is zero so x collapses to 0 -- the whole photo,
+    # centred, with no special case needed. Nothing can leave the composite at any
+    # zoom, so there is no clamp to get wrong and no black edge to guard against.
+    #
+    # A source taller than 9:16 does not reach the sides of its own composite
+    # (_contain_over_blur says so), and sliding it inside its blurred margins looks
+    # like a mistake, so those shots keep the centred zoom they had.
+    if fills_width and CONTAIN_DRIFT_SPAN > 0:
+        ramp = f"on/{span}" if drift_right else f"(1-on/{span})"
+        # `zoom` IS safe to read here: inside x/y it is the zoom already computed for
+        # THIS frame, not a previous-frame feedback value. Verified on a ruler frame --
+        # at frame 119 the window lands at composite x=389.5 with the band at
+        # composite 420 appearing at output x=20, which is the drift to the pixel.
+        x = f"{CONTAIN_DRIFT_SPAN}*{ramp}*(iw-iw/zoom)"
+    else:
+        x = "iw/2-(iw/zoom/2)"
     # d=1 (one output frame per input frame): the looped still arrives as a frame
     # stream, so the zoom accumulates per frame rather than inside one d=120 hold.
     zoompan = (f"zoompan=z='{z}':d=1:s={VW}x{VH}:fps={FPS}"
-               f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'")
+               f":x='{x}':y='ih/2-(ih/zoom/2)'")
     # The caption lives only inside the part of the clip that is NOT shared with a
     # neighbouring clip. Consecutive clips overlap for the length of the dissolve, so a
     # caption drawn across that region cross-fades through the next one and renders as
@@ -1873,11 +2389,28 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
 
     degradations = []
     # The agent's own pick, when there is one and it still holds. Everything else
-    # (Auto, blank, a stale pick) takes the unchanged automatic selection below.
+    # (Auto, blank, a stale pick) takes the automatic selection below.
+    #
+    # PRECEDENCE IS UNCHANGED BY THE SMART SELECTION: an explicit pick wins outright
+    # and is never second-guessed by a model. choose_video_photos still decides first,
+    # exactly as it did, and _smart_auto_selection is only consulted on the AUTO path.
     chosen_urls, choice_note = choose_video_photos(video_photos, image_urls)
     if choice_note:
         degradations.append(choice_note)
-    selected_urls = chosen_urls if chosen_urls else _auto_selection()
+    # Captions the survey already wrote, keyed by url. Empty unless smart selection
+    # ran and succeeded, in which case the normal caption pass is skipped: the same
+    # call did both jobs, so the AUTO path still makes exactly one model call.
+    survey_captions = {}
+    if chosen_urls:
+        selected_urls = chosen_urls
+    else:
+        smart_urls, smart_captions = _smart_auto_selection(
+            image_urls, photo_index, copy_guard=copy_guard)
+        if smart_urls:
+            selected_urls = smart_urls
+            survey_captions = smart_captions or {}
+        else:
+            selected_urls = _auto_selection()
 
     # The dissolve is the house style. Every agent-facing id ("classic", the retired
     # "card", or nothing at all) renders it; only an explicit internal "driftcut"
@@ -1933,7 +2466,19 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             ok, _reason = _caption_is_safe(text)
             if ok:
                 overrides[url] = text
-        if overrides:
+        if survey_captions:
+            # Smart selection already made the one model call this render gets, and it
+            # wrote a caption for every photo it looked at while it was there. Looked
+            # up BY URL rather than by position: a photo that turned out to be
+            # unreadable above is missing from `photos`, and anything keyed on index
+            # would hand its caption to the next photo along -- a caption is a claim
+            # about a room, and putting it on the wrong one misdescribes the property.
+            captions = [survey_captions.get(u) for u in photo_urls]
+            caption_note = None
+            for i, u in enumerate(photo_urls):
+                if u in overrides:
+                    captions[i] = overrides[u]
+        elif overrides:
             todo = [i for i, u in enumerate(photo_urls) if u not in overrides]
             if todo:
                 generated, caption_note = _generate_room_captions(
@@ -1990,7 +2535,15 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                             photo, clip_path, workdir, i,
                             caption=captions[i] if i < len(captions) else None,
                             caption_size=caption_size,
+                            # The two senses of the move alternate on DIFFERENT
+                            # periods -- the zoom every clip, the drift every two --
+                            # so the sequence cycles through all four combinations
+                            # (in-right, out-right, in-left, out-left) before it
+                            # repeats. Alternating both on the same period would give
+                            # two shapes taking turns, which at ten shots is a visible
+                            # tick-tock.
                             zoom_in=(i % 2 == 0),
+                            drift_right=(i // 2 % 2 == 0),
                             # `first` means "this clip is not dissolved INTO", which
                             # decides when the caption may appear. On a Signature the
                             # first PHOTO is the second CLIP, so its caption has to wait

@@ -46,13 +46,18 @@ CLASSIC_ARGS = dict(
     agent_contact_line="9123 4567",
     music_seed="listing-42",
 )
-STUBS = ("_run_ffmpeg", "_fetch_listing_photo", "_generate_room_captions",
+STUBS = ("_run_ffmpeg", "_fetch_listing_photo", "_fetch_image",
+         "_generate_room_captions", "_smart_auto_selection",
          "_probe_duration", "_has_ffmpeg_filter")
 
 
-def capture(module, captions=None, ffmpeg=None, **kwargs):
+def capture(module, captions=None, ffmpeg=None, src_photo=None, smart=None, **kwargs):
     """Run a render with every external dependency stubbed out.
-    Returns (ffmpeg commands it would have run, render result)."""
+    Returns (ffmpeg commands it would have run, render result).
+
+    src_photo swaps the stand-in listing photo, which is how the matrix below reaches
+    the portrait branch: a source taller than 9:16 composites differently and is the
+    one shape that must NOT drift sideways."""
     commands = []
 
     def fake_run_ffmpeg(cmd, timeout):
@@ -66,7 +71,15 @@ def capture(module, captions=None, ffmpeg=None, **kwargs):
 
     saved = {name: getattr(module, name) for name in STUBS}
     module._run_ffmpeg = fake_run_ffmpeg
-    module._fetch_listing_photo = lambda url: photo()
+    module._fetch_listing_photo = lambda url: (src_photo or photo())
+    # The agent's portrait. Stubbed so the golden never depends on a live network.
+    module._fetch_image = lambda url, attempts=2: (src_photo or photo())
+    # Smart photo selection is stubbed OUT by default, i.e. "the survey was not
+    # available, use upload order". Without this the golden would depend on whether
+    # the machine running the tests happens to have an ANTHROPIC_API_KEY set, which
+    # would make it pass on one laptop and fail on another. `smart` opts a config in.
+    module._smart_auto_selection = (
+        smart if callable(smart) else (lambda urls, idx, copy_guard=None: (None, None)))
     def fake_captions(photos, copy_guard=None):
         return (list(captions) if captions else [None] * len(photos)), None
     module._generate_room_captions = fake_captions
@@ -97,24 +110,199 @@ def graph_of(cmd):
     return cmd[cmd.index("-filter_complex") + 1] if "-filter_complex" in cmd else ""
 
 
-print("\n[1] a Classic render issues exactly the commands it issued before")
-before, _ = capture(previous_module(), **CLASSIC_ARGS)
-after, _ = capture(vr, **CLASSIC_ARGS)
-check("same number of ffmpeg calls", len(before) == len(after),
-      "was %d, now %d" % (len(before), len(after)))
+def vf_of(cmd):
+    return cmd[cmd.index("-vf") + 1] if "-vf" in cmd else ""
+
+
 # Temp directory names differ between runs, so compare with the per-run workdir
 # factored out of absolute paths.
 def norm(cmd):
     # The delivery filename carries a random suffix by design, so mask that too --
     # otherwise two runs of the SAME code never compare equal.
-    return [re.sub(r"final_[0-9a-f]{8}\.mp4", "final_XXXXXXXX.mp4",
-                   os.path.basename(x) if os.path.isabs(x) else x) for x in cmd]
-mismatch = next((i for i, (b, a) in enumerate(zip(before, after))
-                 if norm(b) != norm(a)), None)
-check("every command byte-identical", mismatch is None,
-      "" if mismatch is None else
-      "command %d:\n       was %s\n       now %s"
-      % (mismatch, norm(before[mismatch]), norm(after[mismatch])))
+    out = []
+    for x in cmd:
+        x = os.path.basename(x) if os.path.isabs(x) else x
+        # Filter strings EMBED absolute paths (drawtext textfile=/tmp/.../cap_00.txt,
+        # fontfile=/.../Gelasio-Variable.ttf) inside a single argv element, so the
+        # basename() above never sees them and the golden would change every run.
+        # Matched on the OPTION NAME rather than on "looks like a path": a general
+        # path-shaped regex also eats the slashes in zoompan expressions, quietly
+        # turning x='iw/2-(iw/zoom/2)' into x='iw/2-(iw2)' and pinning a corrupted
+        # version of the very motion this file exists to protect.
+        x = re.sub(r"((?:textfile|fontfile)=)((?:\\:|[^:,\]])*)",
+                   lambda m: m.group(1) + os.path.basename(m.group(2)), x)
+        out.append(re.sub(r"final_[0-9a-f]{8}\.mp4", "final_XXXXXXXX.mp4", x))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# [1] THE CLASSIC GUARD
+#
+# This used to diff a Classic render against `git show HEAD:...`. That worked while the
+# Classic was frozen, but it can only ever catch UNCOMMITTED drift: the moment a change
+# is committed, HEAD becomes the new behaviour and the guard agrees with whatever it is
+# handed. On 2026-10-17 the Classic's output deliberately changed (real motion, up to
+# ten photos, CRF 24), so the guard has been re-pointed at a COMMITTED GOLDEN FILE
+# instead. The golden is the intended output, written down, and it survives commits.
+#
+# It is deliberately a matrix rather than one render: one photo and ten, portrait and
+# landscape sources, captions and none, an agent photo and none, an explicit photo pick,
+# and a Signature. Those are the shapes where the clip assembly branches, and a change
+# that moves any of them shows up here as an exact command diff.
+#
+# WHEN THIS FAILS, READ THE DIFF BEFORE REGENERATING. It is telling you a Classic now
+# renders differently, which is either the change you meant or a change you did not.
+# If you meant it:  python3 tests/test_signature_render.py --update-golden
+# and commit the golden alongside the code, so the review sees both.
+# ---------------------------------------------------------------------------
+GOLDEN = os.path.join(HERE, "golden", "classic_commands.txt")
+
+PORTRAIT_ARGS = dict(CLASSIC_ARGS, image_urls=["https://example.test/p.jpg"] * 3)
+MANY_ARGS = dict(CLASSIC_ARGS,
+                 image_urls=["https://example.test/%d.jpg" % i for i in range(12)])
+CAPS = ["the living hall ... where laughter lingers", None,
+        "the dining hall ... where every meal becomes a gathering"]
+
+SMART_PICK = ["https://example.test/%d.jpg" % i for i in (0, 4, 7, 9)]
+SMART_CAPTIONS = {
+    SMART_PICK[0]: "the living hall ... where laughter lingers",
+    SMART_PICK[1]: "the kitchen ... where the day begins",
+    SMART_PICK[3]: "the terrace ... where golden hours drift by",
+}
+
+
+def smart_survey(urls, photo_index, copy_guard=None):
+    """Stands in for a vision survey that worked: a varied four-photo pick with
+    captions keyed BY URL, which is the contract _smart_auto_selection promises."""
+    return list(SMART_PICK), dict(SMART_CAPTIONS)
+
+
+def matrix():
+    """(name, kwargs for capture()) for every shape worth pinning."""
+    yield "classic-3-photos", dict(CLASSIC_ARGS)
+    yield "classic-3-photos-captioned", dict(CLASSIC_ARGS, captions=CAPS)
+    yield "classic-1-photo", dict(CLASSIC_ARGS, image_urls=["https://example.test/a.jpg"])
+    yield "classic-2-photos", dict(CLASSIC_ARGS,
+                                   image_urls=["https://example.test/a.jpg",
+                                               "https://example.test/b.jpg"])
+    yield "classic-12-photos-caps-at-10", dict(MANY_ARGS)
+    yield "classic-12-photos-hero-is-7", dict(MANY_ARGS, photo_index=7)
+    yield "classic-agent-photo", dict(CLASSIC_ARGS,
+                                      agent_photo_url="https://example.test/agent.jpg")
+    yield "classic-no-agent-name", dict(CLASSIC_ARGS, agent_name="", agent_contact_line="")
+    yield "classic-explicit-pick", dict(
+        CLASSIC_ARGS, video_photos=["https://example.test/c.jpg",
+                                    "https://example.test/a.jpg"])
+    yield "classic-portrait-sources", dict(PORTRAIT_ARGS)
+    yield "signature-3-photos", dict(CLASSIC_ARGS, presenter_path=SIG_UPLOAD)
+    # A survey that SUCCEEDED: it chose four of the twelve photos and wrote captions
+    # for three of them. Pins that the renderer uses the chosen photos in the chosen
+    # order, burns in the captions it was handed WITHOUT a second model call, and
+    # leaves the fourth photo bare rather than shifting a caption onto it.
+    yield "classic-smart-selected", dict(MANY_ARGS, smart=smart_survey)
+
+
+def render_matrix():
+    """{name: [normalised ffmpeg commands]} for the whole matrix."""
+    out = {}
+    tall = photo(1000, 2400)          # taller than 9:16 -> the no-drift branch
+    for name, kwargs in matrix():
+        if name == "classic-portrait-sources":
+            kwargs = dict(kwargs, src_photo=tall)
+        cmds, _ = capture(vr, **kwargs)
+        out[name] = [norm(c) for c in cmds]
+    return out
+
+
+def dump(rendered):
+    lines = []
+    for name in sorted(rendered):
+        for i, cmd in enumerate(rendered[name]):
+            lines.append("%s\t%d\t%s" % (name, i, "\x1f".join(cmd)))
+    return "\n".join(lines) + "\n"
+
+
+SIG_UPLOAD = os.path.join(HERE, "_golden_presenter.mp4")
+with open(SIG_UPLOAD, "wb") as f:
+    f.write(b"\0" * 4096)
+try:
+    rendered = render_matrix()
+    produced = dump(rendered)
+
+    if "--update-golden" in sys.argv:
+        os.makedirs(os.path.dirname(GOLDEN), exist_ok=True)
+        with open(GOLDEN, "w", encoding="utf-8") as f:
+            f.write(produced)
+        print("  WROTE %s (%d configs, %d commands)"
+              % (GOLDEN, len(rendered), sum(len(v) for v in rendered.values())))
+        sys.exit(0)
+
+    print("\n[1] a Classic render issues exactly the commands the golden pins")
+    if not os.path.exists(GOLDEN):
+        check("golden file exists", False,
+              "missing %s -- regenerate with --update-golden and review the diff" % GOLDEN)
+    else:
+        expected = open(GOLDEN, encoding="utf-8").read()
+        check("%d configs, %d ffmpeg commands match the golden exactly"
+              % (len(rendered), sum(len(v) for v in rendered.values())),
+              produced == expected)
+        if produced != expected:
+            exp_rows = dict((l.split("\t", 2)[0] + "\t" + l.split("\t", 2)[1],
+                             l.split("\t", 2)[2]) for l in expected.splitlines() if "\t" in l)
+            got_rows = dict((l.split("\t", 2)[0] + "\t" + l.split("\t", 2)[1],
+                             l.split("\t", 2)[2]) for l in produced.splitlines() if "\t" in l)
+            shown = 0
+            for key in sorted(set(exp_rows) | set(got_rows)):
+                if exp_rows.get(key) != got_rows.get(key) and shown < 3:
+                    shown += 1
+                    print("       %s\n         golden: %s\n         now:    %s"
+                          % (key,
+                             (exp_rows.get(key) or "(absent)").replace("\x1f", " ")[:300],
+                             (got_rows.get(key) or "(absent)").replace("\x1f", " ")[:300]))
+
+    # The golden pins WHAT is rendered. These pin WHY, so that a careless
+    # --update-golden cannot quietly undo the thing the golden was written for.
+    print("\n[1b] the motion the Classic is supposed to have")
+    photo_vfs = [vf_of(c) for c in rendered["classic-12-photos-caps-at-10"]
+                 if "zoompan" in vf_of(c)]
+    check("ten photos render ten moving clips (cap raised 6 -> 10)",
+          len(photo_vfs) == vr.MAX_VIDEO_PHOTOS == 10, "found %d" % len(photo_vfs))
+    # The bug this replaced: z='min(zoom+step,max)' reads a previous-frame feedback
+    # value that does not exist at d=1, so the shot never moved. If that form ever
+    # comes back, the Classic is static again and nothing else here would notice.
+    check("no clip uses the feedback zoom form that silently does nothing",
+          not any("min(zoom+" in v or "max(zoom-" in v for v in photo_vfs),
+          next((v for v in photo_vfs if "min(zoom+" in v), ""))
+    check("every clip's zoom is driven by the frame number",
+          all(re.search(r"zoompan=z='[^']*\bon/\d+", v) for v in photo_vfs))
+    check("every clip drifts sideways across the photo",
+          all("(iw-iw/zoom)" in v for v in photo_vfs))
+    check("the drift is bounded by the zoom's spare width, so it cannot leave the photo",
+          all(re.search(r"x='[0-9.]+\*(\(1-)?on/\d+\)?\*\(iw-iw/zoom\)", v)
+              for v in photo_vfs))
+    zoom_in = [("1+%s*on" % round(vr.CONTAIN_ZOOM_MAX - 1.0, 6)) in v for v in photo_vfs]
+    drift_right = [("'%s*on/" % vr.CONTAIN_DRIFT_SPAN) in v for v in photo_vfs]
+    check("the zoom alternates in and out", zoom_in[:4] == [True, False, True, False],
+          str(zoom_in))
+    check("the drift alternates left and right on a different period",
+          drift_right[:4] == [True, True, False, False], str(drift_right))
+    check("so ten shots cycle through four moves, not two",
+          len(set(zip(zoom_in, drift_right))) == 4,
+          str(sorted(set(zip(zoom_in, drift_right)))))
+    # A source taller than 9:16 does not reach the sides of its own composite, so
+    # drifting it would slide the sharp photo around inside blurred margins.
+    tall_vfs = [vf_of(c) for c in rendered["classic-portrait-sources"]
+                if "zoompan" in vf_of(c)]
+    check("a photo taller than the frame keeps the centred zoom, no drift",
+          tall_vfs and all("iw/2-(iw/zoom/2)" in v for v in tall_vfs), str(tall_vfs[:1]))
+    check("and still zooms", all("zoompan=z='1+" in v or "zoompan=z='%s-" % vr.CONTAIN_ZOOM_MAX
+                                 in v for v in tall_vfs))
+    check("delivery CRF is the measured 24", vr.DELIVERY_CRF == "24")
+
+    after, _ = capture(vr, **CLASSIC_ARGS)
+finally:
+    if os.path.exists(SIG_UPLOAD):
+        os.remove(SIG_UPLOAD)
 
 print("\n[2] the Classic soundtrack carries no voice machinery")
 mux = [c for c in after if "[1:a]" in graph_of(c)]
