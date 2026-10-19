@@ -257,6 +257,8 @@ async def startup_event():
     # Detect whether the optional `property_types` list column exists (gates multi-type
     # persistence). Same probe-guard as district: absent -> single property_type only.
     asyncio.create_task(asyncio.to_thread(_probe_property_types_column))
+    # NestList Home: the optional listings.attributes jsonb column (condo-family fields).
+    asyncio.create_task(asyncio.to_thread(_probe_attributes_column))
     # Background photo upscaling. Hands the module a storage-client factory rather than
     # a client, so it always picks up a fresh connection after _reset_db(). No worker
     # thread starts until the first photo is actually queued.
@@ -577,6 +579,18 @@ class ListingRequest(BaseModel):
     # the column exists -> EXACTLY the single-type behaviour. Capped defensively; the primary
     # is always folded in as the first entry (see _resolve_property_types).
     property_types: list[str] = Field(default_factory=list, max_length=12)
+    # OPTIONAL, backward-compatible: NestList Home condo-family fields (Condominium /
+    # Executive Condominium (EC) / Apartment). All optional; landed clients never send them
+    # and nothing about a landed listing changes. Normalised by _build_listing_attributes
+    # and persisted in the probe-gated `attributes jsonb` column (migration 002). The
+    # project name is AGENT-ONLY: never sent to the write-up model, never in any buyer-
+    # facing payload (see _public_project_name).
+    project_name: str = Field(default="", max_length=120)
+    tenure: str = Field(default="", max_length=60)
+    tenure_detail: str = Field(default="", max_length=80)
+    floor_level: str = Field(default="", max_length=20)
+    top_year: int = 0
+    lease_start_year: int = 0
 
 class ListingContentRequest(BaseModel):
     content: str
@@ -653,10 +667,15 @@ class PasswordResetConfirm(BaseModel):
     new_password: str
 
 class CMARequest(BaseModel):
-    street: str
+    # `street` may be blank for a condo-family report that names a project instead.
+    street: str = ""
     property_type: str = ""
     land_size: float = 0
     window_months: int = 24
+    # Condo family only (ignored for landed): match comps to this development first, and
+    # value on built-up PSF x built_up instead of land PSF x land_size.
+    project_name: str = Field(default="", max_length=120)
+    built_up: float = 0
 
 class PublicEnquiryRequest(BaseModel):
     listing_id: str
@@ -1560,6 +1579,8 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
         # Feature #7: always expose a consistent property_types list (falls back to
         # [property_type] before the column exists) so the edit form round-trips cleanly.
         row["property_types"] = _listing_property_types(row)
+        # NestList Home: flat condo-family fields for the edit form (blank when absent).
+        row.update(_listing_strata_fields(row))
         progress = active_video_jobs.get(str(row.get("id"))) or {}
         row["video_queue_position"] = progress.get("queue_position")
         row["video_eta_seconds"] = progress.get("eta_seconds")
@@ -1570,20 +1591,37 @@ async def _generate_listing_text_only(agent, req, district_str: str) -> str:
     """The text-only listing copy path: default when no photos are sent, and the graceful
     fallback if the multimodal write-up fails. DISTRICT-ONLY -- it is given only the district
     (never the street), and the rules forbid naming any road/area, so the generated prose is
-    street-free (hide-the-road)."""
+    street-free (hide-the-road).
+
+    The facts come from the SAME builder as the photo write-up (_build_writeup_facts_block),
+    so a blank or zero field is simply absent instead of being shown to the model as
+    "Land size: 0 sqft" -- an empty, fact-shaped gap it may feel invited to fill -- and a
+    condo-family listing never carries a land size at all. Condo-family types also get
+    content-studio's condo rules and the "Your Home. Your Next Chapter." closing."""
+    is_strata = _is_strata_type(req.property_type)
+    facts_block = _build_writeup_facts_block(req, district_str)
+    strata_rules = ""
+    closing_item = "3. A warm call to action (no price)"
+    if is_strata:
+        strata_rules = """
+
+5. This home is a condominium, executive condominium or apartment. Describe only the unit and
+   development facilities stated in the facts. Never name or imply a swimming pool, gym,
+   clubhouse, BBQ pit, security, playground, MRT access, nearby school or shopping mall unless
+   the facts state it. Never state tenure, floor level, facing, view or the project name unless
+   it is in the facts. For an executive condominium, never state or imply who is eligible to
+   buy it, and never mention MSOP, privatisation, income ceilings or grants. Do not use landed
+   or status words: no "bungalow-like", "landed-like", "estate", "mansion", "grand",
+   "prestigious", "exclusive"."""
+        closing_item = ("3. A closing in this exact shape: \"Your Home. Your Next Chapter.\" followed by one line\n"
+                        "   specific to this home and a warm call to arrange a viewing (no price)")
     prompt = f"""You are {agent['name']} from {agent['agency']}, a specialist in {agent['specialty']}.
 Your tone: {agent.get('tone', 'Warm & Conversational')}
 You emphasise: {agent.get('emphasis', 'Lifestyle & Prestige')}
 Your signature phrase: "{agent.get('signature', 'Where your next chapter begins.')}"
 
-Write a property listing for:
-- Type: {req.property_type}
-- District: {district_str}
-- Land size: {req.land_size:,} sqft
-- Built-up: {req.built_up:,} sqft
-- Bedrooms: {req.bedrooms}
-- Bathrooms: {req.bathrooms}
-- Features: {req.features}
+Write a property listing from these facts (only these -- a fact not listed is unknown):
+{facts_block}
 
 Follow these rules with no exceptions:
 
@@ -1606,13 +1644,13 @@ Follow these rules with no exceptions:
    A modest, honest line beats an impressive-sounding one that isn't backed up.
 
 4. Do NOT mention price anywhere, in any form — no figure, no "attractively priced," no "priced to
-   sell," no range. Price is shown to buyers separately; leave it out of the write-up entirely.
+   sell," no range. Price is shown to buyers separately; leave it out of the write-up entirely.{strata_rules}
 
 Write:
 1. A compelling headline (no house/unit number, no price)
 2. Three short paragraphs in your personal voice — grounded, specific to the facts given, warm
    rather than formal
-3. A warm call to action (no price)
+{closing_item}
 4. End with: {agent['name']} | {agent['agency']} Specialist"""
 
     response = await create_claude_message(
@@ -1653,7 +1691,7 @@ def _basic_listing_fallback(agent, req, district_str: str) -> str:
     agency = agent.get("agency", "")
     return (
         f"{ptype}{where}\n\n"
-        f"A {ptype.lower()}{where}.{spec}{feat}\n\n"
+        f"{'An' if ptype[:1].lower() in 'aeiou' else 'A'} {ptype.lower()}{where}.{spec}{feat}\n\n"
         f"Reach out to arrange a viewing.\n\n"
         f"{name} | {agency} Specialist"
     ).strip()
@@ -1755,6 +1793,12 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
             elif req.land_size > 0 and land_size_sqm < 150:
                 warnings.append(f"Land size {req.land_size:,} sqft ({land_size_sqm:.0f} sqm) is below URA's Inter-Terrace minimum of 150 sqm.")
 
+    # Condo family: land size / plot / site coverage describe a plot of land a strata unit
+    # doesn't have. If they were sent (an old form, a Smart Fill misread), they're left off
+    # -- and the agent is told -- rather than stored and shown to buyers. Only when NO type
+    # on the listing is landed, so a mixed landed+condo listing keeps its land figures.
+    _strip_land_fields_for_strata(req, resolved_property_types, warnings)
+
     if issues:
         return {"compliance": {"passed": passed, "warnings": warnings, "issues": issues}, "listing": None}
 
@@ -1804,8 +1848,13 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
                 listing_text = _basic_listing_fallback(gen_agent, req, district_str)
     else:
         # Text-only path (no photos) -- now DISTRICT-ONLY, same location discipline as the
-        # multimodal path.
-        listing_text = await _generate_listing_text_only(gen_agent, req, district_str)
+        # multimodal path. Degrades to the plain fact-based template on an Anthropic
+        # failure, exactly like the photo path does, so a no-photo listing is never lost.
+        try:
+            listing_text = await _generate_listing_text_only(gen_agent, req, district_str)
+        except Exception as e:
+            logger.error("text-only write-up failed for agent %s, using basic template: %s", agent["id"], e)
+            listing_text = _basic_listing_fallback(gen_agent, req, district_str)
 
     # Discreet per-agent buyer-link code (nestlist.sg/{handle}/{code}). An
     # agent-supplied override wins (validated); otherwise it's derived from the
@@ -1862,11 +1911,18 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     # full ordered list when the column exists.
     if _property_types_column_supported and resolved_property_types:
         insert_payload["property_types"] = resolved_property_types
+    # Condo-family fields (NestList Home). Probe-gated exactly like district: before
+    # migration 002 runs they are simply not stored -- the insert can never fail on them.
+    _attrs = _build_listing_attributes(req)
+    if _attributes_column_supported and _attrs:
+        insert_payload["attributes"] = _attrs
     saved = await db_execute_async(lambda db: db.table("listings").insert(insert_payload), what="generate_listing listings insert", idempotent=False)
 
     listing_row = saved.data[0]
     # `location` in the DB stays as the agent typed it; copy surfaces use this.
     listing_row["display_location"] = display_location
+    listing_row.update(_listing_strata_fields(listing_row))
+    listing_row["attributes_saved"] = bool(_attributes_column_supported)
 
     return {
         "compliance": {"passed": passed, "warnings": warnings, "issues": issues},
@@ -1938,7 +1994,7 @@ FORMAT — prose only, this shape, every time
    Weave in FACTS naturally — bed/bath count, size, storeys — as part of sentences, not as a
    recited list.
 3. CLOSING — exact shape, only the middle line changes:
-     ***Your Vision. Your Legacy.*** {one line specific to this home}. {call to view}.
+     Your Vision. Your Legacy. {one line specific to this home}. {call to view}.
      Please contact me at {agent_phone} ({agent_name}).
 
 ====================================================================
@@ -2052,6 +2108,208 @@ _WRITEUP_NON_LANDED_KEYWORDS = (
 )
 
 
+# ================================
+# NESTLIST HOME, PHASE 1 -- CONDO FAMILY (Condominium / Executive Condominium (EC) /
+# Apartment). One source of truth for "is this a condo-family type": the same function
+# the URA comparables use, so the write-up, the listing fields and the CMA can never
+# disagree about which path a listing is on. Blank / unknown / landed -> False, and every
+# landed code path below is then exactly what it was.
+# ================================
+def _is_strata_type(property_type) -> bool:
+    try:
+        return ura_market_pulse.is_strata_type(str(property_type or ""))
+    except Exception:
+        return False
+
+
+def _is_landed_type(property_type) -> bool:
+    t = str(property_type or "").strip().lower()
+    return any(k in t for k in ("bungalow", "gcb", "good class", "detached", "terrace"))
+
+
+# Canonical tenure values the frontend offers. Free-typed / Smart-Fill variants are folded
+# onto these; anything else is kept honestly as "Other" with the agent's own words in
+# tenure_detail -- never guessed onto a canonical value.
+TENURE_OPTIONS = ("Freehold", "99-year leasehold", "999-year leasehold", "Other")
+FLOOR_LEVEL_OPTIONS = ("Low", "Mid", "High")
+
+
+def _normalize_tenure(raw, detail=""):
+    """-> (tenure, tenure_detail). ("", "") when nothing usable was given."""
+    t = re.sub(r"\s+", " ", str(raw or "")).strip()
+    d = re.sub(r"\s+", " ", str(detail or "")).strip()[:80]
+    if not t:
+        return ("", "") if not d else ("Other", d)
+    low = t.lower()
+    if low in ("fh", "freehold", "estate in fee simple") or low.startswith("freehold"):
+        return "Freehold", d
+    if re.search(r"\b999\b", low):
+        return "999-year leasehold", d
+    if re.search(r"\b99\b", low) or low in ("lh99", "99lh"):
+        return "99-year leasehold", d
+    for opt in TENURE_OPTIONS:
+        if low == opt.lower():
+            return opt, d
+    # e.g. "103-year leasehold" or "60 yrs from 1995": real, just not a standard option.
+    return "Other", (d or t)[:80]
+
+
+def _normalize_floor_level(raw) -> str:
+    """A BAND only ("Low"/"Mid"/"High"). A floor or unit number is never stored."""
+    low = str(raw or "").strip().lower()
+    for opt in FLOOR_LEVEL_OPTIONS:
+        if low.startswith(opt.lower()):
+            return opt
+    if low.startswith("middle"):
+        return "Mid"
+    return ""
+
+
+def _clean_project_name(raw) -> str:
+    """Project/development name with any unit number ("#12-03"), block/house-number
+    prefix and stray whitespace removed. Stored for the agent's own record only."""
+    text = _UNIT_NUMBER_RE.sub(" ", str(raw or ""))
+    text = re.sub(r"\b(?:unit|blk|block)\s*[#\d][\w-]*", " ", text, flags=re.IGNORECASE)
+    text = _HOUSE_NUMBER_PREFIX_RE.sub("", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" ,-#")
+    return text[:120]
+
+
+def _valid_year(v) -> int:
+    try:
+        n = int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if 1900 <= n <= datetime.utcnow().year + 10 else 0
+
+
+# Keys this backend owns inside listings.attributes. Update merges ONLY these, so any key a
+# later phase adds (HDB town, flat model ...) is never clobbered by a condo edit.
+_STRATA_ATTRIBUTE_KEYS = ("project_name", "tenure", "tenure_detail", "floor_level",
+                          "top_year", "lease_start_year")
+
+
+def _build_listing_attributes(req) -> dict:
+    """Normalised condo-family attributes from a request. Only non-empty values. Never
+    raises (missing attrs on an older request model simply yield {})."""
+    out = {}
+    try:
+        pn = _clean_project_name(getattr(req, "project_name", ""))
+        if pn:
+            out["project_name"] = pn
+        tenure, detail = _normalize_tenure(getattr(req, "tenure", ""), getattr(req, "tenure_detail", ""))
+        if tenure:
+            out["tenure"] = tenure
+        if detail:
+            out["tenure_detail"] = detail
+        fl = _normalize_floor_level(getattr(req, "floor_level", ""))
+        if fl:
+            out["floor_level"] = fl
+        ty = _valid_year(getattr(req, "top_year", 0))
+        if ty:
+            out["top_year"] = ty
+        ly = _valid_year(getattr(req, "lease_start_year", 0))
+        if ly:
+            out["lease_start_year"] = ly
+    except Exception as e:
+        logger.error("listing attributes could not be built (ignored): %s", e)
+        return {}
+    return out
+
+
+def _listing_attributes(listing) -> dict:
+    src = listing if isinstance(listing, dict) else {}
+    a = src.get("attributes")
+    return a if isinstance(a, dict) else {}
+
+
+def _listing_strata_fields(listing) -> dict:
+    """Flat condo-family fields for the AUTHED agent's own listing (edit-form round-trip).
+    Always every key, blank when absent, so the frontend never sees undefined."""
+    a = _listing_attributes(listing)
+    return {
+        "project_name": str(a.get("project_name") or ""),
+        "tenure": str(a.get("tenure") or ""),
+        "tenure_detail": str(a.get("tenure_detail") or ""),
+        "floor_level": str(a.get("floor_level") or ""),
+        "top_year": _valid_year(a.get("top_year")),
+        "lease_start_year": _valid_year(a.get("lease_start_year")),
+    }
+
+
+# Jane has NOT approved naming a condo's project in anything a buyer sees: like a street
+# name it pins the location, and the stray-street guard can't recognise project names.
+# So the project name stays agent-only. When/if she approves, the switch is here: flip this
+# to True AND store a per-listing opt-in (attributes["show_project_name"] = True) from the
+# New Listing form -- this function is the single gate every buyer-facing surface uses.
+PROJECT_NAME_PUBLIC_ENABLED = False
+
+
+def _public_project_name(listing) -> str:
+    if not PROJECT_NAME_PUBLIC_ENABLED:
+        return ""
+    a = _listing_attributes(listing)
+    return str(a.get("project_name") or "") if a.get("show_project_name") is True else ""
+
+
+def _scrub_project_name(text, listing, district_label: str):
+    """Serve-time: remove this listing's own project name from outward text (it may be in
+    agent-typed features or hand-edited copy), unless the agent has opted to show it.
+    Only names of 2+ words or 6+ characters are scrubbed, so a one-word name can't eat an
+    ordinary word in the prose. Never raises."""
+    if not text:
+        return text
+    try:
+        name = str(_listing_attributes(listing).get("project_name") or "").strip()
+        if not name or _public_project_name(listing):
+            return text
+        if len(name) < 6 and " " not in name:
+            return text
+        return re.sub(r"(?<!\w)" + re.escape(name) + r"(?!\w)", district_label or "the development",
+                      text, flags=re.IGNORECASE)
+    except Exception as e:
+        logger.error("project-name scrub failed (returning text as-is): %s", e)
+        return text
+
+
+# Content-studio condo copy spec (content/nestlist-home-condo-copy-spec.md, 3.2 + 3.3).
+# Applied ONLY for condo-family types, on top of whichever system prompt loaded (the doc or
+# the embedded fallback), so the landed prompt is byte-for-byte what it was.
+_LANDED_CLOSING = "Your Vision. Your Legacy."
+_STRATA_CLOSING = "Your Home. Your Next Chapter."
+_STRATA_WRITEUP_RULES = """
+
+====================================================================
+CONDOMINIUM / EXECUTIVE CONDOMINIUM / APARTMENT -- additional HARD RULES
+(this home is one of these; these rules are part of the HARD RULE above)
+====================================================================
+- For a condominium, executive condominium or apartment, describe only the unit and the
+  development facilities that are visible in a photo or stated in FACTS. Never name or
+  imply a swimming pool, gym, clubhouse, BBQ pit, security, playground, MRT access, nearby
+  school or shopping mall unless FACTS states it. A facility seen in a photo may be
+  mentioned in general terms ("a pool in the development") without a name or figure.
+- Never state tenure, floor level, facing, view, MRT or school proximity, or the project name
+  unless it is in FACTS. If FACTS has no tenure, do not mention tenure.
+- For an executive condominium, never state or imply who is eligible to buy it, and never
+  mention MSOP, privatisation, income ceilings or grants unless FACTS says so.
+- Do not use landed or status words for a condo-family home: no "bungalow-like",
+  "landed-like", "estate", "mansion", "grand", "prestigious", "exclusive". Warmth is about
+  how the home feels to live in, not rank.
+- The closing for this home is "Your Home. Your Next Chapter." in place of any other
+  opening words given above; the rest of the closing shape is unchanged."""
+
+
+def _apply_strata_writeup_rules(system_prompt: str, property_type) -> str:
+    """Condo-family types: swap the landed closing words for the Home closing and append
+    the condo rule block. Any other type: returned unchanged. Never raises."""
+    if not _is_strata_type(property_type):
+        return system_prompt
+    try:
+        return (system_prompt or "").replace(_LANDED_CLOSING, _STRATA_CLOSING) + _STRATA_WRITEUP_RULES
+    except Exception:
+        return system_prompt
+
+
 def _build_writeup_facts_block(req, district_str: str) -> str:
     """Assemble content-studio's FACTS block, applying its per-line omit rules so the model
     never sees an empty, fact-shaped gap it might feel invited to fill:
@@ -2061,7 +2319,8 @@ def _build_writeup_facts_block(req, district_str: str) -> str:
     District is always included (area context only, never the street). Only lines with a
     real value are emitted."""
     ptype = (req.property_type or "").strip()
-    is_non_landed = any(kw in ptype.lower() for kw in _WRITEUP_NON_LANDED_KEYWORDS)
+    is_non_landed = (any(kw in ptype.lower() for kw in _WRITEUP_NON_LANDED_KEYWORDS)
+                     or _is_strata_type(ptype))
 
     def _num(v):
         try:
@@ -2083,6 +2342,20 @@ def _build_writeup_facts_block(req, district_str: str) -> str:
         lines.append(f"- Built-up size: {_fmt_writeup_num(req.built_up)} sqft")
     if _num(req.land_size) > 0 and not is_non_landed:
         lines.append(f"- Land size: {_fmt_writeup_num(req.land_size)} sqft")
+    if is_non_landed or _is_strata_type(ptype):
+        # Condo-family facts (content-studio spec 3.1). Only what the agent supplied; the
+        # project name is deliberately NEVER given to the model (agent-only until Jane
+        # decides), and nothing about EC eligibility/MSOP/privatisation is ever added.
+        tenure, detail = _normalize_tenure(getattr(req, "tenure", ""),
+                                           getattr(req, "tenure_detail", ""))
+        if tenure == "Other":
+            if detail:   # the agent's own words, e.g. "103-year leasehold"
+                lines.append(f"- Tenure: {detail}")
+        elif tenure:
+            lines.append(f"- Tenure: {tenure}")
+        floor = _normalize_floor_level(getattr(req, "floor_level", ""))
+        if floor:
+            lines.append(f"- Floor level: {floor} floor")
     if (req.features or "").strip():
         lines.append(f"- Agent-noted features: {req.features.strip()}")
     return "\n".join(lines)
@@ -2223,6 +2496,46 @@ def _listing_property_types(listing: dict) -> list[str]:
     return [single] if single else []
 
 
+def _strip_land_fields_for_strata(req, resolved_types, warnings) -> None:
+    """Zero the landed-only plot fields on a condo-family request (in place). No-op for
+    landed, blank, unknown, or any listing that also carries a landed type. Never raises."""
+    try:
+        types = list(resolved_types or []) or [getattr(req, "property_type", "")]
+        if not _is_strata_type(getattr(req, "property_type", "")):
+            return
+        if any(_is_landed_type(t) for t in types):
+            return
+        dropped = []
+        for field, label in (("land_size", "land size"), ("plot_width", "plot width"),
+                             ("plot_depth", "plot depth"), ("site_coverage", "site coverage")):
+            if (getattr(req, field, 0) or 0) > 0:
+                dropped.append(label)
+            setattr(req, field, 0)
+        if dropped and warnings is not None:
+            warnings.append(f"{', '.join(dropped).capitalize()} doesn't apply to a "
+                            f"{req.property_type} unit, so it was left off this listing.")
+    except Exception as e:
+        logger.error("strata land-field strip skipped: %s", e)
+
+
+# NestList Home -- whether listings has the `attributes jsonb` column (migration
+# 002_listing_attributes.sql). Probed once at startup like district; until present, condo
+# fields are used for the write-up but not stored, and nothing can fail on them.
+_attributes_column_supported = False
+
+
+def _probe_attributes_column():
+    global _attributes_column_supported
+    try:
+        get_db().table("listings").select("attributes").limit(1).execute()
+        _attributes_column_supported = True
+        logger.info("listings.attributes column present -- condo-family fields persisted")
+    except Exception:
+        _attributes_column_supported = False
+        logger.warning("listings.attributes column NOT present -- condo fields not stored yet "
+                       "(run backend/migrations/002_listing_attributes.sql)")
+
+
 # Whether the listings table has the new `district` column (the New Listing dropdown value).
 # Probed once at startup; until it is confirmed present we simply do NOT write district, so a
 # missing column can never break the (non-idempotent) listing insert. Once the column is added
@@ -2315,7 +2628,8 @@ async def _generate_writeup_from_photos(agent, req, vision_urls, district_str, c
         "district": district_str,
     }
     system_tmpl, user_tmpl = _load_writeup_prompt()
-    system_prompt = _fill_placeholders(system_tmpl, subs)
+    system_prompt = _apply_strata_writeup_rules(_fill_placeholders(system_tmpl, subs),
+                                                getattr(req, "property_type", ""))
     facts_block = _build_writeup_facts_block(req, district_str)
     user_text = _fill_placeholders(user_tmpl, subs).replace("{facts_block}", facts_block)
 
@@ -2349,7 +2663,7 @@ async def _generate_writeup_from_photos(agent, req, vision_urls, district_str, c
     writeup = "".join(
         block.text for block in response.content if getattr(block, "type", None) == "text"
     ).strip()
-    # No markdown stripping: content-studio's "***Your Vision. Your Legacy.***" closing
+    # No markdown stripping: content-studio's "Your Vision. Your Legacy." closing
     # must survive, and the prompt forbids stray headers/bullets.
     if not writeup:
         raise RuntimeError("write-up came back empty")
@@ -2382,6 +2696,13 @@ class WriteupRequest(BaseModel):
     # one of WRITING_STYLE_OPTIONS overrides the profile tone for this write-up; blank or
     # unrecognised -> profile tone.
     writing_style: str = Field(default="", max_length=50)
+    # OPTIONAL condo-family facts (NestList Home), same meaning as on ListingRequest. Only
+    # tenure and the floor band reach the FACTS block; project_name is accepted so the form
+    # can send one payload, but it is never given to the model.
+    project_name: str = Field(default="", max_length=120)
+    tenure: str = Field(default="", max_length=60)
+    tenure_detail: str = Field(default="", max_length=80)
+    floor_level: str = Field(default="", max_length=20)
 
 
 # One Opus-5 vision call per request -- rate-limited per agent. This dict is PER WORKER, and
@@ -5453,7 +5774,7 @@ async def extract_listing_image(request: Request):
             "type": "text",
             "text": """Extract property listing details from these images and return ONLY a JSON object with these exact fields:
 {
-  "property_type": "one of: Good Class Bungalow (GCB), Detached/Bungalow, Semi-Detached, Inter-Terrace, Corner Terrace, Penthouse",
+  "property_type": "one of: Good Class Bungalow (GCB), Detached/Bungalow, Semi-Detached, Inter-Terrace, Corner Terrace, Penthouse, Condominium, Executive Condominium (EC), Apartment",
   "location": "full address or area",
   "land_size": number in sqft or 0,
   "built_up": number in sqft or 0,
@@ -5465,11 +5786,13 @@ async def extract_listing_image(request: Request):
   "plot_depth": number in metres or 0,
   "storeys": number or 0,
   "site_coverage": number as percentage or 0,
-  "district": "Singapore postal district as a bare number 1-28 ONLY if it is written as text in the image; otherwise \"\""
+  "district": "Singapore postal district as a bare number 1-28 ONLY if it is written as text in the image; otherwise \"\"",
+  "project_name": "the condominium / development name ONLY if written in the image (never a unit or block number); otherwise \"\"",
+  "tenure": "Freehold, 99-year leasehold or 999-year leasehold ONLY if written in the image; any other stated tenure as written; otherwise \"\""
 }
 Do not guess or estimate any value that is not clearly shown or stated in the images. If a field cannot be determined from the images, use "" for text fields and 0 for number fields.
 For district specifically: this field is a frequent source of confident-wrong guesses, so lean HARD toward "". Return a number 1-28 ONLY if you can point to EXPLICIT, VISIBLE district text in the image itself -- a literal "District 15" label, a "D15" tag, or a field/row clearly labelled with the postal district. If you cannot literally SEE such text in the image, you MUST return "". Do NOT infer, derive, or guess the district from the street/road name, the neighbourhood/area/estate name, the postal code, OR from your own general knowledge of where a street is located -- for example, do NOT reason "this is Tembeling Road, which is in District 15" (or any similar street-to-district inference); if the district number is not written in the image, it is not yours to supply, and a wrong district is a misrepresentation of the property. A blank the agent fills in is ALWAYS better than a wrong number. Self-check before returning: "Can I actually SEE the district written as text somewhere in this image? If not, district = \"\"."
-For property_type specifically: if any image contains an explicit official/source "Property Type" field or code, use that over your own inference from the general description — e.g. "CT" means Corner Terrace, "IT" or "ITR" means Inter-Terrace, "SD" means Semi-Detached, "DB" means Detached/Bungalow, "GCB" means Good Class Bungalow (GCB), "PH" means Penthouse. Inter-Terrace and Corner Terrace are frequently confused — an explicit source field always wins over inferring from land size or description text. If no image states or clearly implies a specific property type at all (no field, code, or explicit description), return "" for property_type rather than guessing from land size, price, or general impression — Corner Terrace, Inter-Terrace, and Semi-Detached can have very similar land sizes and are not reliably distinguishable from size alone, so leaving this blank for the agent to confirm is strongly preferred over a wrong guess.
+For property_type specifically: if any image contains an explicit official/source "Property Type" field or code, use that over your own inference from the general description — e.g. "CT" means Corner Terrace, "IT" or "ITR" means Inter-Terrace, "SD" means Semi-Detached, "DB" means Detached/Bungalow, "GCB" means Good Class Bungalow (GCB), "PH" means Penthouse, "Condo" means Condominium, "EC" means Executive Condominium (EC), "Apt" or "Walk-up" means Apartment. Inter-Terrace and Corner Terrace are frequently confused — an explicit source field always wins over inferring from land size or description text. If no image states or clearly implies a specific property type at all (no field, code, or explicit description), return "" for property_type rather than guessing from land size, price, or general impression — Corner Terrace, Inter-Terrace, and Semi-Detached can have very similar land sizes and are not reliably distinguishable from size alone, so leaving this blank for the agent to confirm is strongly preferred over a wrong guess.
 For bathrooms specifically: return a number ONLY if the bathroom/toilet count is explicitly written or clearly shown in the image itself -- a literal "Bathrooms" / "Baths" / "Toilets" field or an unambiguous bathroom icon with a number beside it. Do NOT infer or estimate the bathroom count from the number of bedrooms, the room count, the floor area, the property type, the photos of rooms, or your own general sense of how many bathrooms a home this size "should" have. Bedrooms and bathrooms are different figures and one never implies the other. If the bathroom count is not explicitly stated in the image, you MUST return "" -- a blank the agent fills in is always better than a guessed count, because a wrong bathroom number is a misrepresentation of the property. Self-check before returning: "Can I actually SEE a bathroom/toilet count written in this image? If not, bathrooms = \"\"."
 For land_size and built_up specifically: these must be the raw size figure shown directly in or immediately after the "Land Size" / "Built-Up Size" (or "Estm. Land Size" / "Estm. Build-Up Size") field itself, typically followed by a unit like "sqft". Many source screenshots also show a separate small badge or chip positioned near that same field labeled "PSF" (price per square foot, e.g. "3,157 PSF") — this PSF number is a completely different figure and must NEVER be used as land_size or built_up, even when it sits close to, overlapping, or immediately beside the size number. For example, if a screenshot shows "Estm. Land Size (SQFT): 3003" next to a badge reading "3,157 PSF", land_size is 3003, not 3157 — read the digits under the size label, not the digits under or next to the PSF badge. Before finalizing, sanity-check that price divided by land_size (or built_up) is a plausible PSF for the property type and location shown — if it looks off by roughly an order of magnitude, or if land_size/built_up looks suspiciously close to a PSF figure visible elsewhere in the image, re-read the image and correct it rather than outputting the PSF value by mistake.
 Return only valid JSON, nothing else."""
@@ -5488,6 +5811,13 @@ Return only valid JSON, nothing else."""
         # District dropdown gets a predictable value and never an out-of-range guess.
         # Always present in the response, even if the model omitted it.
         extracted["district"] = _normalize_district(extracted.get("district"))
+        # Condo-family fields: always present (blank when absent) so older and newer
+        # frontends both get a predictable shape; unit numbers stripped from the project
+        # name, tenure folded onto the canonical options.
+        extracted["project_name"] = _clean_project_name(extracted.get("project_name"))
+        _t, _td = _normalize_tenure(extracted.get("tenure"), "")
+        extracted["tenure"] = _t
+        extracted["tenure_detail"] = _td
         # Fact-check gate (feature #16): mirror the district/price "please confirm" safety
         # pattern. `needs_confirmation` lists auto-filled fields the agent should verify
         # before publishing, so the UI can show a ⚠️ confirm prompt. Bathrooms is included
@@ -5509,9 +5839,12 @@ Return only valid JSON, nothing else."""
 # ================================
 @app.get("/api/market-pulse")
 def get_market_pulse():
+    # Every response carries the Open Data Licence source notice (source_attribution /
+    # source_licence_url / source_disclaimer) so the panel can never show URA-derived
+    # figures without it. Added at response time, never stored in the row.
     result = get_db().table("market_pulse").select("*").eq("id", 1).execute()
     if result.data:
-        return result.data[0]
+        return {**result.data[0], **ura_market_pulse.source_notice()}
     return {
         "gcb_transactions": "~36 units",
         "gcb_total_value": "SGD 1.36B",
@@ -5521,7 +5854,8 @@ def get_market_pulse():
         "last_updated": "Jan 2026",
         "refreshed_at": None,
         "partial": False,
-        "source": "manual"
+        "source": "manual",
+        **ura_market_pulse.source_notice(),
     }
 
 @app.put("/api/market-pulse")
@@ -5565,7 +5899,8 @@ async def trigger_market_pulse_refresh(agent=Depends(get_current_agent)):
     stats["partial"] = False
     await db_execute_async(lambda db: db.table("market_pulse").upsert(_market_pulse_row(stats)), what="trigger_market_pulse_refresh market_pulse upsert")
     # Return the saved row plus a light diagnostic so the UI/caller can confirm freshness.
-    return {**stats, "batches_ok": result["batches_ok"], "raw_projects": result["raw_projects"]}
+    return {**stats, "batches_ok": result["batches_ok"], "raw_projects": result["raw_projects"],
+            **ura_market_pulse.source_notice()}
 
 @app.get("/api/market-pulse/diagnostics")
 async def market_pulse_diagnostics(agent=Depends(get_current_agent)):
@@ -5597,12 +5932,23 @@ async def market_pulse_diagnostics(agent=Depends(get_current_agent)):
 
 @app.post("/api/cma/generate")
 async def generate_cma_report(req: CMARequest, agent=Depends(get_current_agent)):
-    if not req.street:
-        raise HTTPException(status_code=400, detail="Street or area name is required")
+    street = (req.street or "").strip()
+    is_strata = ura_market_pulse.is_strata_type(req.property_type)
+    # Agent-only screen, but the project name is still sanitised: a unit number typed
+    # into it must never travel anywhere (and URA has none to match against anyway).
+    project_name = _clean_project_name(req.project_name) if is_strata else ""
+    if not street and not project_name:
+        raise HTTPException(status_code=400, detail=(
+            "Project name or street is required" if is_strata else "Street or area name is required"))
     if not os.environ.get("URA_ACCESS_KEY", ""):
         raise HTTPException(status_code=503, detail="URA market data isn't configured yet -- contact NestList support")
+    # URA publishes five years of sales; anything outside 1..60 months is a typo, not a
+    # wider search. Clamped rather than rejected so an odd value still gets a report.
+    window_months = min(max(int(req.window_months or 24), 1), 60)
     try:
-        result = await ura_market_pulse.generate_cma(req.street, req.property_type, req.land_size, req.window_months)
+        result = await ura_market_pulse.generate_cma(
+            street, req.property_type, max(req.land_size or 0, 0), window_months,
+            project_name=project_name, built_up_sqft=max(req.built_up or 0, 0))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception:
@@ -5867,6 +6213,11 @@ def _public_listing_payload(listing) -> dict:
     )
     public_content = _scrub_own_street(public_content, own_location, district_label)
     public_features = _scrub_own_street(listing.get("features"), own_location, district_label)
+    # Condo family: the project name pins the location the way a street does, and it is
+    # agent-only until Jane decides otherwise -- scrub it from outward text too.
+    public_content = _scrub_project_name(public_content, listing, district_label)
+    public_features = _scrub_project_name(public_features, listing, district_label)
+    _strata = _listing_strata_fields(listing)
     # The listing's own videos, so the buyer's page can actually play the tour the
     # "Reply with Listing" copy promises. Both are optional and both default to null:
     # most listings have neither, and a listing with no video must render a normal
@@ -5909,6 +6260,11 @@ def _public_listing_payload(listing) -> dict:
         "features": public_features,
         "video_url": public_video_url,
         "signature_video_url": public_signature_video_url,
+        # NestList Home (additive; blank for landed). Tenure and a floor BAND only -- no
+        # project name (see _public_project_name), no TOP/lease year (with the district
+        # they can narrow a condo to one development), never a floor or unit number.
+        "tenure": _strata["tenure"] if _strata["tenure"] != "Other" else _strata["tenure_detail"],
+        "floor_level": _strata["floor_level"],
         "agent": {"name": agent_info.get("name"), "agency": agent_info.get("agency")}
     }
 
@@ -6402,13 +6758,16 @@ def delete_listing_permanently(listing_id: str, agent=Depends(get_current_agent)
 
 @app.patch("/api/listings/{listing_id}")
 def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_current_agent)):
-    existing = db_execute(lambda db: db.table("listings").select("id, code").eq("id", listing_id).eq("agent_id", agent["id"]), what="update_listing listings select")
+    _cols = "id, code, attributes" if _attributes_column_supported else "id, code"
+    existing = db_execute(lambda db: db.table("listings").select(_cols).eq("id", listing_id).eq("agent_id", agent["id"]), what="update_listing listings select")
     if not existing.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     # Feature #7 -- same reconciliation as create: property_type stays the PRIMARY (promoted
     # from the list only if the client sent just the list), resolved_property_types is the
     # ordered list for the property_types[] column.
     _primary_type, resolved_property_types = _resolve_property_types(req)
+    req.property_type = _primary_type
+    _strip_land_fields_for_strata(req, resolved_property_types, None)
     update_payload = {
         # Saving here always promotes the row to "active" -- this is the same
         # endpoint used both for editing an existing active listing (already
@@ -6437,6 +6796,15 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
     # stays in sync with the form, mirroring how district always overwrites on update.
     if _property_types_column_supported:
         update_payload["property_types"] = resolved_property_types
+    # Condo-family fields. The form always sends the full set, so the keys THIS backend owns
+    # are replaced wholesale (a cleared tenure really clears); any other key in attributes
+    # (a later phase's) is carried over untouched.
+    if _attributes_column_supported:
+        _prev = existing.data[0].get("attributes")
+        _prev = _prev if isinstance(_prev, dict) else {}
+        _merged = {k: v for k, v in _prev.items() if k not in _STRATA_ATTRIBUTE_KEYS}
+        _merged.update(_build_listing_attributes(req))
+        update_payload["attributes"] = _merged
     # Discreet buyer-link code. An override sets it; otherwise we only *fill in* a
     # code when the listing has none yet -- an ordinary field edit must never
     # clobber an existing code (e.g. the demo listing's YOE). Wrapped whole so it
@@ -6457,7 +6825,9 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
     except Exception:
         pass
     updated = db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="update_listing listings update")
-    return updated.data[0]
+    row = updated.data[0]
+    row.update(_listing_strata_fields(row))
+    return row
 
 MAX_LISTING_CONTENT_CHARS = 20000
 
@@ -6757,6 +7127,13 @@ def _build_propertyguru_text_block(listing: dict) -> str:
     add("Property Type", " / ".join(ptypes) if ptypes else "")
     add("Address", listing.get("location"))
     add("District", _listing_district_label(listing))
+    # Condo family (blank -> skipped, so a landed export is unchanged). This export is the
+    # agent's OWN copy-paste block for PropertyGuru's form, so the project name belongs here.
+    _strata = _listing_strata_fields(listing)
+    add("Project Name", _strata["project_name"])
+    add("Tenure", _strata["tenure_detail"] if _strata["tenure"] == "Other" else _strata["tenure"])
+    add("Floor Level", f"{_strata['floor_level']} floor" if _strata["floor_level"] else "")
+    add("TOP Year", _strata["top_year"] or "")
     add("Asking Price", _pg_export_price(listing.get("price")))
     add("Bedrooms", _pg_export_count(listing.get("bedrooms")))
     add("Bathrooms", _pg_export_count(listing.get("bathrooms")))

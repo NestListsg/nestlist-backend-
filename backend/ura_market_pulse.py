@@ -389,6 +389,141 @@ def _map_property_type(nestlist_type: str) -> str:
             return ura_type
     return ""
 
+
+# ---------------------------------------------------------------------------
+# NestList Home, Phase 1 -- CONDO (strata) comparables.
+#
+# The same PMI_Resi_Transaction feed already carries every private condo, EC and
+# apartment sale; the landed path above throws them away with its
+# typeOfArea == "Land" filter. Strata support is a SEPARATE path, chosen only when the
+# NestList type is one of the condo family, so the landed path (and its output) is
+# untouched: an unknown, blank or landed type never reaches any code below.
+#
+# Ordered: EC is checked BEFORE the generic "condo" token, because "Executive
+# Condominium" contains "condominium". Condominium and Apartment are pooled: URA's split
+# between the two is about the size of the development and its facilities, not a
+# different market, and agents use "condo" for both -- keeping them apart would starve a
+# street with one of each of comparables. EC is kept on its own: it is a subsidised,
+# resale-restricted product that trades at a clearly lower PSF.
+# ---------------------------------------------------------------------------
+_STRATA_TYPE_MAP = [
+    ("executive condominium", ("Executive Condominium",)),
+    ("(ec)", ("Executive Condominium",)),
+    ("condo", ("Condominium", "Apartment")),
+    ("apartment", ("Apartment", "Condominium")),
+    ("walk-up", ("Apartment", "Condominium")),
+    ("walkup", ("Apartment", "Condominium")),
+]
+_STRATA_EXACT_TOKENS = {"ec": ("Executive Condominium",)}
+
+# URA typeOfSale codes -> words an agent reads. Anything else -> "" (never a guess).
+_SALE_TYPE_LABELS = {"1": "New Sale", "2": "Sub Sale", "3": "Resale"}
+
+
+def strata_ura_types(nestlist_type: str) -> tuple:
+    """URA propertyType values that are valid comparables for a condo-family NestList
+    type, or () when the type is not condo-family (=> the landed path). Never raises."""
+    key = str(nestlist_type or "").strip().lower()
+    if not key:
+        return ()
+    if key in _STRATA_EXACT_TOKENS:
+        return _STRATA_EXACT_TOKENS[key]
+    for token, ura_types in _STRATA_TYPE_MAP:
+        if token in key:
+            return ura_types
+    return ()
+
+
+def is_strata_type(nestlist_type: str) -> bool:
+    return bool(strata_ura_types(nestlist_type))
+
+
+def _norm_project(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+
+
+def _extract_strata_comparables(projects: list, street_keyword: str, ura_types: tuple,
+                                window_months: int, project_name: str = "") -> tuple:
+    """Condo-family comparables. Returns (records, matched_on).
+
+    Matching: when the agent gave a project name and URA has sales in a project of that
+    name, comps are THAT development (the most like-for-like comparison there is);
+    otherwise the street keyword, exactly as landed matches. matched_on is "project",
+    "street" or "" (nothing matched) so the report can say which it used.
+
+    Granularity: project + street + a floor RANGE ("06-10") is the finest URA publishes --
+    there are no unit numbers in this feed at all, and none are produced here."""
+    now = datetime.utcnow()
+
+    def within_window(year, month):
+        months_ago = (now.year - year) * 12 + (now.month - month)
+        return 0 <= months_ago < window_months
+
+    wanted_project = _norm_project(project_name)
+    candidates = []
+    if wanted_project:
+        candidates = [p for p in projects if _norm_project(p.get("project", "")) == wanted_project]
+    matched_on = "project" if candidates else ""
+    if not candidates and street_keyword:
+        candidates = [p for p in projects if _matches_street_keyword(p.get("street", ""), street_keyword)]
+        matched_on = "street" if candidates else ""
+
+    records = []
+    seen = set()
+    for project in candidates:
+        street = project.get("street", "")
+        project_label = str(project.get("project", "") or "").strip()
+        for txn in project.get("transaction", []) or []:
+            if txn.get("typeOfArea") != "Strata":
+                continue
+            if txn.get("propertyType") not in ura_types:
+                continue
+            # A bulk purchase of several units is reported as one record with the
+            # combined price and area -- not a comparable for one home.
+            try:
+                if int(str(txn.get("noOfUnits") or "1").strip() or "1") != 1:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            parsed = _parse_contract_date(txn.get("contractDate", ""))
+            if not parsed or not within_window(*parsed):
+                continue
+            try:
+                price = float(txn.get("price", 0))
+                area_sqm = float(txn.get("area", 0))
+            except (TypeError, ValueError):
+                continue
+            if price <= 0 or area_sqm <= 0:
+                continue
+            sig = (_norm_street(street), _norm_project(project_label), txn.get("contractDate", ""),
+                   price, round(area_sqm, 2), txn.get("propertyType", ""),
+                   txn.get("floorRange", ""), txn.get("tenure", ""))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            area_sqft = area_sqm * SQM_TO_SQFT
+            district_code = txn.get("district", "")
+            records.append({
+                "street": street,
+                "project": project_label,
+                "price": price,
+                # For a strata sale URA's area is the unit's strata floor area, i.e. the
+                # condo's built-up size -- so PSF here is built-up PSF, not land PSF.
+                "area_sqft": round(area_sqft),
+                "psf": round(price / area_sqft),
+                "property_type": txn.get("propertyType", ""),
+                "contract_date": f"{parsed[1]:02d}/{parsed[0]}",
+                "district": f"D{district_code}" if district_code else "",
+                "tenure": txn.get("tenure", ""),
+                # A RANGE of floors ("06-10"), never a unit -- and "-" when URA has none.
+                "floor_range": str(txn.get("floorRange", "") or "").strip(),
+                "sale_type": _SALE_TYPE_LABELS.get(str(txn.get("typeOfSale", "")).strip(), ""),
+            })
+    # Newest first. Sorted on (year, month), not on the "MM/YYYY" display string, so a
+    # December sale never sorts above a later January one.
+    records.sort(key=lambda r: (r["contract_date"][3:], r["contract_date"][:2]), reverse=True)
+    return records, matched_on
+
 # Generic road-type words agents commonly append/guess (e.g. typing "Road"
 # when URA's gazetted name actually uses "Walk" or no suffix at all). These
 # are dropped from the fallback word match so a wrong or missing suffix
@@ -532,18 +667,189 @@ def compute_cma_stats(records: list, subject_land_size_sqft: float = 0) -> dict:
         "comparables": records[:20],
     }
 
-async def generate_cma(street_keyword: str, property_type: str = "", land_size_sqft: float = 0, window_months: int = 24) -> dict:
-    access_key = os.environ.get("URA_ACCESS_KEY", "")
-    if not access_key:
-        raise RuntimeError("URA_ACCESS_KEY not configured")
-    token = await get_token(access_key)
-    projects, _batch_report = await fetch_all_transactions(access_key, token)
-    records = extract_comparable_transactions(projects, street_keyword, property_type, window_months)
-    stats = compute_cma_stats(records, land_size_sqft)
+# ---------------------------------------------------------------------------
+# Source notice. The Singapore Open Data Licence requires the source to be stated
+# wherever URA-derived figures are shown (CMA, Market Pulse, printed/exported
+# reports). Carried on every response so no screen can render the numbers without
+# it. Wording deliberately implies no URA endorsement; no URA logo is ever used.
+# Only URA Data Service (PMI_Resi_Transaction) figures flow through this module --
+# REALIS data is internal-use-only and must never be merged into these responses.
+# ---------------------------------------------------------------------------
+SOURCE_ATTRIBUTION = ("Contains information from the URA Data Service, made available "
+                      "under the Singapore Open Data Licence.")
+SOURCE_LICENCE_URL = "https://data.gov.sg/open-data-licence"
+SOURCE_DISCLAIMER = "Indicative only; verify with official records."
+
+
+def source_notice() -> dict:
+    """The three source-notice fields, as added to every CMA / Market Pulse response."""
+    return {
+        "source_attribution": SOURCE_ATTRIBUTION,
+        "source_licence_url": SOURCE_LICENCE_URL,
+        "source_disclaimer": SOURCE_DISCLAIMER,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CMA transaction cache.
+#
+# Before this, EVERY CMA click pulled all four URA batches (the whole private-
+# residential market) and held them in memory for the length of the request: 50 agents
+# generating reports at once meant 50 full copies in RAM and 200 URA calls against one
+# daily quota -- and with condo agents using CMA too, that only gets worse. Now each
+# worker keeps ONE slimmed copy, refreshed at most every CMA_CACHE_TTL_SECONDS, fetched
+# by one request while concurrent requests wait for it (single-flight).
+#
+# If URA is down or returns only some batches, a previous complete copy up to
+# CMA_MAX_STALE_SECONDS old is served instead, marked stale with its date, rather
+# than failing the report -- and a failed fetch is not retried for
+# CMA_FAILURE_COOLDOWN_SECONDS, so an outage doesn't make every agent wait out the
+# full retry ladder in turn.
+#
+# The slimmed copy keeps only the fields the comparables code reads, so the extraction
+# result is identical to running on the raw feed (tested), at a fraction of the memory.
+# ---------------------------------------------------------------------------
+CMA_CACHE_TTL_SECONDS = 12 * 3600
+CMA_MAX_STALE_SECONDS = 7 * 86400
+CMA_FAILURE_COOLDOWN_SECONDS = 120
+CMA_FETCH_BUDGET_SECONDS = 150
+
+_PROJECT_KEEP = ("street", "project")
+_TXN_KEEP = ("typeOfArea", "propertyType", "contractDate", "price", "area", "district",
+             "tenure", "floorRange", "typeOfSale", "noOfUnits")
+
+_cma_cache = {"projects": None, "fetched_at": 0.0, "as_of": None, "last_failure_at": 0.0}
+_cma_lock = None  # created lazily, inside the running event loop
+
+
+def _slim_projects(projects: list) -> list:
+    """Drop every field the comparables code never reads. Strings are interned so the
+    thousands of repeats ("Strata", "Condominium", "99 yrs lease commencing from ...")
+    are stored once."""
+    slim = []
+    intern = __import__("sys").intern
+    for p in projects or []:
+        if not isinstance(p, dict):
+            continue
+        txns = []
+        for t in p.get("transaction", []) or []:
+            if not isinstance(t, dict):
+                continue
+            txns.append({k: (intern(v) if isinstance(v, str) else v)
+                         for k, v in t.items() if k in _TXN_KEEP})
+        if txns:
+            entry = {k: p.get(k, "") for k in _PROJECT_KEEP}
+            entry["transaction"] = txns
+            slim.append(entry)
+    return slim
+
+
+def store_cma_projects(projects: list, already_slim: bool = False) -> None:
+    """Seed the CMA cache from a COMPLETE (all four batches) fetch -- the daily Market
+    Pulse refresh calls this so the worker that owns it never fetches twice."""
+    import time
+    _cma_cache["projects"] = projects if already_slim else _slim_projects(projects)
+    _cma_cache["fetched_at"] = time.time()
+    _cma_cache["as_of"] = date.today().isoformat()
+
+
+async def _get_cma_projects():
+    """(projects, meta) for a CMA. meta = {"data_as_of", "stale", "partial"}.
+    Raises RuntimeError with an agent-readable message when there is nothing usable."""
+    import time
+    global _cma_lock
+
+    def cached(stale):
+        return _cma_cache["projects"], {"data_as_of": _cma_cache["as_of"], "stale": stale,
+                                        "partial": False}
+
+    now = time.time()
+    if _cma_cache["projects"] is not None and now - _cma_cache["fetched_at"] < CMA_CACHE_TTL_SECONDS:
+        return cached(False)
+
+    if _cma_lock is None:
+        _cma_lock = asyncio.Lock()
+    async with _cma_lock:
+        now = time.time()
+        if _cma_cache["projects"] is not None and now - _cma_cache["fetched_at"] < CMA_CACHE_TTL_SECONDS:
+            return cached(False)   # another request refreshed it while we waited
+        have_stale = (_cma_cache["projects"] is not None
+                      and now - _cma_cache["fetched_at"] < CMA_MAX_STALE_SECONDS)
+        if now - _cma_cache["last_failure_at"] < CMA_FAILURE_COOLDOWN_SECONDS:
+            if have_stale:
+                return cached(True)
+            raise RuntimeError("URA's data service isn't responding right now -- please try again in a few minutes")
+
+        access_key = os.environ.get("URA_ACCESS_KEY", "")
+        if not access_key:
+            raise RuntimeError("URA_ACCESS_KEY not configured")
+        try:
+            async def _fetch():
+                token = await get_token(access_key)
+                return await fetch_all_transactions(access_key, token)
+            projects, batch_report = await asyncio.wait_for(_fetch(), timeout=CMA_FETCH_BUDGET_SECONDS)
+        except Exception as e:
+            _cma_cache["last_failure_at"] = time.time()
+            print(f"CMA URA fetch failed: {type(e).__name__}: {e}")
+            if have_stale:
+                return cached(True)
+            raise RuntimeError("Couldn't reach URA's data service right now -- please try again shortly")
+
+        if all(b.get("ok") for b in batch_report) and len(batch_report) == 4:
+            # Slimming walks every transaction in the market -- off the event loop, so
+            # the worker's other requests aren't held up while it runs.
+            slim = await asyncio.to_thread(_slim_projects, projects)
+            store_cma_projects(slim, already_slim=True)
+            return cached(False)
+
+        # Some batches failed. Prefer a complete older copy; otherwise use what arrived,
+        # flagged partial (comparables from the missing districts are absent), and do NOT
+        # cache it -- the next request tries again for a complete set.
+        _cma_cache["last_failure_at"] = time.time()
+        if have_stale:
+            return cached(True)
+        if projects:
+            return await asyncio.to_thread(_slim_projects, projects), {"data_as_of": date.today().isoformat(),
+                                              "stale": False, "partial": True}
+        raise RuntimeError("Couldn't reach URA's data service right now -- please try again shortly")
+
+
+async def generate_cma(street_keyword: str, property_type: str = "", land_size_sqft: float = 0,
+                       window_months: int = 24, project_name: str = "",
+                       built_up_sqft: float = 0) -> dict:
+    """Comparable-sales report.
+
+    LANDED (and blank/unknown types): exactly as before -- Land-type sales on the street,
+    valued on LAND PSF x the subject's land size. The landed record and stats shapes are
+    unchanged; this only ADDS keys (source notice, valuation basis, data freshness).
+
+    CONDO family (Condominium / Executive Condominium (EC) / Apartment): Strata-type
+    sales in the named project (or on the street), valued on BUILT-UP PSF x the
+    subject's built-up size. Land size is ignored for these."""
+    projects, meta = await _get_cma_projects()
+    ura_types = strata_ura_types(property_type)
+    if ura_types:
+        records, matched_on = _extract_strata_comparables(
+            projects, street_keyword, ura_types, window_months, project_name)
+        stats = compute_cma_stats(records, built_up_sqft)
+        stats["valuation_basis"] = "built_up_psf"
+        stats["subject_area_sqft"] = built_up_sqft or 0
+        stats["matched_on"] = matched_on
+        stats["project_name"] = project_name or ""
+    else:
+        records = extract_comparable_transactions(projects, street_keyword, property_type, window_months)
+        stats = compute_cma_stats(records, land_size_sqft)
+        stats["valuation_basis"] = "land_psf"
+        stats["subject_area_sqft"] = land_size_sqft or 0
+        stats["matched_on"] = "street" if records else ""
     stats["street_keyword"] = street_keyword
     stats["property_type"] = property_type
     stats["window_months"] = window_months
     stats["generated_at"] = date.today().isoformat()
+    stats["data_as_of"] = meta.get("data_as_of")
+    stats["data_stale"] = bool(meta.get("stale"))
+    stats["data_partial"] = bool(meta.get("partial"))
+    stats.update(source_notice())
     return stats
 
 async def refresh_market_pulse(include_survey: bool = False) -> dict:
@@ -593,6 +899,14 @@ async def refresh_market_pulse(include_survey: bool = False) -> dict:
 
     stats = compute_market_pulse_stats(projects)
     result["stats"] = stats  # exposed for diagnostics even when incomplete
+    if batches_ok == 4 and projects:
+        # A complete pull is exactly what CMA needs too: hand it over so this worker's
+        # next CMA doesn't fetch the whole market a second time. Never allowed to break
+        # the refresh itself.
+        try:
+            store_cma_projects(await asyncio.to_thread(_slim_projects, projects), already_slim=True)
+        except Exception as e:
+            print(f"CMA cache seed from Market Pulse refresh failed (harmless): {e}")
     result["ok"] = (batches_ok == 4 and stats is not None)
 
     if include_survey:
