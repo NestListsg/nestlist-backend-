@@ -225,6 +225,11 @@ def base_ns(**extra):
         # Studio rule (condo-family "0" bedrooms). The fixture is a Semi-Detached, so the
         # real helper would say False too; stubbed because main.py is executed piecemeal.
         _listing_is_studio=lambda listing: False,
+        # NestList Home end-slate overlay: a landed fixture gets the plain contact back.
+        _home_video_overlay=lambda listing, agent, price_text, stats: (
+            (agent or {}).get("contact", ""), price_text, stats),
+        # NestList Home CEA keys on profile responses (not what this file tests).
+        _with_cea_fields=lambda out, agent: out,
         apply_listing_copy_guards=lambda text, context=None: text,
         _agent_caption_overrides=lambda stored: {},
         get_current_agent=lambda: None,
