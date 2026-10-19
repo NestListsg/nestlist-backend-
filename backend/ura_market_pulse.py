@@ -3,7 +3,7 @@ import json
 import os
 import re
 import httpx
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 
 TOKEN_URL = "https://eservice.ura.gov.sg/uraDataService/insertNewToken/v1"
 TRANSACTION_URL = "https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1"
@@ -148,10 +148,20 @@ async def _get_json_with_retry(client, url, *, attempts=3, backoff=2, **kwargs):
     raise RuntimeError(f"URA API returned a non-JSON response after {attempts} attempts: {last_error}")
 
 
+# Singapore time. URA's token day follows the Singapore calendar day, and Railway's
+# clock is UTC -- keyed on the UTC date, the cached token would be reused for the first
+# eight hours of each Singapore day after URA had already expired it.
+SGT = timezone(timedelta(hours=8))
+
+
+def _sgt_today() -> date:
+    return datetime.now(SGT).date()
+
+
 async def get_token(access_key: str) -> str:
-    """URA tokens are valid for the calendar day they were issued. Cache and
-    only refetch once the date rolls over."""
-    today = date.today()
+    """URA tokens are valid for the (Singapore) calendar day they were issued. Cache and
+    only refetch once the Singapore date rolls over."""
+    today = _sgt_today()
     if _token_cache["token"] and _token_cache["fetched_on"] == today:
         return _token_cache["token"]
 
@@ -167,7 +177,7 @@ async def get_token(access_key: str) -> str:
         return token
 
 
-async def fetch_all_transactions(access_key: str, token: str):
+async def fetch_all_transactions(access_key: str, token: str, batch_timeout: float = None):
     """Fetch all 4 batches of PMI_Resi_Transaction (split by postal district
     ranges). GCB areas live in specific districts (D10/D11/D21/D23 etc.) that
     fall in specific batches, so a single dropped batch silently removes whole
@@ -180,18 +190,24 @@ async def fetch_all_transactions(access_key: str, token: str):
     partial fetch rather than persist an under-count as if it were complete.
 
     Returns (all_projects, batch_report), where batch_report is a list of
-    {"batch", "ok", "status", "projects", "message"} -- one entry per batch."""
+    {"batch", "ok", "status", "projects", "message"} -- one entry per batch.
+
+    batch_timeout (seconds, optional): a hard ceiling on ONE batch, retries included. A
+    batch that runs past it is recorded as failed and the next batch still runs, so the
+    batches that did finish are kept. None (the Market Pulse refresh) = no extra ceiling,
+    exactly the original behaviour."""
     headers = {**BROWSER_HEADERS, "AccessKey": access_key, "Token": token}
     all_projects = []
     batch_report = []
     async with httpx.AsyncClient(timeout=60) as client:
         for batch in (1, 2, 3, 4):
             try:
-                data = await _get_json_with_retry(
+                call = _get_json_with_retry(
                     client, TRANSACTION_URL,
                     params={"service": "PMI_Resi_Transaction", "batch": batch},
                     headers=headers,
                 )
+                data = await (asyncio.wait_for(call, timeout=batch_timeout) if batch_timeout else call)
                 status = data.get("Status")
                 if status == "Success":
                     projects = data.get("Result", []) or []
@@ -210,9 +226,9 @@ async def fetch_all_transactions(access_key: str, token: str):
                 # A raising batch (empty body after retries, HTTP error, timeout) must
                 # not abort the other three -- record it and carry on so batch_report
                 # reflects exactly which districts we actually received.
-                print(f"URA batch {batch} failed: {e}")
+                print(f"URA batch {batch} failed: {type(e).__name__}: {e}")
                 batch_report.append({"batch": batch, "ok": False, "status": "Exception",
-                                     "projects": 0, "message": str(e)[:300]})
+                                     "projects": 0, "message": (str(e) or type(e).__name__)[:300]})
     return all_projects, batch_report
 
 
@@ -697,14 +713,18 @@ def source_notice() -> dict:
 # residential market) and held them in memory for the length of the request: 50 agents
 # generating reports at once meant 50 full copies in RAM and 200 URA calls against one
 # daily quota -- and with condo agents using CMA too, that only gets worse. Now each
-# worker keeps ONE slimmed copy, refreshed at most every CMA_CACHE_TTL_SECONDS, fetched
-# by one request while concurrent requests wait for it (single-flight).
+# worker keeps ONE slimmed copy, refreshed at most every CMA_CACHE_TTL_SECONDS.
 #
-# If URA is down or returns only some batches, a previous complete copy up to
-# CMA_MAX_STALE_SECONDS old is served instead, marked stale with its date, rather
-# than failing the report -- and a failed fetch is not retried for
-# CMA_FAILURE_COOLDOWN_SECONDS, so an outage doesn't make every agent wait out the
-# full retry ladder in turn.
+#   * Once a copy exists, nobody waits on URA again: past 12h it is served at once
+#     (marked stale, with its date) while ONE background pull refreshes it -- for up to
+#     CMA_MAX_STALE_SECONDS, which also covers a URA outage.
+#   * With no copy (a fresh worker), the first request pulls and concurrent requests
+#     wait for that one pull (single-flight).
+#   * Each of the four batches has its own time budget; batches that finished are kept.
+#     A pull with missing batches is served flagged "partial" for the cool-down window
+#     only, never kept as the 12-hour copy.
+#   * A failed pull is not retried for CMA_FAILURE_COOLDOWN_SECONDS (and Telegram is
+#     told), so an outage doesn't make every agent wait out the retry ladder in turn.
 #
 # The slimmed copy keeps only the fields the comparables code reads, so the extraction
 # result is identical to running on the raw feed (tested), at a fraction of the memory.
@@ -712,14 +732,44 @@ def source_notice() -> dict:
 CMA_CACHE_TTL_SECONDS = 12 * 3600
 CMA_MAX_STALE_SECONDS = 7 * 86400
 CMA_FAILURE_COOLDOWN_SECONDS = 120
-CMA_FETCH_BUDGET_SECONDS = 150
+# Per-BATCH ceiling, retries included. Set above the worst case the batch could take on
+# its own before this existed (3 attempts x 60s httpx timeout + 2s + 4s backoff = 186s),
+# so it can only ever cut off a batch that would have hung longer than the code allowed
+# before. There is deliberately NO overall cap: the old code had none, and a cap on the
+# whole pull threw away batches that had already arrived.
+CMA_BATCH_BUDGET_SECONDS = 200
 
 _PROJECT_KEEP = ("street", "project")
 _TXN_KEEP = ("typeOfArea", "propertyType", "contractDate", "price", "area", "district",
              "tenure", "floorRange", "typeOfSale", "noOfUnits")
 
-_cma_cache = {"projects": None, "fetched_at": 0.0, "as_of": None, "last_failure_at": 0.0}
-_cma_lock = None  # created lazily, inside the running event loop
+_cma_cache = {"projects": None, "fetched_at": 0.0, "as_of": None, "last_failure_at": 0.0,
+              "partial_projects": None, "partial_at": 0.0, "partial_as_of": None}
+_cma_lock = None          # created lazily, inside the running event loop
+_cma_refresh_task = None  # the one background refresh in flight, if any
+_failure_alert = None     # optional async callable(message), set by main.py
+
+
+def set_failure_alert(hook) -> None:
+    """main.py hands in its throttled Telegram alert so a URA outage on the CMA path is
+    reported, not just logged. Optional: unset = log only."""
+    global _failure_alert
+    _failure_alert = hook
+
+
+def _alert_failure(message: str) -> None:
+    hook = _failure_alert
+    if hook is None:
+        return
+    try:
+        task = asyncio.get_running_loop().create_task(hook(message))
+        _BACKGROUND.add(task)
+        task.add_done_callback(_BACKGROUND.discard)
+    except Exception as e:
+        print(f"CMA failure alert not sent (harmless): {e}")
+
+
+_BACKGROUND = set()  # strong refs so background tasks aren't garbage-collected mid-run
 
 
 def _slim_projects(projects: list) -> list:
@@ -750,67 +800,122 @@ def store_cma_projects(projects: list, already_slim: bool = False) -> None:
     import time
     _cma_cache["projects"] = projects if already_slim else _slim_projects(projects)
     _cma_cache["fetched_at"] = time.time()
-    _cma_cache["as_of"] = date.today().isoformat()
+    _cma_cache["as_of"] = _sgt_today().isoformat()
+    _cma_cache["partial_projects"] = None
+
+
+def _cached_meta(stale: bool):
+    return _cma_cache["projects"], {"data_as_of": _cma_cache["as_of"], "stale": stale, "partial": False}
+
+
+def _partial_meta():
+    return _cma_cache["partial_projects"], {"data_as_of": _cma_cache["partial_as_of"],
+                                            "stale": False, "partial": True}
+
+
+async def _fetch_into_cache() -> bool:
+    """ONE pull from URA into the cache. Never raises.
+
+    Returns True when a complete copy was stored. On a partial pull (some batches failed
+    or ran out of time) the batches that DID arrive are kept as a short-lived partial copy:
+    served, flagged partial, never promoted to the 12-hour copy. Caller holds _cma_lock."""
+    import time
+    access_key = os.environ.get("URA_ACCESS_KEY", "")
+    if not access_key:
+        return False
+    try:
+        token = await get_token(access_key)
+        projects, batch_report = await fetch_all_transactions(
+            access_key, token, batch_timeout=CMA_BATCH_BUDGET_SECONDS)
+    except Exception as e:
+        _cma_cache["last_failure_at"] = time.time()
+        print(f"CMA URA fetch failed: {type(e).__name__}: {e}")
+        _alert_failure(f"URA comparables fetch failed ({type(e).__name__}). Pricing reports are "
+                       "serving the last saved copy if there is one; retrying in a few minutes.")
+        return False
+
+    ok = len(batch_report) == 4 and all(b.get("ok") for b in batch_report)
+    if ok:
+        # Slimming walks every transaction in the market -- off the event loop, so the
+        # worker's other requests aren't held up while it runs.
+        store_cma_projects(await asyncio.to_thread(_slim_projects, projects), already_slim=True)
+        return True
+
+    _cma_cache["last_failure_at"] = time.time()
+    failed = [b.get("batch") for b in batch_report if not b.get("ok")]
+    print(f"CMA URA fetch partial: batches {failed} failed")
+    _alert_failure(f"URA comparables fetch incomplete: batches {failed} failed. Pricing reports "
+                   "use the last complete copy if there is one, otherwise flag results as partial.")
+    if projects:
+        _cma_cache["partial_projects"] = await asyncio.to_thread(_slim_projects, projects)
+        _cma_cache["partial_at"] = time.time()
+        _cma_cache["partial_as_of"] = _sgt_today().isoformat()
+    return False
+
+
+def _ensure_background_refresh() -> None:
+    """Start ONE background refresh unless one is already running or URA is in its failure
+    cool-down. Agents are never made to wait on it."""
+    import time
+    global _cma_refresh_task
+    if _cma_refresh_task is not None and not _cma_refresh_task.done():
+        return
+    if time.time() - _cma_cache["last_failure_at"] < CMA_FAILURE_COOLDOWN_SECONDS:
+        return
+
+    async def _run():
+        global _cma_lock
+        if _cma_lock is None:
+            _cma_lock = asyncio.Lock()
+        async with _cma_lock:
+            if time.time() - _cma_cache["fetched_at"] < CMA_CACHE_TTL_SECONDS:
+                return   # someone else already refreshed it
+            await _fetch_into_cache()
+
+    _cma_refresh_task = asyncio.get_running_loop().create_task(_run())
+    _BACKGROUND.add(_cma_refresh_task)
+    _cma_refresh_task.add_done_callback(_BACKGROUND.discard)
 
 
 async def _get_cma_projects():
     """(projects, meta) for a CMA. meta = {"data_as_of", "stale", "partial"}.
-    Raises RuntimeError with an agent-readable message when there is nothing usable."""
+    Raises RuntimeError with an agent-readable message when there is nothing usable.
+
+      fresh copy (< 12h)              -> served.
+      older complete copy (< 7 days)  -> served AT ONCE, marked stale, while one
+                                         background refresh runs (stale-while-revalidate).
+      no usable copy                  -> this request (and any arriving meanwhile) waits
+                                         for ONE pull; on a partial pull the batches that
+                                         arrived are served, flagged partial.
+    """
     import time
     global _cma_lock
-
-    def cached(stale):
-        return _cma_cache["projects"], {"data_as_of": _cma_cache["as_of"], "stale": stale,
-                                        "partial": False}
-
     now = time.time()
-    if _cma_cache["projects"] is not None and now - _cma_cache["fetched_at"] < CMA_CACHE_TTL_SECONDS:
-        return cached(False)
+    age = now - _cma_cache["fetched_at"]
+    if _cma_cache["projects"] is not None and age < CMA_CACHE_TTL_SECONDS:
+        return _cached_meta(False)
+    if _cma_cache["projects"] is not None and age < CMA_MAX_STALE_SECONDS:
+        _ensure_background_refresh()
+        return _cached_meta(True)
 
     if _cma_lock is None:
         _cma_lock = asyncio.Lock()
     async with _cma_lock:
         now = time.time()
         if _cma_cache["projects"] is not None and now - _cma_cache["fetched_at"] < CMA_CACHE_TTL_SECONDS:
-            return cached(False)   # another request refreshed it while we waited
-        have_stale = (_cma_cache["projects"] is not None
-                      and now - _cma_cache["fetched_at"] < CMA_MAX_STALE_SECONDS)
+            return _cached_meta(False)   # another request refreshed it while we waited
+        partial_fresh = (_cma_cache["partial_projects"] is not None
+                         and now - _cma_cache["partial_at"] < CMA_FAILURE_COOLDOWN_SECONDS)
         if now - _cma_cache["last_failure_at"] < CMA_FAILURE_COOLDOWN_SECONDS:
-            if have_stale:
-                return cached(True)
+            if partial_fresh:
+                return _partial_meta()
             raise RuntimeError("URA's data service isn't responding right now -- please try again in a few minutes")
-
-        access_key = os.environ.get("URA_ACCESS_KEY", "")
-        if not access_key:
+        if not os.environ.get("URA_ACCESS_KEY", ""):
             raise RuntimeError("URA_ACCESS_KEY not configured")
-        try:
-            async def _fetch():
-                token = await get_token(access_key)
-                return await fetch_all_transactions(access_key, token)
-            projects, batch_report = await asyncio.wait_for(_fetch(), timeout=CMA_FETCH_BUDGET_SECONDS)
-        except Exception as e:
-            _cma_cache["last_failure_at"] = time.time()
-            print(f"CMA URA fetch failed: {type(e).__name__}: {e}")
-            if have_stale:
-                return cached(True)
-            raise RuntimeError("Couldn't reach URA's data service right now -- please try again shortly")
-
-        if all(b.get("ok") for b in batch_report) and len(batch_report) == 4:
-            # Slimming walks every transaction in the market -- off the event loop, so
-            # the worker's other requests aren't held up while it runs.
-            slim = await asyncio.to_thread(_slim_projects, projects)
-            store_cma_projects(slim, already_slim=True)
-            return cached(False)
-
-        # Some batches failed. Prefer a complete older copy; otherwise use what arrived,
-        # flagged partial (comparables from the missing districts are absent), and do NOT
-        # cache it -- the next request tries again for a complete set.
-        _cma_cache["last_failure_at"] = time.time()
-        if have_stale:
-            return cached(True)
-        if projects:
-            return await asyncio.to_thread(_slim_projects, projects), {"data_as_of": date.today().isoformat(),
-                                              "stale": False, "partial": True}
+        if await _fetch_into_cache():
+            return _cached_meta(False)
+        if _cma_cache["partial_projects"] is not None and time.time() - _cma_cache["partial_at"] < CMA_FAILURE_COOLDOWN_SECONDS:
+            return _partial_meta()
         raise RuntimeError("Couldn't reach URA's data service right now -- please try again shortly")
 
 

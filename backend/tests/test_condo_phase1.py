@@ -195,8 +195,9 @@ class FakeURA:
     async def token(self, key):
         return "tok"
 
-    async def fetch(self, key, token):
+    async def fetch(self, key, token, batch_timeout=None):
         self.calls += 1
+        self.batch_timeout = batch_timeout
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.fail:
@@ -206,8 +207,15 @@ class FakeURA:
 
 
 def reset_cache():
-    NEW._cma_cache.update({"projects": None, "fetched_at": 0.0, "as_of": None, "last_failure_at": 0.0})
+    NEW._cma_cache.update({"projects": None, "fetched_at": 0.0, "as_of": None, "last_failure_at": 0.0,
+                           "partial_projects": None, "partial_at": 0.0, "partial_as_of": None})
     NEW._cma_lock = None
+    NEW._cma_refresh_task = None
+
+
+async def drain_background():
+    while NEW._BACKGROUND:
+        await asyncio.gather(*list(NEW._BACKGROUND), return_exceptions=True)
 
 
 def install(fake):
@@ -247,7 +255,13 @@ async def scenario_values():
 
 asyncio.run(scenario_values())
 
-print("\n[5] URA cache: single-flight, outage, partial, time budget")
+print("\n[5] URA cache: single-flight, stale-while-revalidate, outage, per-batch budget")
+ALERTS = []
+
+
+async def collect_alert(msg):
+    ALERTS.append(msg)
+NEW.set_failure_alert(collect_alert)
 
 
 async def scenario_single_flight():
@@ -255,25 +269,52 @@ async def scenario_single_flight():
     fake = FakeURA(delay=0.2)
     install(fake)
     results = await asyncio.gather(*[NEW.generate_cma("Nassim Road", "", 0, 24) for _ in range(50)])
-    check("50 concurrent CMAs -> 1 URA fetch", fake.calls == 1, fake.calls)
+    check("cold worker: 50 concurrent CMAs -> 1 URA fetch", fake.calls == 1, fake.calls)
     check("...and all 50 got the same answer", all(r["comparables"] == results[0]["comparables"] for r in results))
+    check("CMA pulls use the per-batch budget, not an overall cap",
+          fake.batch_timeout == NEW.CMA_BATCH_BUDGET_SECONDS and not hasattr(NEW, "CMA_FETCH_BUDGET_SECONDS"))
     await NEW.generate_cma("Cuscaden Walk", "Condominium", 0, 24)
     check("a later request inside the TTL fetches nothing", fake.calls == 1)
 
 asyncio.run(scenario_single_flight())
 
 
-async def scenario_outage():
+async def scenario_swr():
     reset_cache()
     install(FakeURA())
-    await NEW.generate_cma("Nassim Road", "", 0, 24)                 # seeds the cache
-    NEW._cma_cache["fetched_at"] -= NEW.CMA_CACHE_TTL_SECONDS + 1     # now expired
+    await NEW.generate_cma("Nassim Road", "", 0, 24)
+    NEW._cma_cache["fetched_at"] -= NEW.CMA_CACHE_TTL_SECONDS + 1     # expired, < 7 days
+    slow = FakeURA(delay=1.0)
+    install(slow)
+    t0 = time.time()
+    rs = await asyncio.gather(*[NEW.generate_cma("Nassim Road", "", 0, 24) for _ in range(50)])
+    took = time.time() - t0
+    check("expired copy: 50 requests answered at once from the old copy, marked stale",
+          took < 0.5 and all(r["data_stale"] and r["comparable_count"] > 0 for r in rs), round(took, 2))
+    await drain_background()
+    check("...while exactly ONE background refresh ran", slow.calls == 1, slow.calls)
+    r = await NEW.generate_cma("Nassim Road", "", 0, 24)
+    check("...and the next request gets the fresh copy", not r["data_stale"] and slow.calls == 1)
+
+asyncio.run(scenario_swr())
+
+
+async def scenario_outage():
+    reset_cache()
+    ALERTS.clear()
+    install(FakeURA())
+    await NEW.generate_cma("Nassim Road", "", 0, 24)
+    NEW._cma_cache["fetched_at"] -= NEW.CMA_CACHE_TTL_SECONDS + 1
     down = FakeURA(fail=RuntimeError("URA down"))
     install(down)
     r = await NEW.generate_cma("Nassim Road", "", 0, 24)
+    await drain_background()
     check("URA down + older complete copy -> served, marked stale", r["data_stale"] and r["comparable_count"] > 0)
-    await NEW.generate_cma("Nassim Road", "", 0, 24)
+    for _ in range(5):
+        await NEW.generate_cma("Nassim Road", "", 0, 24)
+    await drain_background()
     check("cooldown: an outage is not re-hit on every click", down.calls == 1, down.calls)
+    check("the outage was alerted (Telegram hook)", len(ALERTS) == 1 and "URA" in ALERTS[0], ALERTS)
     reset_cache()
     install(FakeURA(fail=RuntimeError("URA down")))
     try:
@@ -300,26 +341,50 @@ async def scenario_partial():
     fake = FakeURA(partial=True)
     install(fake)
     r = await NEW.generate_cma("Nassim Road", "", 0, 24)
-    check("partial fetch with no copy -> answered, flagged partial", r["data_partial"] and not r["data_stale"])
-    check("partial fetch is never cached", NEW._cma_cache["projects"] is None)
+    check("partial pull with no copy -> answered, flagged partial", r["data_partial"] and not r["data_stale"])
+    check("partial pull never becomes the 12-hour copy", NEW._cma_cache["projects"] is None)
+    r2 = await NEW.generate_cma("Nassim Road", "", 0, 24)
+    check("within the cooldown the partial copy is served again, no re-fetch",
+          r2["data_partial"] and fake.calls == 1, fake.calls)
 
 asyncio.run(scenario_partial())
 
 
-async def scenario_budget():
+async def scenario_batch_budget():
+    """The REAL fetch_all_transactions, with batch 3 hanging: the other three must be kept."""
     reset_cache()
-    install(FakeURA(delay=5))
-    saved = NEW.CMA_FETCH_BUDGET_SECONDS
-    NEW.CMA_FETCH_BUDGET_SECONDS = 0.2
-    t0 = time.time()
-    try:
-        await NEW.generate_cma("Nassim Road", "", 0, 24)
-        check("hung URA fetch is cut off at the budget", False)
-    except RuntimeError:
-        check("hung URA fetch is cut off at the budget", time.time() - t0 < 2, time.time() - t0)
-    NEW.CMA_FETCH_BUDGET_SECONDS = saved
+    NEW.fetch_all_transactions = _REAL_FETCH
+    NEW.get_token = FakeURA().token
+    saved_retry, saved_budget = NEW._get_json_with_retry, NEW.CMA_BATCH_BUDGET_SECONDS
 
-asyncio.run(scenario_budget())
+    async def fake_get(client, url, **kw):
+        b = kw["params"]["batch"]
+        if b == 3:
+            await asyncio.sleep(30)
+        return {"Status": "Success", "Result": [RAW[0]] if b == 1 else [RAW[1]] if b == 2 else [RAW[3]]}
+    NEW._get_json_with_retry = fake_get
+    NEW.CMA_BATCH_BUDGET_SECONDS = 0.3
+    t0 = time.time()
+    r = await NEW.generate_cma("Nassim Road", "", 0, 24)
+    check("a hanging batch is cut at its own budget; the pull returns promptly",
+          time.time() - t0 < 3, round(time.time() - t0, 2))
+    check("...the three finished batches are kept and served, flagged partial",
+          r["data_partial"] and r["comparable_count"] > 0 and NEW._cma_cache["projects"] is None)
+    projects, report = await _REAL_FETCH("k", "t")   # Market Pulse path: no batch budget
+    NEW._get_json_with_retry, NEW.CMA_BATCH_BUDGET_SECONDS = saved_retry, saved_budget
+    check("Market Pulse pull (no batch_timeout) keeps the original no-ceiling behaviour",
+          all(b["ok"] for b in report) and len(report) == 4)
+
+NEW.CMA_BATCH_BUDGET_SECONDS, _saved_budget = NEW.CMA_BATCH_BUDGET_SECONDS, NEW.CMA_BATCH_BUDGET_SECONDS
+asyncio.run(scenario_batch_budget())
+NEW.CMA_BATCH_BUDGET_SECONDS = _saved_budget
+
+print("\n[5b] URA token is cached by the SINGAPORE day")
+from datetime import timezone, timedelta  # noqa: E402
+check("_sgt_today is UTC+8", NEW._sgt_today() == datetime.now(timezone(timedelta(hours=8))).date())
+NEW._token_cache.update({"token": "cached-token", "fetched_on": NEW._sgt_today()})
+check("same SGT day -> cached token, no network", asyncio.run(_REAL_TOKEN("k")) == "cached-token")
+NEW._token_cache.update({"token": None, "fetched_on": None})
 
 
 async def scenario_seed_from_pulse():
@@ -359,7 +424,7 @@ LOG = logging.getLogger("condo-test")
 LOG.addHandler(logging.NullHandler())
 LOG.propagate = False
 
-NS = {"re": re, "datetime": datetime, "logger": LOG, "ura_market_pulse": NEW, "Optional": None}
+NS = {"re": re, "datetime": datetime, "logger": LOG, "ura_market_pulse": NEW, "Optional": None, "types": types}
 
 
 def run_nodes(*names):
@@ -375,7 +440,10 @@ def run_span(first, last):
     exec(compile(code, MAIN, "exec"), NS)
 
 
-run_nodes("_HOUSE_NUMBER_PREFIX_RE", "_UNIT_NUMBER_RE")
+run_nodes("_HOUSE_NUMBER_PREFIX_RE", "_UNIT_NUMBER_RE", "_STREET_SUFFIXES", "_ADDRESS_NUMBER_RE",
+          "_NON_STREET_WORDS", "_address_number_hits", "_strip_address_numbers", "_to_number",
+          "_format_price_millions", "_price_leak_strings", "_strip_price_leaks",
+          "apply_listing_copy_guards", "_guard_features")
 run_span("_fmt_writeup_num", "_build_writeup_facts_block")
 run_nodes("_strip_land_fields_for_strata", "_generate_listing_text_only", "_basic_listing_fallback",
           "_normalize_district", "_extract_district_token", "_listing_district_label",
@@ -394,7 +462,9 @@ check("floor band only", [NS["_normalize_floor_level"](x) for x in ("high", "Mid
 cp = NS["_clean_project_name"]
 for raw, exp in [("The Sail @ Marina Bay #12-03", "The Sail @ Marina Bay"),
                  ("#05-11 Parc Esta", "Parc Esta"), ("Blk 12 The Interlace", "The Interlace"),
-                 ("Unit 5-12 Reflections", "Reflections"), ("", ""), (None, "")]:
+                 ("Unit 5-12 Reflections", "Reflections"), ("8 Saint Thomas", "8 Saint Thomas"),
+                 ("26 Newton #03-01", "26 Newton"), ("8 Hullet", "8 Hullet"),
+                 ("One Pearl Bank unit 12-03", "One Pearl Bank"), ("", ""), (None, "")]:
     check(f"project {raw!r} -> {exp!r}", cp(raw) == exp, cp(raw))
 attrs = NS["_build_listing_attributes"](types.SimpleNamespace(
     project_name="Parc Esta #05-11", tenure="99 yrs", tenure_detail="", floor_level="high",
@@ -406,12 +476,32 @@ check("strata fields always complete, blank for landed",
       NS["_listing_strata_fields"]({"attributes": None}) == {"project_name": "", "tenure": "", "tenure_detail": "",
                                                              "floor_level": "", "top_year": 0, "lease_start_year": 0})
 
+print("\n[6b] unit-number pattern: catches units, not ordinary ranges")
+UR = NS["_UNIT_NUMBER_RE"]
+for t in ["#12-03", "# 12 - 03", "unit 12-03", "Unit no. 5-11", "apt 7-123", "12-03", "05-11",
+          "12-103", "#05-11A", "high floor 12-03 unit"]:
+    check(f"unit caught: {t!r}", bool(UR.search(t)))
+for t in ["10-15 minutes", "20-30 guests", "2018-2020", "$1.2-1.5M", "12-03-2024", "10-12", "1-2",
+          "9123-4567", "3-4 bedrooms", "5-10 mins walk", "06-10 floors", "12-100 sqft", "2-storey",
+          "24-7", "S$1,200-1,500", "30-40 years", "05-10 min", "1,970 sqft", "D15"]:
+    check(f"not a unit: {t!r}", not UR.search(t), UR.search(t))
+gf = NS["_guard_features"]
+check("features guard strips units, keeps the rest",
+      gf("Pool view, unit 05-11, 3 bedrooms, 10-15 mins to MRT") == "Pool view, 3 bedrooms, 10-15 mins to MRT",
+      gf("Pool view, unit 05-11, 3 bedrooms, 10-15 mins to MRT"))
+check("features guard on empty / None", gf("") == "" and gf(None) is None)
+
 print("\n[7] project name stays agent-only")
 listing = {"attributes": {"project_name": "Parc Esta", "show_project_name": True}}
 check("public gate returns nothing (not approved), even with an opt-in flag", NS["_public_project_name"](listing) == "")
 check("project name scrubbed from outward text",
       NS["_scrub_project_name"]("Welcome to Parc Esta, a bright home.", listing, "District 14")
       == "Welcome to District 14, a bright home.")
+check("a number in front of a scrubbed name goes with it (never '26 District 11')",
+      NS["_scrub_project_name"]("Live at 26 Newton today.", {"attributes": {"project_name": "Newton Suites"}}, "District 11")
+      == "Live at 26 Newton today." and
+      NS["_scrub_project_name"]("Live at 26 Newton Suites today.", {"attributes": {"project_name": "Newton Suites"}}, "District 11")
+      == "Live at District 11 today.")
 check("short one-word names are not scrubbed (would eat ordinary words)",
       NS["_scrub_project_name"]("Sky views", {"attributes": {"project_name": "Sky"}}, "District 1") == "Sky views")
 check("scrub is a no-op on landed", NS["_scrub_project_name"]("A home", {}, "District 10") == "A home")
@@ -464,7 +554,6 @@ async def fake_claude(**kw):
     return _Resp("Headline\n\nBody.")
 
 NS["create_claude_message"] = fake_claude
-NS["apply_listing_copy_guards"] = lambda text, **kw: text
 AGENT = {"id": "a1", "name": "Joshua", "agency": "NL", "specialty": "homes"}
 asyncio.run(NS["_generate_listing_text_only"](AGENT, condo_req, "District 14"))
 p = SEEN[-1]
@@ -600,8 +689,13 @@ for supported in (False, True):
     check(f"create (column {'present' if supported else 'absent'}): attributes written only when the column exists",
           ("attributes" in ins) is supported
           and (not supported or ins["attributes"]["project_name"] == "Parc Esta"))
+DB.log.clear()
+asyncio.run(NS["generate_listing"](NS["ListingRequest"](**dict(CONDO_BODY, features="Corner unit #05-11, 10-15 mins to MRT")), agent=AGENT))
+ins = [e for e in DB.log if e[1] == "insert"][0][3]
+check("create: features unit-number guarded before the prompt and the row",
+      "05-11" not in ins["features"] and "10-15 mins" in ins["features"] and "05-11" not in SEEN[-1], ins["features"])
 check("create: write-up prompt never saw the project name", "Parc Esta\n" not in SEEN[-1]
-      and "- Agent-noted features: Parc Esta clubhouse" in SEEN[-1])
+      and "- Agent-noted features: Corner" in SEEN[-1])
 DB.log.clear()
 NS["_attributes_column_supported"] = True
 out = asyncio.run(NS["generate_listing"](NS["ListingRequest"](property_type="Semi-Detached", location="9 X Road",
@@ -630,6 +724,22 @@ check("update: owned keys replaced (cleared tenure clears), foreign keys kept, l
       upd["attributes"] == {"hdb_town": "Tampines", "project_name": "Parc Esta", "top_year": 2022}
       and upd["land_size"] == 0, upd.get("attributes"))
 check("update: response carries flat condo fields", row["project_name"] == "Parc Esta" and row["tenure"] == "")
+DB.row = {"id": "L1", "code": "YOE", "attributes": {"project_name": "Parc Esta", "tenure": "Other",
+                                                     "tenure_detail": "103-year leasehold", "floor_level": "High",
+                                                     "top_year": 2022, "hdb_town": "Tampines"}}
+DB.log.clear()
+NS["update_listing"]("L1", NS["ListingRequest"](property_type="Condominium", location="x", bedrooms="3",
+                                                features="Nice, unit 05-11"), agent=AGENT)
+upd = [e for e in DB.log if e[1] == "update"][0][3]
+check("update that omits the condo fields keeps every saved value", upd["attributes"] == DB.row["attributes"],
+      upd["attributes"])
+check("update: features unit-number guarded on save", "05-11" not in upd["features"], upd["features"])
+DB.log.clear()
+NS["update_listing"]("L1", NS["ListingRequest"](property_type="Condominium", location="x", bedrooms="3", features="",
+                                                floor_level="Low"), agent=AGENT)
+upd = [e for e in DB.log if e[1] == "update"][0][3]
+check("update that sends ONE condo field changes only that one",
+      upd["attributes"] == dict(DB.row["attributes"], floor_level="Low"), upd["attributes"])
 NS["_attributes_column_supported"] = False
 DB.log.clear()
 NS["update_listing"]("L1", NS["ListingRequest"](**CONDO_BODY), agent=AGENT)
@@ -645,6 +755,13 @@ blob = repr(pub)
 check("public page: no project name anywhere, no TOP year, no unit number",
       "Parc Esta" not in blob and "2022" not in blob and "#05" not in blob, blob[:300])
 check("public page: tenure + floor band shown", pub["tenure"] == "Freehold" and pub["floor_level"] == "High")
+pub_o = NS["_public_listing_payload"]({"id": "L3", "agent_id": "a1", "property_type": "Apartment", "location": "x",
+                                       "price": "1", "content": "x", "features": "Corner unit #05-11, unit 12-03",
+                                       "attributes": {"tenure": "Other", "tenure_detail": "call me 9123 4567 lol"}})
+check("public page: tenure_detail (agent free text) never served; 'Other' alone shows blank",
+      pub_o["tenure"] == "" and "9123" not in repr(pub_o))
+check("public page: unit numbers stripped from old, unguarded features on serve",
+      "05-11" not in pub_o["features"] and "12-03" not in pub_o["features"], pub_o["features"])
 pub_l = NS["_public_listing_payload"]({"id": "L2", "agent_id": "a1", "property_type": "GCB", "location": "1 Nassim Road",
                                        "price": "1", "content": "x"})
 check("public page landed: condo keys blank", pub_l["tenure"] == "" and pub_l["floor_level"] == "")
@@ -755,6 +872,17 @@ for rows, label in (([{"id": 1, "gcb_transactions": "40 units", "source": "ura_a
     check(f"Market Pulse ({label}) carries the source notice",
           mp["source_licence_url"] == "https://data.gov.sg/open-data-licence" and mp["source_disclaimer"]
           and mp["source_attribution"])
+
+print("\n[16] Market Pulse save drops non-column keys")
+run_nodes("_MARKET_PULSE_COLUMNS", "_market_pulse_row")
+NS["_market_pulse_columns_supported"] = True
+row = NS["_market_pulse_row"]({"gcb_transactions": "40 units", "source": "manual", "partial": False,
+                               **NEW.source_notice(), "batches_ok": 4, "raw_projects": 999, "bogus": 1})
+check("source_* / diagnostics / unknown keys dropped, real columns kept",
+      row == {"id": 1, "gcb_transactions": "40 units", "source": "manual", "partial": False}, row)
+NS["_market_pulse_columns_supported"] = False
+check("freshness columns still dropped before their migration",
+      "partial" not in NS["_market_pulse_row"]({"partial": False, "refreshed_at": "x", "gcb_largest": "1"}))
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

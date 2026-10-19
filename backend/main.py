@@ -27,6 +27,7 @@ import time
 import random
 import logging
 import math
+import types
 from datetime import datetime, timedelta, date, timezone
 from urllib.parse import quote, urlsplit
 from PIL import Image as PILImage, ImageEnhance, ImageOps, ImageStat
@@ -259,6 +260,10 @@ async def startup_event():
     asyncio.create_task(asyncio.to_thread(_probe_property_types_column))
     # NestList Home: the optional listings.attributes jsonb column (condo-family fields).
     asyncio.create_task(asyncio.to_thread(_probe_attributes_column))
+    # URA comparables outages on the CMA path go to Telegram (throttled), not just the log.
+    ura_market_pulse.set_failure_alert(
+        lambda msg: send_telegram_alert_throttled(
+            "ura_cma_fetch_failed", f"⚠️ <b>NestList Warning</b>\n\n{msg}"))
     # Background photo upscaling. Hands the module a storage-client factory rather than
     # a client, so it always picks up a fresh connection after _reset_db(). No worker
     # thread starts until the first photo is actually queued.
@@ -1293,7 +1298,22 @@ def confirm_password_reset(req: PasswordResetConfirm):
 # Layer 1a: leading block/house number -- "22G Tembeling Road" -> "Tembeling Road".
 _HOUSE_NUMBER_PREFIX_RE = re.compile(r"^\s*\d{1,4}[A-Za-z]?\s+(?=\D)")
 # Layer 1b/2b: HDB-style unit number anywhere -- "#03-04".
-_UNIT_NUMBER_RE = re.compile(r"#\d{1,3}-\d{1,5}[A-Za-z]?")
+# Singapore unit numbers, three spellings:
+#   "#12-03" / "# 12 - 03"         -- the hash form, always a unit
+#   "unit 12-03", "apt no. 5-11"    -- an explicit unit word in front
+#   bare "12-03", "05-11", "12-103" -- only when it LOOKS like a unit: the floor is
+#     zero-padded ("05-..."), or the unit part is zero-padded or 3-4 digits ("..-03",
+#     "..-103"). Ordinary ranges in prose ("10-15 minutes", "20-30 guests", "2018-2020",
+#     "$1.2-1.5M", "12-03-2024") don't have that shape, and a trailing time/measure word
+#     rules out the rest.
+_UNIT_NUMBER_RE = re.compile(
+    r"#\s?\d{1,3}\s?-\s?\d{1,5}[A-Za-z]?"
+    r"|\b(?:unit|apt|apartment)\.?\s*(?:no\.?\s*)?#?\d{1,3}-\d{1,5}[A-Za-z]?\b"
+    r"|(?<![\w$.,/#-])(?:0[1-9]-\d{2,4}|\d{2}-(?:0\d{1,3}|\d{3,4}))[A-Za-z]?(?![\w%/-])"
+    r"(?!\s*(?:min|hr|hour|day|week|month|year|yr|sq|km|m\b|metre|meter|storey|stor|%|per|"
+    r"bed|bath|room|pax|people|guest|car|floor|level|lvl|psf|k\b|deg))",
+    re.IGNORECASE,
+)
 
 # Layer 2a: a house number the model reconstructed mid-sentence. Anchored on
 # Singapore street suffixes so plain listing numbers ("1,970 sqft", "3 bedrooms")
@@ -1452,6 +1472,7 @@ def _strip_address_numbers(text: str) -> tuple:
         text = _UNIT_NUMBER_RE.sub("", text)
         text = re.sub(r"[ \t]{2,}", " ", text)
         text = re.sub(r"\s+([,.;])", r"\1", text)
+        text = re.sub(r",(?:\s*,)+", ",", text)   # "view, unit 05-11, 3 beds" -> no ",,"
     return text, stripped
 
 
@@ -1542,6 +1563,16 @@ def apply_listing_copy_guards(text: str, price=None, built_up=None, context: str
     except Exception as e:
         logger.error("copy guard [%s] failed, returning ungated text: %s", context, e)
         return text
+
+
+def _guard_features(features):
+    """House/unit-number guard for the agent's free-text Key Features -- applied when it is
+    saved AND when it is served. Price is NOT stripped here (features have never been
+    price-guarded and an agent may legitimately note e.g. a maintenance fee). Never raises,
+    never empties."""
+    if not features:
+        return features
+    return apply_listing_copy_guards(str(features), price=None, built_up=None, context="features")
 
 
 # ================================
@@ -1798,6 +1829,8 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     # -- and the agent is told -- rather than stored and shown to buyers. Only when NO type
     # on the listing is landed, so a mixed landed+condo listing keeps its land figures.
     _strip_land_fields_for_strata(req, resolved_property_types, warnings)
+    # Unit/house numbers out of Key Features before they reach the prompt or the row.
+    req.features = _guard_features(req.features) or ""
 
     if issues:
         return {"compliance": {"passed": passed, "warnings": warnings, "issues": issues}, "listing": None}
@@ -2166,11 +2199,12 @@ def _normalize_floor_level(raw) -> str:
 
 
 def _clean_project_name(raw) -> str:
-    """Project/development name with any unit number ("#12-03"), block/house-number
-    prefix and stray whitespace removed. Stored for the agent's own record only."""
+    """Project/development name with any unit number ("#12-03", "unit 12-03") and
+    "Blk 12"-style tokens removed. Stored for the agent's own record only."""
+    # Only unit/block tokens go. A leading number is often PART of the name ("8 Saint
+    # Thomas", "26 Newton", "8 Hullet"), so it is never stripped on its own.
     text = _UNIT_NUMBER_RE.sub(" ", str(raw or ""))
-    text = re.sub(r"\b(?:unit|blk|block)\s*[#\d][\w-]*", " ", text, flags=re.IGNORECASE)
-    text = _HOUSE_NUMBER_PREFIX_RE.sub("", text)
+    text = re.sub(r"\b(?:unit|blk|block|apt|no)\.?\s*#?\d[\w-]*", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s{2,}", " ", text).strip(" ,-#")
     return text[:120]
 
@@ -2215,6 +2249,26 @@ def _build_listing_attributes(req) -> dict:
         logger.error("listing attributes could not be built (ignored): %s", e)
         return {}
     return out
+
+
+def _merge_listing_attributes(prev: dict, req) -> dict:
+    """Saved attributes + only the condo fields present in the request body. Never raises:
+    on trouble the saved attributes are returned unchanged."""
+    prev = prev if isinstance(prev, dict) else {}
+    try:
+        sent = set(getattr(req, "model_fields_set", None) or getattr(req, "__fields_set__", None) or ())
+        sent_owned = {k for k in _STRATA_ATTRIBUTE_KEYS if k in sent}
+        if not sent_owned:
+            return dict(prev)
+        view = {k: (getattr(req, k) if k in sent_owned else prev.get(k, "")) for k in _STRATA_ATTRIBUTE_KEYS}
+        for k in ("top_year", "lease_start_year"):
+            view[k] = view[k] or 0
+        merged = {k: v for k, v in prev.items() if k not in _STRATA_ATTRIBUTE_KEYS}
+        merged.update(_build_listing_attributes(types.SimpleNamespace(**view)))
+        return merged
+    except Exception as e:
+        logger.error("attribute merge failed, keeping saved values: %s", e)
+        return dict(prev)
 
 
 def _listing_attributes(listing) -> dict:
@@ -2265,8 +2319,10 @@ def _scrub_project_name(text, listing, district_label: str):
             return text
         if len(name) < 6 and " " not in name:
             return text
-        return re.sub(r"(?<!\w)" + re.escape(name) + r"(?!\w)", district_label or "the development",
-                      text, flags=re.IGNORECASE)
+        # A number written in front of the name ("26 Newton" when the stored name is just
+        # "Newton") goes WITH it, so the result can never read "26 District 11".
+        return re.sub(r"(?<!\w)(?:\d{1,4}[A-Za-z]?\s+)?" + re.escape(name) + r"(?!\w)",
+                      district_label or "the development", text, flags=re.IGNORECASE)
     except Exception as e:
         logger.error("project-name scrub failed (returning text as-is): %s", e)
         return text
@@ -2599,10 +2655,19 @@ def _probe_market_pulse_columns():
                        "ADD COLUMN IF NOT EXISTS refreshed_at text, "
                        "ADD COLUMN IF NOT EXISTS partial boolean;)")
 
+# The market_pulse table's columns. Anything else in a body is dropped before the upsert:
+# responses now carry the source notice (source_attribution / source_licence_url /
+# source_disclaimer) and refresh diagnostics (batches_ok, raw_projects), and the admin
+# Edit -> Save posts the whole object back -- an unknown key would fail the write.
+_MARKET_PULSE_COLUMNS = ("gcb_transactions", "gcb_total_value", "gcb_avg_psf", "gcb_largest",
+                         "nassim_range", "last_updated", "refreshed_at", "partial", "source")
+
+
 def _market_pulse_row(stats: dict) -> dict:
     """Build the id=1 upsert payload, dropping freshness columns the DB doesn't
     have yet so a not-yet-migrated market_pulse table can never break the write."""
-    row = {"id": 1, **stats}
+    stats = stats if isinstance(stats, dict) else {}
+    row = {"id": 1, **{k: v for k, v in stats.items() if k in _MARKET_PULSE_COLUMNS}}
     if not _market_pulse_columns_supported:
         row.pop("refreshed_at", None)
         row.pop("partial", None)
@@ -6212,7 +6277,9 @@ def _public_listing_payload(listing) -> dict:
         context=f"public:{listing['id']}",
     )
     public_content = _scrub_own_street(public_content, own_location, district_label)
-    public_features = _scrub_own_street(listing.get("features"), own_location, district_label)
+    # Features are agent free text and never went through the copy guard: strip any
+    # house/unit number before the street scrub (older rows were saved unguarded).
+    public_features = _scrub_own_street(_guard_features(listing.get("features")), own_location, district_label)
     # Condo family: the project name pins the location the way a street does, and it is
     # agent-only until Jane decides otherwise -- scrub it from outward text too.
     public_content = _scrub_project_name(public_content, listing, district_label)
@@ -6263,7 +6330,9 @@ def _public_listing_payload(listing) -> dict:
         # NestList Home (additive; blank for landed). Tenure and a floor BAND only -- no
         # project name (see _public_project_name), no TOP/lease year (with the district
         # they can narrow a condo to one development), never a floor or unit number.
-        "tenure": _strata["tenure"] if _strata["tenure"] != "Other" else _strata["tenure_detail"],
+        # Normalised tenure only. tenure_detail is the agent's free text and stays agent-only
+        # (it could carry anything); "Other" alone tells a buyer nothing, so it is blank.
+        "tenure": _strata["tenure"] if _strata["tenure"] != "Other" else "",
         "floor_level": _strata["floor_level"],
         "agent": {"name": agent_info.get("name"), "agency": agent_info.get("agency")}
     }
@@ -6768,6 +6837,7 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
     _primary_type, resolved_property_types = _resolve_property_types(req)
     req.property_type = _primary_type
     _strip_land_fields_for_strata(req, resolved_property_types, None)
+    req.features = _guard_features(req.features) or ""
     update_payload = {
         # Saving here always promotes the row to "active" -- this is the same
         # endpoint used both for editing an existing active listing (already
@@ -6796,15 +6866,14 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
     # stays in sync with the form, mirroring how district always overwrites on update.
     if _property_types_column_supported:
         update_payload["property_types"] = resolved_property_types
-    # Condo-family fields. The form always sends the full set, so the keys THIS backend owns
-    # are replaced wholesale (a cleared tenure really clears); any other key in attributes
-    # (a later phase's) is carried over untouched.
+    # Condo-family fields: only the ones this request actually SENT change (sent blank =
+    # cleared). One the client left out keeps its saved value -- an older form, or any
+    # edit path that doesn't know about condo fields, can never wipe them. Keys a later
+    # phase adds to attributes are carried over untouched.
     if _attributes_column_supported:
         _prev = existing.data[0].get("attributes")
         _prev = _prev if isinstance(_prev, dict) else {}
-        _merged = {k: v for k, v in _prev.items() if k not in _STRATA_ATTRIBUTE_KEYS}
-        _merged.update(_build_listing_attributes(req))
-        update_payload["attributes"] = _merged
+        update_payload["attributes"] = _merge_listing_attributes(_prev, req)
     # Discreet buyer-link code. An override sets it; otherwise we only *fill in* a
     # code when the listing has none yet -- an ordinary field edit must never
     # clobber an existing code (e.g. the demo listing's YOE). Wrapped whole so it
