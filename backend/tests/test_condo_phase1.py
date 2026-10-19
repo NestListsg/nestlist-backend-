@@ -837,8 +837,8 @@ NS["_attributes_column_supported"] = True
 out = asyncio.run(NS["generate_listing"](NS["ListingRequest"](property_type="Semi-Detached", location="9 X Road",
                                                                land_size=3000, bedrooms="4", features=""), agent=AGENT))
 ins = [e for e in DB.log if e[1] == "insert"][0][3]
-check("create landed: land size kept, only owner consent in attributes, no condo warning",
-      ins["land_size"] == 3000 and ins["attributes"] == {"owner_consent_confirmed": False}
+check("create landed (consent not sent): land size kept, no attributes written, no condo warning",
+      ins["land_size"] == 3000 and "attributes" not in ins
       and not any("doesn't apply" in w for w in out["compliance"]["warnings"]))
 
 async def _boom(*a, **k):

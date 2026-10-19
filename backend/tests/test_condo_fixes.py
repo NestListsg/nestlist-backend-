@@ -264,8 +264,12 @@ r = D(PH_RAW, "", CA, 24, "Dunman")
 check("S1: 'Dunman' with no street -> ambiguous, no DUNMAN VIEW guess",
       r["project_match"] == "ambiguous" and r["records"] == [] and r["matched_project"] == "")
 r = D(PH_RAW, "Dunman Road", CA, 24, "Dunman")
-check("S1: 'Dunman' + Dunman Road: only DUNMAN VIEW starts with it -> that one",
-      r["matched_project"] == "DUNMAN VIEW" and [x["price"] for x in r["records"]] == [1700000.0])
+check("N5: 'Dunman' + Dunman Road: GRAND DUNMAN is on it too -> ambiguous, street sales used",
+      r["project_match"] == "ambiguous" and r["matched_project"] == "" and r["matched_on"] == "street"
+      and sorted(x["price"] for x in r["records"]) == [1700000.0, 2100000.0], r)
+r = D(PH_RAW, "Jiak Kim Street", CA, 24, "Riviere")
+check("N5: one word + street with only one development carrying it -> matched (exact here)",
+      r["matched_project"] == "RIVIERE")
 r = D(PH_RAW, "Dunman Road", CA, 24, "Grand Dunman")
 check("'Grand Dunman' -> exact GRAND DUNMAN", r["project_match"] == "exact" and r["matched_project"] == "GRAND DUNMAN")
 r = D(PH_RAW, "", CA, 24, "Reflections")

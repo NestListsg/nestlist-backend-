@@ -285,14 +285,16 @@ check("public agent block, condo + incomplete: blank CEA keys", pab(BARE_AGENT, 
 # ---------------------------------------------------------------------------
 print("\n[4] owner consent")
 CC = NS["_consent_attributes_for_create"]
-check("create, ticked -> True + timestamp", CC(types.SimpleNamespace(owner_consent_confirmed=True))["owner_consent_confirmed"]
-      is True and CC(types.SimpleNamespace(owner_consent_confirmed=True))["owner_consent_at"].startswith("20"))
-check("create, missing (stale client) -> recorded False, no timestamp",
-      CC(types.SimpleNamespace()) == {"owner_consent_confirmed": False}
-      and CC(types.SimpleNamespace(owner_consent_confirmed=None)) == {"owner_consent_confirmed": False})
 CU = NS["_consent_attributes_for_update"]
 LR = NS["ListingRequest"]
 base = dict(property_type="Condominium", location="x", bedrooms="2", features="")
+ticked = CC(LR(**base, owner_consent_confirmed=True))
+check("create, ticked -> True + timestamp", ticked["owner_consent_confirmed"] is True
+      and ticked["owner_consent_at"].startswith("20"))
+check("create, explicitly NOT ticked -> recorded False (blocks posting)",
+      CC(LR(**base, owner_consent_confirmed=False)) == {"owner_consent_confirmed": False})
+check("create, not sent (stale cached client) -> NO key at all (posts like a legacy listing)",
+      CC(LR(**base)) == {} and CC(LR(**base, owner_consent_confirmed=None)) == {} and CC(types.SimpleNamespace()) == {})
 check("edit not sending consent: saved value untouched", CU({"owner_consent_confirmed": True}, LR(**base)) == {})
 check("edit ticking: True + new timestamp",
       CU({"owner_consent_confirmed": False}, LR(**base, owner_consent_confirmed=True))["owner_consent_confirmed"] is True)
@@ -403,7 +405,8 @@ ins = [e for e in db.log if e[1] == "insert"][0][2]
 check("condo + incomplete CEA: no block, warning + cea_missing returned",
       "CEA Reg No" not in ins["content"] and out["cea_missing"] == ["cea_reg_no", "agency_name", "agency_licence_no"]
       and any("CEA details are incomplete" in w for w in out["compliance"]["warnings"]))
-check("stale client (no consent sent) -> recorded False", ins["attributes"]["owner_consent_confirmed"] is False)
+check("stale client (no consent sent) -> no consent key, so posting is not blocked",
+      "owner_consent_confirmed" not in ins.get("attributes", {}))
 db = _DB(CEA_AGENT)
 _use(db)
 out = asyncio.run(NS["generate_listing"](LR(property_type="Semi-Detached", location="9 X Road", bedrooms="4",
@@ -443,6 +446,12 @@ check("generate-writeup condo: CEA block appended", r["writeup"].endswith(NS["_c
 r = asyncio.run(NS["generate_writeup"](WR(property_type="Condominium"), agent=BARE_AGENT))
 check("generate-writeup condo, incomplete CEA: warning", "CEA" not in r["writeup"] and r["warnings"]
       and r["cea_missing"])
+r = asyncio.run(NS["generate_writeup"](WR(property_type="Condominium", property_types=["Condominium", "Semi-Detached"]),
+                                       agent=CEA_AGENT))
+check("N1 generate-writeup condo + landed types: no CEA", "CEA" not in r["writeup"] and r["cea_missing"] == [])
+r = asyncio.run(NS["generate_writeup"](WR(property_type="Condominium", property_types=["Condominium", "Apartment"]),
+                                       agent=CEA_AGENT))
+check("N1 generate-writeup all condo types: CEA", r["writeup"].endswith(NS["_cea_text_block"](CEA_AGENT)))
 r = asyncio.run(NS["generate_writeup"](WR(property_type="Detached/Bungalow"), agent=CEA_AGENT))
 check("generate-writeup landed: unchanged text, no CEA", r["writeup"] == "Body.\n\nYour Home. Your Next Chapter."
       and r["cea_missing"] == [] and r["warnings"] == [])
@@ -454,7 +463,12 @@ _use(db)
 NS["create_seller"](NS["SellerLeadRequest"](**{k: v for k, v in dict(
     seller_name="S", location="x", property_type="Condominium").items()}), agent=CEA_AGENT)
 ins = [e for e in db.log if e[1] == "insert"][0][2]
-check("new seller lead: owner consent recorded False", ins["attributes"] == {"owner_consent_confirmed": False})
+check("new seller lead without consent: no key (no attributes written)", "attributes" not in ins)
+db = _DB(CEA_AGENT)
+_use(db)
+NS["create_seller"](NS["SellerLeadRequest"](seller_name="S", location="x", owner_consent_confirmed=False), agent=CEA_AGENT)
+check("new seller lead with consent explicitly false: recorded",
+      [e for e in db.log if e[1] == "insert"][0][2]["attributes"] == {"owner_consent_confirmed": False})
 NS["_attributes_column_supported"] = False
 db = _DB(CEA_AGENT)
 _use(db)
@@ -506,23 +520,70 @@ check("LANDED page: no project name, no price label, no eligibility, agent = {na
       pub_l["project_name"] == "" and pub_l["price_label"] == "" and pub_l["ec_eligibility"] == ""
       and set(pub_l["agent"]) == {"name", "agency"})
 
+print("\n[7b] N2: CEA block never served on a non-Home listing")
+BLOCK = NS["_cea_text_block"](CEA_AGENT)
+WITH = "A lovely home.\n\nYour Home. Your Next Chapter.\n\nJanel | NL Realty Specialist\n\n" + BLOCK
+st = NS["_strip_cea_block"](WITH)
+check("strip removes name|phone line, reg no and agency licence, keeps the rest",
+      "CEA Reg No" not in st and "Licence No" not in st and "9123 4567" not in st
+      and st.endswith("Janel | NL Realty Specialist"), repr(st))
+check("strip: one-line poster form removed too",
+      NS["_strip_cea_block"]("x\n" + NS["_cea_licence_line"](CEA_AGENT)) == "x")
+check("strip leaves ordinary text alone (incl. a '|' line not above a CEA line)",
+      NS["_strip_cea_block"]("A | B\nAgency: we love it") == "A | B\nAgency: we love it")
+check("strip: a text that is only the block comes back empty; None/'' never raise",
+      NS["_strip_cea_block"](BLOCK) == "" and NS["_strip_cea_block"](None) is None
+      and NS["_strip_cea_block"]("") == "")
+H = NS["_home_safe_text"]
+check("Home listing keeps its block", H({"property_type": "Condominium"}, WITH) == WITH)
+check("type changed to landed -> block gone", "CEA Reg No" not in H({"property_type": "Semi-Detached"}, WITH))
+check("mixed condo + landed -> block gone",
+      "CEA" not in H({"property_type": "Condominium", "property_types": ["Condominium", "Corner Terrace"]}, WITH))
+db = _DB(CEA_AGENT)
+_use(db)
+pub = NS["_public_listing_payload"]({"id": "L9", "agent_id": "a1", "property_type": "Semi-Detached",
+                                     "location": "9 X Road", "price": "1", "content": WITH})
+check("buyer page, ex-condo now landed: no CEA in content", "CEA Reg No" not in pub["content"]
+      and "Licence" not in pub["content"])
+run_nodes("_pg_export_price", "_pg_export_count", "_pg_export_measure", "_build_propertyguru_text_block")
+pg = NS["_build_propertyguru_text_block"]({"property_type": "Detached/Bungalow", "location": "x", "content": WITH})
+check("PropertyGuru export, landed: no CEA", "CEA Reg No" not in pg)
+pg = NS["_build_propertyguru_text_block"]({"property_type": "Condominium", "location": "x", "content": WITH})
+check("PropertyGuru export, condo: CEA kept", "CEA Reg No: R123456A" in pg)
+check("My Listings rows are served through the same strip",
+      'row["content"] = _home_safe_text(row, row.get("content"))' in SRC)
+
 # ---------------------------------------------------------------------------
 print("\n[8] poster: condo price + CEA footer; landed poster byte-identical")
 import poster_renderer as PR  # noqa: E402
 from PIL import Image  # noqa: E402
 
-old_src = subprocess.run(["git", "show", "7ef82be:backend/poster_renderer.py"], cwd=REPO,
-                         capture_output=True, text=True).stdout
-OLD_PR = types.ModuleType("poster_renderer_old")
-OLD_PR.__file__ = os.path.join(BACKEND, "poster_renderer.py")
-exec(compile(old_src, OLD_PR.__file__, "exec"), OLD_PR.__dict__)
+def _git_show(spec):
+    """Source of a file at a pushed commit, or None when not inside the git repo (e.g. a
+    deploy image) -- the golden comparisons are then SKIPPED, never an error."""
+    try:
+        r = subprocess.run(["git", "show", spec], cwd=REPO, capture_output=True, text=True, timeout=30)
+        return r.stdout if r.returncode == 0 and r.stdout else None
+    except Exception:
+        return None
+
+
 args = dict(property_type="SEMI-DETACHED", district="DISTRICT 15", price_text="SGD 4.2M",
             stats=["4 Rooms", "3 Baths"], agent_name="Janel", agent_contact_line="9123 4567")
-same = True
-for tid in PR.TEMPLATES:
-    if PR.render_poster(**args, template_id=tid).tobytes() != OLD_PR.render_poster(**args, template_id=tid).tobytes():
-        same = False
-check(f"no compliance line: all {len(PR.TEMPLATES)} templates pixel-identical to before", same)
+old_src = _git_show("7ef82be:backend/poster_renderer.py")
+check("golden source lookup outside git -> None (test skips, never errors)",
+      _git_show("0000000000000000000000000000000000000000:nope") is None)
+if old_src is None:
+    print("  SKIP  landed poster golden (not inside the git repo)")
+else:
+    OLD_PR = types.ModuleType("poster_renderer_old")
+    OLD_PR.__file__ = os.path.join(BACKEND, "poster_renderer.py")
+    exec(compile(old_src, OLD_PR.__file__, "exec"), OLD_PR.__dict__)
+    same = True
+    for tid in PR.TEMPLATES:
+        if PR.render_poster(**args, template_id=tid).tobytes() != OLD_PR.render_poster(**args, template_id=tid).tobytes():
+            same = False
+    check(f"no compliance line: all {len(PR.TEMPLATES)} templates pixel-identical to before", same)
 band = PR.render_poster(**args, template_id="editorial", compliance_line=NS["_cea_licence_line"](CEA_AGENT))
 check("with the CEA line: still 1200x1500 (Instagram 4:5), differs from the plain poster",
       band.size == (1200, 1500) and band.tobytes() != PR.render_poster(**args, template_id="editorial").tobytes())
@@ -567,17 +628,19 @@ for ptype, agent, expect_line, expect_price in [
 # ---------------------------------------------------------------------------
 print("\n[9] video end slate: extra lines drawn; single-line contact pixel-identical")
 import video_renderer as VR  # noqa: E402
-old_vr = subprocess.run(["git", "show", "7ef82be:backend/video_renderer.py"], cwd=REPO,
-                        capture_output=True, text=True).stdout
-tree = ast.parse(old_vr)
-fn = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_render_contact_card"][0]
-old_ns = dict(VR.__dict__)
-exec(compile("\n".join(old_vr.splitlines()[fn.lineno - 1:fn.end_lineno]), "old_vr", "exec"), old_ns)
+old_vr = _git_show("7ef82be:backend/video_renderer.py")
 face = Image.new("RGB", (400, 500), (120, 90, 70))
-for photo in (None, face):
-    check(f"single-line contact ({'photo' if photo else 'no photo'}): identical to before",
-          VR._render_contact_card("Janel", "9123 4567", photo).tobytes()
-          == old_ns["_render_contact_card"]("Janel", "9123 4567", photo).tobytes())
+if old_vr is None:
+    print("  SKIP  landed end-slate golden (not inside the git repo)")
+else:
+    tree = ast.parse(old_vr)
+    fn = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_render_contact_card"][0]
+    old_ns = dict(VR.__dict__)
+    exec(compile("\n".join(old_vr.splitlines()[fn.lineno - 1:fn.end_lineno]), "old_vr", "exec"), old_ns)
+    for photo in (None, face):
+        check(f"single-line contact ({'photo' if photo else 'no photo'}): identical to before",
+              VR._render_contact_card("Janel", "9123 4567", photo).tobytes()
+              == old_ns["_render_contact_card"]("Janel", "9123 4567", photo).tobytes())
 multi = VR._render_contact_card("Janel", "9123 4567\nSGD 1.5M\nCEA Reg No: R123456A\nAgency: X (Licence No: L3008899K)", face)
 check("multi-line contact renders (and differs)", multi.size == (VR.VW, VR.VH)
       and multi.tobytes() != VR._render_contact_card("Janel", "9123 4567", face).tobytes())

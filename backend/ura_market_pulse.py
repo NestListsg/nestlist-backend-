@@ -525,9 +525,11 @@ def cma_strata_types(nestlist_type: str) -> tuple:
 #      URA's name is never allowed to be the SHORTER one: "Riviere Tower" never matches
 #      RIVIERE. A close match is accepted ONLY when exactly one development fits, and:
 #        - the agent typed 2+ significant words (after dropping the/at/and), or
-#        - the agent typed ONE word and gave a street, and exactly one development on
-#          that street fits. One word with no street ("Dunman": Dunman View? Grand
-#          Dunman?) is ambiguous -- nothing is chosen and the street is used instead.
+#        - the agent typed ONE word and gave a street, exactly one development on that
+#          street fits, AND no other development on that street has the word anywhere
+#          in its name. One word with no street ("Dunman": Dunman View? Grand Dunman?),
+#          or with a street that has both, is ambiguous -- nothing is chosen and the
+#          street is used instead.
 #      When a street is given, a close match must also be on it.
 # The URA name actually used is reported back (matched_project) so the agent can see it.
 _PROJECT_STOPWORDS = {"the", "at", "and"}
@@ -563,6 +565,16 @@ def _match_projects(projects: list, project_name: str, street_keyword: str) -> t
     close = [p for p in projects if _is_close_project(wanted, _project_tokens(p.get("project", "")))]
     if street_keyword:
         close = [p for p in close if _matches_street_keyword(p.get("street", ""), street_keyword)]
+        if len(wanted) < 2 and close:
+            # One word + street: if ANY other development on that street also has the word
+            # in its name ("Dunman" on Dunman Road: DUNMAN VIEW and GRAND DUNMAN), the
+            # agent could mean either -- choose neither.
+            word = wanted[0]
+            with_word = {_project_tokens(p.get("project", "")) for p in projects
+                         if word in _project_tokens(p.get("project", ""))
+                         and _matches_street_keyword(p.get("street", ""), street_keyword)}
+            if len(with_word) > 1:
+                return [], "ambiguous", []
     elif len(wanted) < 2:
         # One word, no street: too easy to pick the wrong development.
         return [], ("ambiguous" if close else ""), []

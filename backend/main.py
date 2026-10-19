@@ -620,7 +620,8 @@ class ListingRequest(BaseModel):
     # The ONLY source for any eligibility wording -- never inferred.
     ec_eligibility: str = Field(default="", max_length=20)
     # ALL listing types: the agent confirms the owner consents to this listing being
-    # advertised. None (an older client that doesn't send it) is recorded as False.
+    # advertised. Recorded ONLY when sent (true or false); not sent (an older or cached
+    # client) records nothing, so the listing posts like any pre-consent listing.
     owner_consent_confirmed: Optional[bool] = None
 
 class ListingContentRequest(BaseModel):
@@ -773,6 +774,8 @@ class SellerLeadRequest(BaseModel):
     mandate_type: str = ""
     temperature: str = "WARM"
     seller_notes: str = ""
+    # Optional; recorded only when sent (see _consent_attributes_for_create).
+    owner_consent_confirmed: Optional[bool] = None
 
 class ChatMessage(BaseModel):
     role: str
@@ -1710,6 +1713,7 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
     active_video_jobs = video_jobs.describe_active_for_agent(agent["id"])
     for row in rows:
         row["display_location"] = _strip_house_number(row.get("location"))
+        row["content"] = _home_safe_text(row, row.get("content"))
         row["agent_code"] = owner_code
         # Feature #7: always expose a consistent property_types list (falls back to
         # [property_type] before the column exists) so the edit form round-trips cleanly.
@@ -2590,22 +2594,64 @@ def _with_cea_fields(out: dict, agent) -> dict:
     return out
 
 
+# Serve-time: a listing that is NOT a Home listing never shows CEA numbers, even if its
+# stored write-up carries the block (it was a condo, then its type changed to landed).
+# Removes: a "Name | phone" line directly above "CEA Reg No:", the "CEA Reg No:" line
+# (including the one-line poster form), and any "Agency: ... (Licence No: ...)" line.
+_CEA_BLOCK_RE = re.compile(
+    r"(?:^[^\n]*\|[^\n]*\n(?=CEA Reg No:))?^CEA Reg No:[^\n]*\n?"
+    r"|^Agency:[^\n]*\(Licence No:[^\n]*\)[^\n]*\n?",
+    re.MULTILINE)
+
+
+def _strip_cea_block(text):
+    """Text with any CEA block removed. Never raises. (A text that was ONLY a CEA block
+    comes back empty: on a non-Home listing the numbers must not show.)"""
+    if not text:
+        return text
+    try:
+        out = _CEA_BLOCK_RE.sub("", str(text))
+        return re.sub(r"\n{3,}", "\n\n", out).rstrip()
+    except Exception as e:
+        logger.error("CEA block strip failed (text served as-is): %s", e)
+        return text
+
+
+def _home_safe_text(listing, text):
+    """Outward text for a listing: unchanged on a Home (condo-family-only) listing; any
+    CEA block stripped on every other listing (Prestige/landed never shows the numbers)."""
+    src = listing if isinstance(listing, dict) else {}
+    if _home_listing_needs_cea(src.get("property_type"), _listing_property_types(src)):
+        return text
+    return _strip_cea_block(text)
+
+
 # --- Owner consent (ALL listing types) ---------------------------------------------------
 # Rule for auto-posting: a listing whose attributes CARRY owner_consent_confirmed and it is
-# not True is refused. Every listing created after this deploy carries the key (an older
-# client that doesn't send it is recorded as False), so it needs the tick. Listings created
-# BEFORE this deploy have no key and keep posting exactly as before.
+# not True is refused. The key is written ONLY when the client actually sent the field: the
+# current form always sends it (true or false), so an explicit "not confirmed" blocks
+# posting. A client that doesn't send it at all -- a pre-consent listing, or an agent on a
+# stale cached frontend -- leaves no key, and that listing posts exactly as before (an
+# old cached page must never strand a listing it can't even show the tick-box for).
 OWNER_CONSENT_REQUIRED_DETAIL = ("This listing hasn't been confirmed as advertised with the owner's "
                                  "consent. Edit the listing, tick the owner-consent box and save, "
                                  "then post again.")
 
 
 def _consent_attributes_for_create(req) -> dict:
-    ok = getattr(req, "owner_consent_confirmed", None) is True
-    out = {"owner_consent_confirmed": ok}
-    if ok:
-        out["owner_consent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    return out
+    """{} unless the client SENT owner_consent_confirmed (true or false). Never raises."""
+    try:
+        sent = set(getattr(req, "model_fields_set", None) or getattr(req, "__fields_set__", None) or ())
+        value = getattr(req, "owner_consent_confirmed", None)
+        if "owner_consent_confirmed" not in sent or value is None:
+            return {}
+        out = {"owner_consent_confirmed": value is True}
+        if value is True:
+            out["owner_consent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return out
+    except Exception as e:
+        logger.error("owner-consent not recorded (listing posts as before): %s", e)
+        return {}
 
 
 def _consent_attributes_for_update(prev: dict, req) -> dict:
@@ -3290,6 +3336,9 @@ class WriteupRequest(BaseModel):
     floor_level: str = Field(default="", max_length=20)
     hide_project_name: bool = False
     ec_eligibility: str = Field(default="", max_length=20)
+    # Optional: every type on the listing (feature #7). CEA details close the write-up only
+    # when ALL of them are condo family; not sent -> the primary type alone decides.
+    property_types: list[str] = Field(default_factory=list, max_length=12)
 
 
 # One Opus-5 vision call per request -- rate-limited per agent. This dict is PER WORKER, and
@@ -3348,7 +3397,7 @@ async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)
     _generate_writeup_hits[agent["id"]] = _hits
 
     cea_missing = []
-    if _home_listing_needs_cea(req.property_type):
+    if _home_listing_needs_cea(req.property_type, _clean_property_types(req.property_types)):
         cea_missing = _cea_missing(agent)
         if not cea_missing:
             writeup = _append_cea_block(writeup, agent)
@@ -6866,6 +6915,7 @@ def _public_listing_payload(listing) -> dict:
         context=f"public:{listing['id']}",
     )
     public_content = _scrub_own_street(public_content, own_location, district_label)
+    public_content = _home_safe_text(listing, public_content)
     # Features are agent free text and never went through the copy guard: strip any
     # house/unit number before the street scrub (older rows were saved unguarded).
     public_features = _scrub_own_street(_guard_features(listing.get("features")), own_location, district_label)
@@ -7832,7 +7882,7 @@ def _build_propertyguru_text_block(listing: dict) -> str:
     if features:
         parts.append("Key Features\n------------\n" + features)
 
-    content = str(listing.get("content") or "").strip()
+    content = str(_home_safe_text(listing, listing.get("content")) or "").strip()
     if content:
         parts.append("Description\n-----------\n" + content)
 
@@ -8293,10 +8343,11 @@ def get_sellers(agent=Depends(get_current_agent)):
 @app.post("/api/sellers")
 def create_seller(req: SellerLeadRequest, agent=Depends(get_current_agent)):
     payload = _seller_lead_payload(req, agent["id"])
-    # A lead becomes a listing through the edit form; recorded as not-yet-confirmed so it
-    # needs the owner-consent tick before auto-posting, like any new listing.
-    if _attributes_column_supported:
-        payload["attributes"] = {"owner_consent_confirmed": False}
+    # Owner consent only when the client sent it (same rule as a listing); otherwise no key,
+    # and the edit form that converts the lead records it then.
+    _consent = _consent_attributes_for_create(req)
+    if _attributes_column_supported and _consent:
+        payload["attributes"] = _consent
     result = db_execute(lambda db: db.table("listings").insert(payload), what="create_seller listings insert", idempotent=False)
     return result.data[0]
 
