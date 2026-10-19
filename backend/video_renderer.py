@@ -45,6 +45,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 import photo_upscale
+import slow_read
 
 logger = logging.getLogger(__name__)
 
@@ -482,6 +483,11 @@ _ENCODE_ARGS = [
 
 CAPTION_MODEL = "claude-sonnet-4-5"  # same model main.py uses for listing copy
 CAPTION_TIMEOUT_SECONDS = 60
+# Ceiling on the whole caption pass, both keys included. This one runs INSIDE the
+# render slot and against RENDER_BUDGET_SECONDS, so an unbounded caption call is worse
+# than an unbounded survey: it holds a slot the fleet only has four of. Generous enough
+# that a healthy pass over ten photos never approaches it.
+CAPTION_BUDGET_SECONDS = 150
 CAPTION_MAX_CHARS = 72
 CAPTION_SEPARATOR = " ... "
 
@@ -1115,23 +1121,79 @@ MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024
 MAX_SOURCE_PIXELS = 80_000_000  # decompression-bomb / phone-panorama guard
 
 
-def _fetch_image(url, attempts=2):
+# One photo download may take this long before it is cut off, and a whole _fetch_image
+# call (both attempts plus the sleep between them) this long. These are DEADLINES, not
+# read timeouts: requests' timeout=(connect, read) is per READ, so a server dribbling a
+# byte just inside the read timeout resets the clock forever and the download never
+# ends. See slow_read for the measurements.
+#
+# 30s is deliberately loose. A listing photo is 100KB-3MB and its 4x upscaled twin a
+# few MB more; on a slow mobile-tethered CDN read that is still minutes of headroom per
+# megabyte, so a healthy fetch never comes near this. The number only has to be small
+# enough that a stuck one cannot pin a worker.
+FETCH_ATTEMPT_SECONDS = 30
+FETCH_TOTAL_SECONDS = 70
+
+
+def _fetch_image(url, attempts=2, deadline=None):
     """Downloads one photo. Streams with a hard byte cap so a mis-uploaded 200MB file
     can't exhaust memory, and retries once because a single flaky CDN read shouldn't
-    cost the agent a whole video."""
+    cost the agent a whole video.
+
+    `deadline` is an absolute time.monotonic() value and bounds the WHOLE call,
+    attempts included -- the survey pass uses it to share one budget across fifteen
+    candidate photos. Omitted, the call bounds itself at FETCH_TOTAL_SECONDS.
+    """
+    overall = deadline if deadline is not None else time.monotonic() + FETCH_TOTAL_SECONDS
     last_error = None
     for attempt in range(attempts):
+        if time.monotonic() >= overall:
+            last_error = last_error or TimeoutError("ran out of time before starting")
+            break
+        attempt_deadline = min(time.monotonic() + FETCH_ATTEMPT_SECONDS, overall)
         try:
-            with requests.get(url, timeout=(5, 25), stream=True) as response:
+            # NOT a `with` block. Letting requests close a streamed response tidily
+            # means waiting out a body that is still arriving in a trickle -- measured
+            # at 80s past the deadline during the Signature work, which is exactly what
+            # this must not do. The `finally` abandons the connection instead.
+            response = requests.get(url, timeout=(5, 25), stream=True)
+            try:
                 response.raise_for_status()
                 declared = response.headers.get("content-length")
                 if declared and int(declared) > MAX_DOWNLOAD_BYTES:
                     raise ValueError(f"photo is {int(declared) // 1024 // 1024}MB, over the {MAX_DOWNLOAD_BYTES // 1024 // 1024}MB limit")
                 buffer = io.BytesIO()
-                for chunk in response.iter_content(chunk_size=64 * 1024):
-                    buffer.write(chunk)
-                    if buffer.tell() > MAX_DOWNLOAD_BYTES:
-                        raise ValueError(f"photo exceeded the {MAX_DOWNLOAD_BYTES // 1024 // 1024}MB limit while downloading")
+                # THE WATCHDOG. The deadline check inside the loop cannot fire while a
+                # read is blocked on a chunk that is filling too slowly; shutting the
+                # socket down from another thread is what unblocks it.
+                try:
+                    with slow_read.deadline_watchdog(response, attempt_deadline):
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            if time.monotonic() > attempt_deadline:
+                                raise TimeoutError("photo download passed its deadline")
+                            buffer.write(chunk)
+                            if buffer.tell() > MAX_DOWNLOAD_BYTES:
+                                raise ValueError(f"photo exceeded the {MAX_DOWNLOAD_BYTES // 1024 // 1024}MB limit while downloading")
+                except ValueError:
+                    raise
+                except Exception:
+                    # A read the watchdog interrupted surfaces here as an ordinary
+                    # transport error ("Response ended prematurely"). Past the deadline
+                    # that is what it is, and saying so is far more use in the logs than
+                    # leaving someone to wonder which CDN broke.
+                    if time.monotonic() > attempt_deadline:
+                        raise TimeoutError("photo download passed its deadline")
+                    raise
+            finally:
+                # Always, on every path: this connection is never reused, and the tidy
+                # close is the slow one.
+                slow_read.abandon_response(response)
+            if time.monotonic() > attempt_deadline:
+                # Either the watchdog cut the read, or the body ended just as the
+                # deadline passed. An interrupted read can look like a clean end of
+                # body, so a download that ran past its deadline is never trusted to
+                # be complete -- decoding it would risk half a photo in the film.
+                raise TimeoutError("photo download passed its deadline")
             buffer.seek(0)
             img = Image.open(buffer)
             if img.width * img.height > MAX_SOURCE_PIXELS:
@@ -1142,7 +1204,7 @@ def _fetch_image(url, attempts=2):
             return ImageOps.exif_transpose(img)
         except Exception as e:
             last_error = e
-            if attempt + 1 < attempts:
+            if attempt + 1 < attempts and time.monotonic() + 1.0 < overall:
                 time.sleep(1.0)
     raise RuntimeError(f"could not fetch photo: {last_error}")
 
@@ -1364,19 +1426,33 @@ def _vision_call(content, timeout, max_tokens=1024, budget=None):
     Shared by the caption pass and the survey pass so there is one place that knows
     about keys, timeouts and retry policy.
 
-    `budget`, when set, is a wall-clock ceiling in seconds for the WHOLE attempt
-    sequence: once it is spent we stop rather than start another key. Without it, two
-    keys x (timeout + one SDK retry) can burn four minutes against a degraded API
-    before the caller gets to fall back.
+    `budget` is a wall-clock ceiling in seconds for the WHOLE attempt sequence, and it
+    is ENFORCED, not merely checked between attempts.
+
+    That distinction is the whole point. The SDK's `timeout` is handed to httpx, where
+    a read timeout is PER READ: an endpoint dribbling a byte just inside it resets the
+    clock forever, so one attempt can run without limit while every individual read
+    looks healthy. Checking the budget between keys cannot help, because the check does
+    not run while the call is blocked. Measured consequence of leaving it advisory: one
+    key at timeout=75 with max_retries=1 can burn ~150s before the budget is consulted
+    at all, and a dribbling endpoint has no bound whatsoever.
+
+    So each attempt runs under an absolute deadline that returns control whether or not
+    the SDK is finished (see slow_read.call_with_deadline). Unlike a photo download
+    there is no socket we can reach -- the SDK owns its httpx client -- so the stuck
+    attempt is abandoned rather than interrupted: we stop waiting, the caller falls
+    back, and the daemon thread dies when httpx eventually gives up. It holds no lock
+    the render needs and writes nothing.
     """
-    started = time.monotonic()
+    deadline = time.monotonic() + (budget if budget is not None else timeout * 2 + 30)
     raw = None
     last_error = None
     for key in _anthropic_keys():
-        if budget is not None and time.monotonic() - started > budget:
-            logger.warning("vision call: budget of %ss spent, not trying another key", budget)
+        if time.monotonic() >= deadline:
+            logger.warning("vision call: budget spent, not trying another key")
             break
-        try:
+
+        def attempt(key=key):
             import anthropic
             # max_retries=1: the render already has a wall-clock budget, and the SDK's
             # default of 2 retries on top of the timeout can burn three minutes on a
@@ -1387,7 +1463,11 @@ def _vision_call(content, timeout, max_tokens=1024, budget=None):
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": content}],
             )
-            raw = "".join(b.text for b in response.content if getattr(b, "type", "") == "text")
+            return "".join(b.text for b in response.content
+                           if getattr(b, "type", "") == "text")
+
+        try:
+            raw = slow_read.call_with_deadline(attempt, deadline, name="vision call")
             break
         except Exception as e:
             last_error = e
@@ -1436,7 +1516,8 @@ def _generate_room_captions(photos, copy_guard=None):
         logger.warning("captions skipped: no Anthropic API key configured")
         return [None] * len(photos), "no API key"
 
-    raw, last_error = _vision_call(content, CAPTION_TIMEOUT_SECONDS)
+    raw, last_error = _vision_call(content, CAPTION_TIMEOUT_SECONDS,
+                                   budget=CAPTION_BUDGET_SECONDS)
     if raw is None:
         logger.warning("captions skipped: Claude call failed (%s)", last_error)
         return [None] * len(photos), f"AI call failed ({type(last_error).__name__})"
@@ -1702,10 +1783,16 @@ def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
     DELIBERATELY OUTSIDE THE RENDER SLOT. This runs before _RENDER_SLOTS.acquire, so a
     model call that takes a minute does not sit on one of the four ffmpeg slots the
     whole fleet has. What bounds the concurrency here instead is video_jobs, which
-    admits at most PER_PROCESS_RENDER_LIMIT Classic jobs per worker, so the number of
-    surveys in flight is already capped before this function is reached. The job's
-    heartbeat runs on its own thread for the whole job, so the extra latency cannot
-    make a claim look stale (STALE_AFTER_SECONDS) and trigger a second render.
+    admits at most PER_PROCESS_RENDER_LIMIT Classic jobs per worker.
+
+    WHICH IS EXACTLY WHY EVERY STEP BELOW HAS AN ENFORCED DEADLINE. That per-worker
+    limit is 1, so this function stalling does not slow a worker down, it stops it:
+    the job stays claimed, and because the heartbeat runs on its own thread it keeps
+    reporting healthy, so sweep_stale (which selects on heartbeat_at alone) never
+    reclaims it. A worker can therefore sit on a dribbling CDN read or a hung API call
+    indefinitely while looking perfectly alive from the outside. The budgets here used
+    to be advisory -- checked only between steps, which is no check at all while a read
+    is blocked -- and are now absolute; see slow_read for why a timeout is not enough.
     """
     try:
         hero = image_urls[photo_index]
@@ -1717,10 +1804,12 @@ def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
             # written by the normal caption pass downstream.
             return None, None, None
 
-        started = time.monotonic()
+        # One deadline shared by all fifteen candidate fetches, passed INTO each one so
+        # it bounds the read itself rather than only the gap between reads.
+        fetch_deadline = time.monotonic() + SURVEY_FETCH_BUDGET_SECONDS
         photos, urls = [], []
         for url in candidates:
-            if time.monotonic() - started > SURVEY_FETCH_BUDGET_SECONDS:
+            if time.monotonic() >= fetch_deadline:
                 logger.warning("photo survey: fetch budget spent after %d of %d photos",
                                len(urls), len(candidates))
                 break
@@ -1730,7 +1819,7 @@ def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
                 # the big one would be bytes and memory spent for nothing. attempts=1
                 # because a flaky read on a candidate should cost that candidate, not
                 # the render's time budget.
-                img = _fetch_image(url, attempts=1)
+                img = _fetch_image(url, attempts=1, deadline=fetch_deadline)
             except Exception as e:
                 logger.debug("photo survey: skipping unreadable candidate (%s)", e)
                 continue

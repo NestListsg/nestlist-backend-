@@ -1,0 +1,220 @@
+"""Deadlines that actually end things, proved against a server that really dribbles.
+
+THE BUG THIS GUARDS. A read timeout in requests and httpx is PER READ. A server that
+sends one byte just inside the timeout resets the clock forever, so a download runs
+without limit while every individual read looks healthy. A deadline checked between
+chunks is no help at all: the check cannot run while a read is blocked on the chunk
+that is filling too slowly.
+
+That matters here more than it looks. The photo survey runs with the job CLAIMED, and
+video_jobs admits one Classic per worker, so a stuck fetch does not slow a worker down,
+it stops it -- while the heartbeat thread keeps reporting healthy, so sweep_stale never
+reclaims the job. An unbounded read is therefore a worker lost until the process is
+restarted.
+
+Everything below uses a real socket and real wall-clock time, because the failure being
+guarded against is specifically that the obvious implementations LOOK right and block
+anyway. A mock would prove nothing.
+"""
+import os, socket, sys, threading, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BACKEND = os.path.dirname(HERE)
+sys.path.insert(0, BACKEND)
+import logging  # noqa: E402
+logging.disable(logging.CRITICAL)
+import slow_read  # noqa: E402
+import video_renderer as vr  # noqa: E402
+
+PASS, FAIL = [], []
+
+
+def check(name, cond, detail=""):
+    (PASS if cond else FAIL).append(name)
+    print(("  PASS  " if cond else "  FAIL  ") + name + (("  -- " + detail) if detail else ""))
+
+
+class DribblingServer:
+    """Sends headers, then one byte every `gap` seconds, forever.
+
+    Never finishes, never errors, and every individual read completes well inside any
+    sane read timeout. This is the shape that defeats timeout=(5, 25).
+    """
+
+    def __init__(self, gap=0.2, declared=None):
+        self.gap = gap
+        self.declared = declared
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return "http://127.0.0.1:%d/slow.jpg" % self.port
+
+    def _serve(self):
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            conn.recv(65536)
+            length = ("Content-Length: %d\r\n" % self.declared) if self.declared else \
+                     "Transfer-Encoding: chunked\r\n"
+            conn.sendall(("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n"
+                          + length + "\r\n").encode())
+            while not self.stop.is_set():
+                if self.declared:
+                    conn.sendall(b"\xff")
+                else:
+                    conn.sendall(b"1\r\n\xff\r\n")
+                time.sleep(self.gap)
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def close(self):
+        self.stop.set()
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+print("\n[the premise] the dribbling server really does defeat a read timeout")
+server = DribblingServer(gap=0.2)
+try:
+    import requests
+    started = time.monotonic()
+    blocked = {}
+
+    def naive():
+        try:
+            with requests.get(server.url, timeout=(5, 25), stream=True) as r:
+                for _chunk in r.iter_content(chunk_size=64 * 1024):
+                    if time.monotonic() - started > 25:
+                        blocked["ran_past"] = time.monotonic() - started
+                        return
+        except Exception as e:
+            blocked["error"] = repr(e)
+
+    t = threading.Thread(target=naive, daemon=True)
+    t.start()
+    t.join(12)
+    check("a plain read-timeout download is STILL RUNNING after 12s, which is the "
+          "bug the deadlines below exist to fix",
+          t.is_alive() or "ran_past" in blocked,
+          "it ended on its own, so this server is not dribbling: %s" % blocked)
+
+    print("\n[_fetch_image] an enforced deadline ends a dribbling download")
+    started = time.monotonic()
+    try:
+        vr._fetch_image(server.url, attempts=1,
+                        deadline=time.monotonic() + 3)
+        took = time.monotonic() - started
+        check("raises rather than returning a half-downloaded photo", False,
+              "returned after %.1fs" % took)
+    except Exception as e:
+        took = time.monotonic() - started
+        check("gives up within a second or so of its deadline (took %.1fs)" % took,
+              2.5 <= took <= 8.0, "%.1fs, %s" % (took, e))
+        check("...and says it was the deadline, not a mystery transport error",
+              "deadline" in str(e).lower() or "timeout" in str(e).lower(), str(e))
+
+    print("\n[_fetch_image] the deadline covers BOTH attempts, not each one")
+    started = time.monotonic()
+    try:
+        vr._fetch_image(server.url, attempts=2, deadline=time.monotonic() + 4)
+    except Exception:
+        pass
+    took = time.monotonic() - started
+    check("two attempts still finish inside the shared deadline (took %.1fs)" % took,
+          took <= 9.0, "%.1fs" % took)
+
+    print("\n[survey] fifteen dribbling candidates cannot outlast the fetch budget")
+    saved_budget = vr.SURVEY_FETCH_BUDGET_SECONDS
+    saved_min = vr.MIN_VIDEO_PHOTOS
+    vr.SURVEY_FETCH_BUDGET_SECONDS = 4
+    try:
+        started = time.monotonic()
+        out = vr._smart_auto_selection([server.url + "?i=%d" % i for i in range(15)], 0)
+        took = time.monotonic() - started
+        check("falls back to upload order rather than hanging (took %.1fs)" % took,
+              out == (None, None, None), str(out))
+        check("...inside the fetch budget, not fifteen times it",
+              took <= 12.0, "%.1fs for 15 candidates" % took)
+    finally:
+        vr.SURVEY_FETCH_BUDGET_SECONDS = saved_budget
+        vr.MIN_VIDEO_PHOTOS = saved_min
+finally:
+    server.close()
+
+print("\n[declared length] a cut-short download is never mistaken for a complete one")
+server2 = DribblingServer(gap=0.2, declared=5_000_000)
+try:
+    started = time.monotonic()
+    try:
+        vr._fetch_image(server2.url, attempts=1, deadline=time.monotonic() + 3)
+        check("a truncated body is rejected", False, "it returned an image")
+    except Exception as e:
+        check("a truncated body is rejected rather than decoded", True, type(e).__name__)
+        check("...and it took about the deadline, not the full body",
+              time.monotonic() - started <= 8.0)
+finally:
+    server2.close()
+
+print("\n[call_with_deadline] work with no reachable socket is abandoned on time")
+started = time.monotonic()
+try:
+    slow_read.call_with_deadline(lambda: time.sleep(30), time.monotonic() + 1.5,
+                                 name="stuck call")
+    check("raises TimeoutError", False, "it returned")
+except TimeoutError:
+    took = time.monotonic() - started
+    check("the CALLER is released on time (took %.1fs)" % took, took <= 3.0, "%.1fs" % took)
+check("a healthy call still returns its value",
+      slow_read.call_with_deadline(lambda: 42, time.monotonic() + 5) == 42)
+try:
+    slow_read.call_with_deadline(lambda: (_ for _ in ()).throw(ValueError("inner")),
+                                 time.monotonic() + 5)
+    check("an exception inside propagates", False, "it did not raise")
+except ValueError as e:
+    check("an exception inside propagates to the caller", str(e) == "inner")
+
+print("\n[_vision_call] a hung SDK call cannot outlast the budget")
+saved = vr._anthropic_keys
+vr._anthropic_keys = lambda: ["key-one-placeholder", "key-two-placeholder"]
+try:
+    import slow_read as _sr
+    real = _sr.call_with_deadline
+    def stuck(fn, deadline, name="call"):
+        return real(lambda: time.sleep(60), deadline, name)
+    _sr.call_with_deadline = stuck
+    try:
+        started = time.monotonic()
+        raw, err = vr._vision_call([{"type": "text", "text": "x"}], timeout=75, budget=3)
+        took = time.monotonic() - started
+        check("returns (None, error) instead of hanging", raw is None and err is not None,
+              "%r %r" % (raw, err))
+        check("...inside the budget even with two keys to try (took %.1fs)" % took,
+              took <= 7.0, "%.1fs" % took)
+    finally:
+        _sr.call_with_deadline = real
+finally:
+    vr._anthropic_keys = saved
+
+print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
+sys.exit(1 if FAIL else 0)

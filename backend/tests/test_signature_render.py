@@ -73,7 +73,7 @@ def capture(module, captions=None, ffmpeg=None, src_photo=None, smart=None, **kw
     module._run_ffmpeg = fake_run_ffmpeg
     module._fetch_listing_photo = lambda url: (src_photo or photo())
     # The agent's portrait. Stubbed so the golden never depends on a live network.
-    module._fetch_image = lambda url, attempts=2: (src_photo or photo())
+    module._fetch_image = lambda url, attempts=2, deadline=None: (src_photo or photo())
     # Smart photo selection is stubbed OUT by default, i.e. "the survey was not
     # available, use upload order". Without this the golden would depend on whether
     # the machine running the tests happens to have an ANTHROPIC_API_KEY set, which

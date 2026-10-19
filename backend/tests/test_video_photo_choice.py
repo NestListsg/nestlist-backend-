@@ -90,7 +90,7 @@ def install_stubs(mod, unreadable=()):
     def write(path, text):
         open(path, "w").write(text)
     mod._fetch_listing_photo = fetch
-    mod._fetch_image = lambda url: "AGENT"
+    mod._fetch_image = lambda url, attempts=2, deadline=None: "AGENT"
     mod._generate_room_captions = lambda photos, copy_guard=None: (["cap(%s)" % p for p in photos], None)
     mod._caption_font_size = lambda captions: 1
     def contain(photo, clip_path, workdir, i, **kw):

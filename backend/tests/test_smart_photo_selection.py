@@ -202,7 +202,7 @@ def run_selection(n=12, fetch=None, survey=None, keys=("k",)):
     saved = {k: getattr(vr, k) for k in
              ("_fetch_image", "_survey_photos", "_anthropic_keys")}
     vr._anthropic_keys = lambda: list(keys)
-    vr._fetch_image = fetch or (lambda url, attempts=2: photo())
+    vr._fetch_image = fetch or (lambda url, attempts=2, deadline=None: photo())
     if survey is not None:
         vr._survey_photos = survey
     try:
@@ -222,14 +222,14 @@ check("every photo unlabelled -> upload order (nothing to select on)",
       run_selection(survey=lambda p, copy_guard=None: ([(vr.SPACE_UNKNOWN, None)] * len(p), None)) == AUTO)
 
 
-def fetch_fails(url, attempts=2):
+def fetch_fails(url, attempts=2, deadline=None):
     raise IOError("cdn down")
 
 
 check("every photo unreadable -> upload order", run_selection(fetch=fetch_fails) == AUTO)
 
 
-def hero_fails(url, attempts=2):
+def hero_fails(url, attempts=2, deadline=None):
     if url == URLS[0]:
         raise IOError("gone")
     return photo()
@@ -240,7 +240,7 @@ check("the HERO unreadable -> upload order, never a film without the star photo"
                     survey=lambda p, copy_guard=None: ([("living", None)] * len(p), None)) == AUTO)
 
 
-def mostly_fail(url, attempts=2):
+def mostly_fail(url, attempts=2, deadline=None):
     if url in URLS[2:]:
         raise IOError("gone")
     return photo()
@@ -294,7 +294,7 @@ def install_stubs(mod, unreadable=(), survey=None):
     calls = []
     del CAPTION_PASS_CALLS[:]
     mod._fetch_listing_photo = lambda u: (_ for _ in ()).throw(IOError("x")) if u in unreadable else "P:" + u
-    mod._fetch_image = lambda u, attempts=2: photo()
+    mod._fetch_image = lambda u, attempts=2, deadline=None: photo()
     def caption_pass(photos, copy_guard=None):
         # Recorded, because "did the caption pass run at all?" is the question behind
         # the one-model-call guarantee on the AUTO path.
