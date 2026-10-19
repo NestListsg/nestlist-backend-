@@ -79,7 +79,7 @@ def capture(module, captions=None, ffmpeg=None, src_photo=None, smart=None, **kw
     # the machine running the tests happens to have an ANTHROPIC_API_KEY set, which
     # would make it pass on one laptop and fail on another. `smart` opts a config in.
     module._smart_auto_selection = (
-        smart if callable(smart) else (lambda urls, idx, copy_guard=None: (None, None)))
+        smart if callable(smart) else (lambda urls, idx, copy_guard=None: (None, None, None)))
     def fake_captions(photos, copy_guard=None):
         return (list(captions) if captions else [None] * len(photos)), None
     module._generate_room_captions = fake_captions
@@ -174,7 +174,7 @@ SMART_CAPTIONS = {
 def smart_survey(urls, photo_index, copy_guard=None):
     """Stands in for a vision survey that worked: a varied four-photo pick with
     captions keyed BY URL, which is the contract _smart_auto_selection promises."""
-    return list(SMART_PICK), dict(SMART_CAPTIONS)
+    return list(SMART_PICK), dict(SMART_CAPTIONS), None
 
 
 def matrix():

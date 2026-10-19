@@ -1686,9 +1686,9 @@ def _varied_order(spaces, limit, minimum):
 
 
 def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
-    """The AUTO path's photo choice: (selected urls, {url: caption}) or (None, None).
+    """The AUTO path's photo choice: (selected urls, {url: caption}, note).
 
-    (None, None) means "use the plain upload-order selection" and is the answer
+    (None, None, None) means "use the plain upload-order selection" and is the answer
     whenever anything at all goes wrong -- no key, a slow or failed model call, a
     reply that does not parse, too few readable photos, an unexpected exception. THAT
     IS THE WHOLE DESIGN: a worse-chosen video is a small loss, a failed render is a
@@ -1715,7 +1715,7 @@ def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
             # Every photo is going in anyway, so there is nothing to choose and no
             # reason to spend a vision call working that out. The captions still get
             # written by the normal caption pass downstream.
-            return None, None
+            return None, None, None
 
         started = time.monotonic()
         photos, urls = [], []
@@ -1751,15 +1751,21 @@ def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
             # film", and with two or three candidates there is nothing to choose.
             logger.info("photo survey: not enough readable candidates (%d); using "
                         "upload order", len(urls))
-            return None, None
+            return None, None, None
 
-        survey, _note = _survey_photos(photos, copy_guard)
+        survey, note = _survey_photos(photos, copy_guard)
         spaces = [s for s, _c in survey]
         if all(s == SPACE_UNKNOWN for s in spaces):
             # The call came back but told us nothing we can select on. Upload order is
             # a better answer than a set chosen from labels we do not believe.
+            # Falling back here means the normal caption pass runs downstream and
+            # makes its own call, so this is the one AUTO path that can cost two. It
+            # is rare (the model answered but labelled nothing), and fresh captions
+            # for the photos actually chosen beat reusing captions written for a
+            # different set. The note is dropped for the same reason: the caption
+            # pass will report its own outcome and must not be double-counted.
             logger.info("photo survey: no usable room labels; using upload order")
-            return None, None
+            return None, None, None
 
         # urls[0] is the hero: the candidate list was built with it first, and the
         # fetch loop keeps `urls` and `photos` in step, so index 0 survives a skip.
@@ -1772,10 +1778,14 @@ def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
         logger.info("photo survey: chose %d of %d photos covering %d distinct spaces",
                     len(selected), len(urls),
                     len({spaces[i] for i in picked if spaces[i] != SPACE_UNKNOWN}))
-        return selected, captions
+        # The note travels with the result. Without it a survey that selected well
+        # but had its captions rejected by the copy guards shipped a film of bare
+        # photos and an EMPTY degradation list -- a missing caption with no trace,
+        # which is a complaint nobody can diagnose afterwards.
+        return selected, captions, note
     except Exception as e:
         logger.warning("photo survey failed (%s); using upload order", e)
-        return None, None
+        return None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -2397,18 +2407,27 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
     chosen_urls, choice_note = choose_video_photos(video_photos, image_urls)
     if choice_note:
         degradations.append(choice_note)
-    # Captions the survey already wrote, keyed by url. Empty unless smart selection
-    # ran and succeeded, in which case the normal caption pass is skipped: the same
-    # call did both jobs, so the AUTO path still makes exactly one model call.
+    # Captions the survey already wrote, keyed by url, plus whether the survey is the
+    # thing that wrote them.
+    #
+    # survey_used IS NOT "survey_captions is non-empty". A survey can choose a good
+    # set of photos and still have every caption rejected by the copy guards, and an
+    # empty dict read as a falsy "no survey" sends the render into the caption pass
+    # for a SECOND model call -- one that, unlike the survey, runs inside the render
+    # slot and against RENDER_BUDGET_SECONDS. The flag separates "the survey ran"
+    # from "the survey produced captions", which are different questions.
+    survey_used = False
     survey_captions = {}
+    survey_note = None
     if chosen_urls:
         selected_urls = chosen_urls
     else:
-        smart_urls, smart_captions = _smart_auto_selection(
+        smart_urls, smart_captions, survey_note = _smart_auto_selection(
             image_urls, photo_index, copy_guard=copy_guard)
         if smart_urls:
             selected_urls = smart_urls
             survey_captions = smart_captions or {}
+            survey_used = True
         else:
             selected_urls = _auto_selection()
 
@@ -2466,15 +2485,18 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             ok, _reason = _caption_is_safe(text)
             if ok:
                 overrides[url] = text
-        if survey_captions:
-            # Smart selection already made the one model call this render gets, and it
-            # wrote a caption for every photo it looked at while it was there. Looked
-            # up BY URL rather than by position: a photo that turned out to be
-            # unreadable above is missing from `photos`, and anything keyed on index
-            # would hand its caption to the next photo along -- a caption is a claim
-            # about a room, and putting it on the wrong one misdescribes the property.
+        if survey_used:
+            # Smart selection already made this render's model call, and it wrote the
+            # captions while it was there. Looked up BY URL rather than by position: a
+            # photo that turned out to be unreadable above is missing from `photos`,
+            # and anything keyed on index would hand its caption to the next photo
+            # along -- a caption is a claim about a room, and putting it on the wrong
+            # one misdescribes the property.
             captions = [survey_captions.get(u) for u in photo_urls]
-            caption_note = None
+            # The survey's own note, carried through so that captions dropped by the
+            # copy guards are reported exactly as the caption pass would have reported
+            # them. Silently shipping bare photos leaves nothing to diagnose later.
+            caption_note = survey_note
             for i, u in enumerate(photo_urls):
                 if u in overrides:
                     captions[i] = overrides[u]

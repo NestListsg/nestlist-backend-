@@ -212,7 +212,7 @@ def run_selection(n=12, fetch=None, survey=None, keys=("k",)):
             setattr(vr, k, v)
 
 
-AUTO = (None, None)
+AUTO = (None, None, None)
 check("no API key -> upload order",
       run_selection(survey=lambda p, copy_guard=None: ([(vr.SPACE_UNKNOWN, None)] * len(p),
                                                        "no API key")) == AUTO)
@@ -261,7 +261,7 @@ def good_survey(photos, copy_guard=None):
              for i in range(len(photos))], None)
 
 
-urls, captions = run_selection(survey=good_survey)
+urls, captions, note = run_selection(survey=good_survey)
 check("the happy path returns a varied set", urls is not None and len(urls) == 7, str(urls))
 check("...hero first", urls and urls[0] == URLS[0])
 check("...no space twice", len({u for u in urls}) == len(urls))
@@ -269,19 +269,39 @@ check("...captions keyed by url, one per chosen photo",
       set(captions) == set(urls), str(set(captions) ^ set(urls)))
 check("...and no caption for a photo that was not chosen",
       all(u in urls for u in captions))
+check("...and the survey's note comes back with the result, not dropped",
+      note is None, str(note))
+
+
+def noisy_survey(photos, copy_guard=None):
+    out, _ = good_survey(photos)
+    return out, "2 caption(s) rejected by the copy guards"
+
+
+_u, _c, note = run_selection(survey=noisy_survey)
+check("a note from the survey is carried out of _smart_auto_selection",
+      note == "2 caption(s) rejected by the copy guards", str(note))
 
 
 # ------------------------------------------------- precedence and caption keying
 print("\n[precedence] the agent's explicit pick is never second-guessed")
 
 
+CAPTION_PASS_CALLS = []
+
+
 def install_stubs(mod, unreadable=(), survey=None):
     calls = []
+    del CAPTION_PASS_CALLS[:]
     mod._fetch_listing_photo = lambda u: (_ for _ in ()).throw(IOError("x")) if u in unreadable else "P:" + u
     mod._fetch_image = lambda u, attempts=2: photo()
-    mod._generate_room_captions = lambda photos, copy_guard=None: (
-        ["generated(%s)" % p for p in photos], None)
-    mod._smart_auto_selection = survey or (lambda u, i, copy_guard=None: (None, None))
+    def caption_pass(photos, copy_guard=None):
+        # Recorded, because "did the caption pass run at all?" is the question behind
+        # the one-model-call guarantee on the AUTO path.
+        CAPTION_PASS_CALLS.append(len(photos))
+        return ["generated(%s)" % p for p in photos], None
+    mod._generate_room_captions = caption_pass
+    mod._smart_auto_selection = survey or (lambda u, i, copy_guard=None: (None, None, None))
     mod._caption_font_size = lambda captions: 1
     def contain(p, clip_path, workdir, i, **kw):
         calls.append((p, kw.get("caption")))
@@ -325,7 +345,7 @@ smart_called = []
 
 def spy_survey(urls, photo_index, copy_guard=None):
     smart_called.append(urls)
-    return (list(SMART[0]), dict(SMART[1]))
+    return (list(SMART[0]), dict(SMART[1]), None)
 
 
 del smart_called[:]
@@ -355,6 +375,53 @@ check("the photo AFTER it keeps its own caption, not the dropped one's",
                    ("P:" + SMART[0][2], SMART[1][SMART[0][2]])], str(rendered))
 check("the returned caption map names the photos actually used",
       set(caps) == {SMART[0][0], SMART[0][2]}, str(set(caps)))
+
+print("\n[captions] a survey that loses captions says so, and does not re-call the model")
+# F2/F3, found in audit. A survey can choose a good set of photos and still have most
+# or all of its captions thrown out by the copy guards. Two things went wrong there:
+# the note was dropped on the floor, so the film shipped with bare photos and an EMPTY
+# degradation list (nothing to diagnose a complaint with), and an empty caption dict
+# read as "no survey ran", sending the render into a SECOND model call -- inside the
+# render slot and against the render budget, unlike the survey itself.
+GUARD_NOTE = "2 caption(s) rejected by the copy guards"
+
+
+def survey_mostly_rejected(urls, photo_index, copy_guard=None):
+    """Chose three photos; the guards allowed only the first one's caption."""
+    return list(SMART[0]), {SMART[0][0]: SMART[1][SMART[0][0]]}, GUARD_NOTE
+
+
+def survey_all_rejected(urls, photo_index, copy_guard=None):
+    return list(SMART[0]), {}, "every caption was rejected"
+
+
+_degs, caps, calls = render(survey=survey_mostly_rejected)
+check("a partly-rejected survey reports what was lost",
+      any(GUARD_NOTE in d for d in _degs), str(_degs))
+check("...the photo that kept its caption keeps it",
+      calls[0][1] == SMART[1][SMART[0][0]], str(calls[0][1]))
+check("...the others render bare rather than borrowing someone else's",
+      [c[1] for c in calls[1:]] == [None, None], str([c[1] for c in calls]))
+check("...and no second model call was made",
+      CAPTION_PASS_CALLS == [], str(CAPTION_PASS_CALLS))
+
+_degs, caps, calls = render(survey=survey_all_rejected)
+check("a survey whose captions were ALL rejected makes no second model call",
+      CAPTION_PASS_CALLS == [], "caption pass ran with %s" % CAPTION_PASS_CALLS)
+check("...and still reports the loss to the agent",
+      any("rejected" in d for d in _degs), str(_degs))
+check("...and still renders the photos the survey chose",
+      [c[0] for c in calls] == ["P:" + u for u in SMART[0]], str([c[0] for c in calls]))
+check("...with every caption bare, not borrowed",
+      all(c[1] is None for c in calls), str([c[1] for c in calls]))
+
+_degs, caps, calls = render()          # no survey -> upload order
+check("when the survey does NOT run, the caption pass still does",
+      len(CAPTION_PASS_CALLS) == 1, str(CAPTION_PASS_CALLS))
+
+_degs, caps, calls = render(survey=spy_survey)
+check("a fully successful survey also makes exactly one model call",
+      CAPTION_PASS_CALLS == [], str(CAPTION_PASS_CALLS))
 
 print("\n[captions] an agent's edited caption still beats the survey's")
 edited = "my own words ... exactly as i typed them"
