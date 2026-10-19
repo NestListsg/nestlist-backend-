@@ -223,8 +223,18 @@ MAX_SELECTION_CANDIDATES = 15
 # video_jobs migration is run) still surfaces the old wording, unchanged.
 #
 # Set to 1 after measuring one clip render at ~800MB peak RSS (both styles, macOS).
-# At 2 the fleet worst case was 8 concurrent x ~800MB = ~6.6GB, uncomfortably close to
-# the instance limit; at 1 it is 4 x ~800MB = ~3.3GB.
+#
+# CORRECTED 2026-10-19: that 800MB was THIS PROCESS ONLY. ffmpeg runs as a separate
+# process and the instance pays for both; measured together, one Classic render peaks
+# at ~1.6GB (379MB python + 1234MB ffmpeg at ten photos; an independent audit measured
+# ~1.85GB on other hardware). So the fleet worst case at this setting is ~6.4GB, not
+# ~3.3GB, and at 2 it would have been ~13GB rather than ~6.6GB. The conclusion is
+# unchanged and now has more margin behind it: 1 is the right number. The full table
+# lives at JOB_TYPES in video_jobs.py.
+#
+# Peak memory is nearly FLAT in the photo count (1214MB at six photos, 1234MB at ten),
+# because clips are encoded one at a time -- raising MAX_VIDEO_PHOTOS cost CPU and
+# bytes, not memory.
 #
 # The other candidate lever -- lowering UPSCALE -- was measured and rejected: peak RSS
 # is essentially flat across upscale factors (986MB at 1x, 766MB at 2x, 876MB at 3x),
@@ -2605,7 +2615,12 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                     captions[i] = overrides[u]
         else:
             captions, caption_note = _generate_room_captions(photos, copy_guard=copy_guard)
-        captions_used = {u: captions[i] for i, u in enumerate(photo_urls) if captions[i]}
+        # Filled in after the clip loop, from the photos that actually reached the
+        # film. Computing it here over the whole PLAN meant a render that ran out of
+        # budget, or lost a clip to an encode failure, still reported and STORED
+        # captions for photos the agent cannot see in their video -- and those stored
+        # captions are what the caption editor shows them next time.
+        captions_used = {}
         if caption_note:
             degradations.append(f"captions: {caption_note}")
         caption_size = _caption_font_size(captions)
@@ -2634,11 +2649,33 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                         "in My Profile, or record a new one."
                     ) from e
                 clip_paths.append(opening_clip)
+            # Which photos actually reached a clip. `photo_urls` is the PLAN; this is
+            # the film. They diverge when the budget runs out or a clip fails to
+            # encode, and the captions we return and store have to describe the film
+            # the agent can watch, not the one we set out to make.
+            rendered_urls = []
+            loop_started = time.monotonic()
             for i, photo in enumerate(photos):
-                if i > 0 and time.monotonic() - started > RENDER_BUDGET_SECONDS:
+                elapsed = time.monotonic() - started
+                if i > 0 and elapsed > RENDER_BUDGET_SECONDS:
                     logger.warning("render budget reached after %d photos; finishing early", i)
                     degradations.append(f"took too long, so only the first {i} photos were used")
                     break
+                # Is this the final clip of the film? Not just "the last photo in the
+                # plan": if the budget will not stretch to another clip after this one,
+                # this one ENDS the film and has to be built as the ending -- `last`
+                # decides how long the caption stays up, and a clip built as a middle
+                # clip drops its caption XFADE_SECONDS early.
+                #
+                # The prediction is made BINDING below (we stop after it) rather than
+                # re-checked next time round. That matters: predicting "last" and then
+                # rendering another clip would leave a caption running through the
+                # dissolve into it, which double-strikes. Being wrong in the other
+                # direction only costs a caption 1.25s of screen time.
+                per_clip = (time.monotonic() - loop_started) / i if i else 0.0
+                budget_is_spent = (
+                    i > 0 and elapsed + 2 * per_clip > RENDER_BUDGET_SECONDS)
+                is_last = (i == len(photos) - 1) or budget_is_spent
                 clip_path = os.path.join(workdir, f"clip_{i:02d}.mp4")
                 try:
                     if dissolve:
@@ -2661,7 +2698,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                             # out the dissolve from the presenter or it double-strikes
                             # through it.
                             first=(i == 0 and opening_clip is None),
-                            last=(i == len(photos) - 1),
+                            last=is_last,
                         )
                     else:
                         frame, can_pan = _prepare_frame(photo)
@@ -2682,6 +2719,18 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                     degradations.append("a photo failed to render and was skipped")
                     continue
                 clip_paths.append(clip_path)
+                rendered_urls.append(photo_urls[i])
+                if budget_is_spent and i < len(photos) - 1:
+                    # Binding, as promised above: this clip was built as the ending, so
+                    # the film ends here.
+                    logger.warning("render budget will not reach another clip; "
+                                   "finishing after %d photos", i + 1)
+                    degradations.append(
+                        f"took too long, so only the first {i + 1} photos were used")
+                    break
+
+            by_url = {u: captions[i] for i, u in enumerate(photo_urls) if captions[i]}
+            captions_used = {u: by_url[u] for u in rendered_urls if u in by_url}
 
             photo_clips = len(clip_paths) - (1 if opening_clip else 0)
             if not photo_clips:

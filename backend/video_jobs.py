@@ -68,9 +68,9 @@ wasted work is harmless, because the video upload targets a fixed path per listi
 both renders would write the same bytes to the same place.
 
 CONCURRENCY IS PER JOB TYPE, NOT ONE GLOBAL NUMBER
-Classic is CPU/memory bound: one render peaks around 800MB RSS, so the limit is
-per-process and stays at 1 (4 across the fleet), exactly the number video_renderer's
-comment was measured for. Signature will be bound by something else entirely --
+Classic is CPU/memory bound: one render peaks around 1.6GB RSS counting the ffmpeg
+children (see the measured table at JOB_TYPES -- the long-quoted 800MB counted only
+the python process), so the limit is per-process and stays at 1 (4 across the fleet). Signature will be bound by something else entirely --
 Replicate allows ONE prediction at a time on the whole account, regardless of how many
 processes we run -- so it carries an ACCOUNT-WIDE limit of 1 that is checked against the
 database, not against a local counter. Both live in JOB_TYPES; adding a third type means
@@ -142,12 +142,37 @@ class JobTypeConfig:
         self.max_attempts = max_attempts
 
 
+# MEASURED COST OF ONE CLASSIC RENDER (2026-10-19, real ffmpeg, 3200x1800 sources).
+# This replaces a long-standing "~800MB RSS" figure that counted only the PYTHON
+# process. ffmpeg is a separate process and the instance pays for both, so the number
+# that matters for sizing is the peak of the SUM:
+#
+#     photos   peak tree RSS   python   ffmpeg   wall    ffmpeg CPU
+#        6        1521 MB      307 MB   1214 MB  11.7s      79.1s
+#       10        1613 MB      379 MB   1234 MB  18.0s     127.0s
+#
+# (An independent audit measured ~1.85GB on different hardware. Treat 1.6-1.9GB as the
+# range, not 800MB.)
+#
+# TWO THINGS TO READ OFF THIS. First, peak memory is dominated by ffmpeg and is nearly
+# FLAT in the photo count -- 1214MB at six photos, 1234MB at ten -- because clips are
+# encoded one at a time, so raising the photo cap costs CPU and bytes, not memory.
+# Second, the real fleet ceiling at four workers is ~6.4GB (or ~7.4GB on the audit's
+# figure), not the ~3.3GB derived further down from the old 800MB. Size the Railway
+# instance from THIS table.
+#
+# The per-process limit of 1 is unchanged and is still right -- if anything more
+# clearly right, since each render is twice the footprint previously believed.
 JOB_TYPES = {
-    # Classic: CPU and memory bound. One render peaks at ~800MB RSS (measured, see
-    # video_renderer.MAX_CONCURRENT_RENDERS), so one per worker, four across the fleet,
-    # is the same ceiling production already runs at -- the queue changes WHO waits and
-    # for how long, not how much runs at once. Single-agent behaviour is unchanged.
-    JOB_TYPE_CLASSIC: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=60),
+    # Classic: CPU and memory bound. One per worker, four across the fleet, is the same
+    # ceiling production already runs at -- the queue changes WHO waits and for how
+    # long, not how much runs at once. Single-agent behaviour is unchanged.
+    #
+    # default_seconds was 60, calibrated when a film was six photos. Ten photos cost
+    # 1.6x the CPU (79s -> 127s measured above), so the cold-start quote was about half
+    # the truth; scaled by that same ratio. It is ONLY the fallback until real
+    # duration_seconds rows exist, after which the rolling mean takes over.
+    JOB_TYPE_CLASSIC: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=100),
     # Signature: the Classic film with the agent's own presenting clip as its opening
     # slide -- the same CPU and memory shape as a Classic, plus one more slide and one
     # audio pass.
@@ -155,11 +180,15 @@ JOB_TYPES = {
     # It used to carry account_limit=1 and default_seconds=360. Both were inherited from
     # a Replicate avatar pipeline that was closed on evidence and never shipped, and the
     # audit found they cost three things and bought nothing: memory is already bounded by
-    # MAX_CONCURRENT_RENDERS x PER_PROCESS_RENDER_LIMIT x the worker count (~3.3GB)
-    # whatever the mix of tiers, so serialising Signatures fleet-wide only made agents
+    # MAX_CONCURRENT_RENDERS x PER_PROCESS_RENDER_LIMIT x the worker count (~6.4GB on
+    # the measured table above, not the ~3.3GB this line used to claim from the old
+    # python-only figure) whatever the mix of tiers, so serialising Signatures
+    # fleet-wide only made agents
     # queue behind each other, turned any one stuck render into a platform-wide stall,
     # and quoted an ETA four to five times the real one.
-    JOB_TYPE_SIGNATURE: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=90),
+    # default_seconds scaled by the same 1.6x as the Classic (90 -> 145): a Signature is
+    # a Classic plus one more slide and one audio pass.
+    JOB_TYPE_SIGNATURE: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=145),
 }
 
 # How many renders of ANY type one worker process may have in flight at once.
@@ -169,8 +198,8 @@ JOB_TYPES = {
 # contend for video_renderer's single render slot -- the second would sit inside a
 # claimed job for RENDER_SLOT_WAIT_SECONDS before deferring, heartbeating all the while
 # so nothing could reclaim it, while the agent's queue position quietly meant nothing.
-# One render per process is the memory ceiling video_renderer measured; this makes the
-# queue honour it when CHOOSING work rather than discovering it while rendering.
+# One render per process is the memory ceiling measured in the table above; this makes
+# the queue honour it when CHOOSING work rather than discovering it while rendering.
 #
 # With a single type registered this is exactly the old behaviour: the sum of what is
 # running is that one type's count, which per_process_limit already capped.
@@ -197,7 +226,7 @@ SWEEP_SECONDS = 30.0       # stale-claim sweep cadence
 # a 10-minute stale-lock escape; without this the queue would be a regression on it.
 #
 # Deliberately much longer than any plausible real wait -- at four concurrent Classic
-# renders of ~60s, 30 minutes is roughly 120 jobs deep, far beyond anything this
+# renders of ~100s, 30 minutes is roughly 70 jobs deep, far beyond anything this
 # product will see -- and guarded further by _queue_is_draining(), so a genuinely deep
 # but healthy queue is never mistaken for a dead one.
 QUEUED_ESCAPE_SECONDS = float(os.environ.get("VIDEO_QUEUE_ESCAPE_SECONDS", "1800"))

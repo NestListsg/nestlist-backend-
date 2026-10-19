@@ -408,9 +408,14 @@ check("signature has no account-wide cap either",
       workers[0].JOB_TYPES["signature"].account_limit is None)
 check("the real ceiling is one render per worker process, across both types",
       workers[0].PER_PROCESS_RENDER_LIMIT == 1)
+# Expressed against the Classic rather than a literal, because both defaults were
+# re-scaled when the photo cap rose to 10 and the measured CPU cost went with it. The
+# point of this check is that a Signature is a Classic plus a slide, NOT the old 360s
+# inherited from the abandoned Replicate pipeline.
+_sig = workers[0].JOB_TYPES["signature"].default_seconds
+_cls = workers[0].JOB_TYPES["classic"].default_seconds
 check("the Signature ETA default is a Classic-shaped number now",
-      workers[0].JOB_TYPES["signature"].default_seconds <= 120,
-      str(workers[0].JOB_TYPES["signature"].default_seconds))
+      _cls <= _sig <= 2 * _cls, "signature=%s classic=%s" % (_sig, _cls))
 
 # The account-wide cap MECHANISM stays live for any type that needs one later, so it is
 # exercised below against a type configured with one. Each worker is its own module
@@ -469,8 +474,11 @@ check("the running job reports position 0", positions[0] == 0, str(positions))
 check("the queued jobs report 2,3,4,5 behind it", positions[1:] == [2, 3, 4, 5], str(positions))
 etas = [w.describe(w.get_job(j["id"])).get("eta_seconds") for j in jobs[1:]]
 check("ETAs are real numbers, not zero", all(e and e > 0 for e in etas), str(etas))
-check("with 4 slots free, the next 4 in line all wait one render (~120s)",
-      etas == [120, 120, 120, 120], str(etas))
+# Two renders' worth of the type's default, for all four -- written against the
+# constant so re-timing a render does not look like a queue bug.
+_one = w.JOB_TYPES[w.JOB_TYPE_CLASSIC].default_seconds
+check("with 4 slots free, the next 4 in line all wait the same, two renders' worth",
+      etas == [2 * _one] * 4, "%s (default_seconds=%s)" % (etas, _one))
 
 # A deeper queue must produce a visibly growing estimate, not one flat number.
 db = FakeDB()

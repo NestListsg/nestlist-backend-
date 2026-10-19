@@ -430,5 +430,69 @@ check("the override wins on its own photo",
       [c[1] for c in calls] == [SMART[1][SMART[0][0]], edited, SMART[1][SMART[0][2]]],
       str([c[1] for c in calls]))
 
+
+print("\n[truncated films] what is reported must describe the film that exists")
+# F7, found in audit. captions_used was computed over the PLANNED photos before the
+# clip loop, so a render that ran out of budget -- or lost a clip to an encode failure
+# -- still reported and STORED captions for photos not in the film. Those stored
+# captions are what the caption editor shows the agent next time.
+
+
+def render_slow(fail_on=None, budget=None, n=8, **kw):
+    """A render where each clip encode takes real time, so the budget can run out."""
+    saved = {k: getattr(vr, k) for k in
+             ("_fetch_listing_photo", "_fetch_image", "_generate_room_captions",
+              "_smart_auto_selection", "_caption_font_size", "_contain_clip",
+              "_dissolve_segments", "_concat", "_probe_duration",
+              "_render_contact_card", "_build_card_clip", "_select_music_track",
+              "_run_ffmpeg", "RENDER_BUDGET_SECONDS")}
+    urls = ["https://x/%d.jpg" % i for i in range(n)]
+    calls = install_stubs(vr)
+    plain = vr._contain_clip
+
+    def slow_clip(photo, clip_path, workdir, i, **kwargs):
+        if fail_on is not None and i == fail_on:
+            raise RuntimeError("encode failed")
+        time.sleep(0.05)
+        calls.append((photo, kwargs.get("caption"), kwargs.get("last")))
+        open(clip_path, "w").write("[%s]" % photo)
+    vr._contain_clip = slow_clip
+    vr._generate_room_captions = lambda photos, copy_guard=None: (
+        ["cap-%d" % i for i in range(len(photos))], None)
+    if budget is not None:
+        vr.RENDER_BUDGET_SECONDS = budget
+    try:
+        out = vr.render_property_video(urls, agent_name="A", agent_contact_line="c", **kw)
+        return list(out[1]), dict(out[2]), calls, urls
+    finally:
+        for k, v in saved.items():
+            setattr(vr, k, v)
+        vr._contain_clip = plain
+
+
+import time  # noqa: E402
+
+degs, caps, calls, urls = render_slow(budget=0.12, n=8)
+shots = [c for c in calls if len(c) == 3]
+check("the budget really did cut the film short", len(shots) < 8, "%d shots" % len(shots))
+check("captions are reported only for the photos in the film",
+      len(caps) == len(shots), "%d captions for %d shots" % (len(caps), len(shots)))
+check("...and they are the FIRST photos, the ones that rendered",
+      set(caps) == set(urls[:len(shots)]), str(sorted(caps)))
+check("the agent is told the film was cut short",
+      any("took too long" in d for d in degs), str(degs))
+check("the final shot of a truncated film is built as an ending, so its caption "
+      "does not vanish early", shots[-1][2] is True, str([c[2] for c in shots]))
+check("...and only the final one is", [c[2] for c in shots[:-1]] == [False] * (len(shots) - 1),
+      str([c[2] for c in shots]))
+
+degs, caps, calls, urls = render_slow(fail_on=3, n=6)
+shots = [c for c in calls if len(c) == 3]
+check("a clip that fails to encode drops out of the film", len(shots) == 5, str(len(shots)))
+check("...and out of the reported captions too",
+      urls[3] not in caps and len(caps) == 5, str(sorted(caps)))
+check("...while every other photo keeps its own caption",
+      set(caps) == set(urls[:3]) | set(urls[4:6]), str(sorted(caps)))
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)
