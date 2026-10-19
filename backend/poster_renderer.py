@@ -691,20 +691,59 @@ TEMPLATES = {
 }
 
 
+COMPLIANCE_BAND_H = 46
+COMPLIANCE_FONT = _load_font(INTER, 22, weight=600, opsz=11)
+
+
+def _add_compliance_band(poster, text):
+    """Fits the finished poster into a W x H frame with a slim band along the bottom that
+    carries `text` (the CEA registration + agency licence line, NestList Home only).
+
+    The template is scaled down a few percent and centred rather than overlaid, so no
+    part of any template's layout is covered; the poster stays exactly W x H (4:5), the
+    ratio Instagram accepts. The band takes the colour of the template's own bottom edge.
+    Never raises: on any trouble the poster is returned without the band."""
+    try:
+        poster = poster.convert("RGB")
+        edge = poster.getpixel((2, poster.height - 2))
+        scale = (H - COMPLIANCE_BAND_H) / poster.height
+        inner = poster.resize((max(1, round(poster.width * scale)), H - COMPLIANCE_BAND_H), Image.LANCZOS)
+        framed = Image.new("RGB", (W, H), edge)
+        framed.paste(inner, ((W - inner.width) // 2, 0))
+        draw = ImageDraw.Draw(framed)
+        luminance = 0.299 * edge[0] + 0.587 * edge[1] + 0.114 * edge[2]
+        ink = (20, 20, 20) if luminance > 150 else (245, 241, 232)
+        font = COMPLIANCE_FONT
+        size = 22
+        while draw.textlength(text, font=font) > W - 60 and size > 14:
+            size -= 1
+            font = _load_font(INTER, size, weight=600, opsz=11)
+        tw = draw.textlength(text, font=font)
+        draw.text(((W - tw) / 2, H - COMPLIANCE_BAND_H + (COMPLIANCE_BAND_H - size) / 2 - 2),
+                  text, font=font, fill=ink)
+        return framed
+    except Exception as e:
+        print(f"compliance band skipped (poster returned without it): {e}")
+        return poster
+
+
 def render_poster(property_type, district, price_text, stats, agent_name, agent_contact_line,
-                   property_photo_url=None, agent_photo_url=None, template_id="editorial"):
+                  property_photo_url=None, agent_photo_url=None, template_id="editorial",
+                  compliance_line=""):
     """Renders one poster image and returns it as a Pillow Image (RGB, JPEG-ready).
 
     stats: list of strings (e.g. "5 Rooms", "4 Baths", "2,400 sqft", "SGD 1,200 psf").
     Empty/falsy entries are dropped from the joined stats line rather than left blank.
     template_id: one of TEMPLATES' keys; falls back to "editorial" if unknown.
+    compliance_line: optional footer text (NestList Home CEA line). Blank -- every landed
+    poster -- returns exactly the template's own render.
     """
     property_photo = _fetch_listing_photo(property_photo_url) if property_photo_url else None
     # The agent portrait is not a listing photo and has no hires twin -- fetched plainly.
     agent_photo = _fetch_image(agent_photo_url) if agent_photo_url else None
 
     renderer = TEMPLATES.get(template_id, _render_editorial)
-    return renderer(
+    poster = renderer(
         property_type=property_type,
         district=district,
         price_text=price_text,
@@ -714,3 +753,6 @@ def render_poster(property_type, district, price_text, stats, agent_name, agent_
         property_photo=property_photo,
         agent_photo=agent_photo,
     )
+    if compliance_line and str(compliance_line).strip():
+        poster = _add_compliance_band(poster, str(compliance_line).strip())
+    return poster

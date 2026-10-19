@@ -1509,7 +1509,13 @@ def _fit_text(draw, text, font_path, size, max_width):
 
 def _render_contact_card(agent_name, agent_contact_line, agent_photo=None):
     """The closing still: warm off-white card, gold-ringed portrait, name, divider,
-    invitation, contact in gold. Layout and colours are the prototype's."""
+    invitation, contact in gold. Layout and colours are the prototype's.
+
+    agent_contact_line may carry extra lines after a "\n" (NestList Home condo listings:
+    the price, then the CEA registration and agency licence lines). The first line is the
+    contact exactly as before; the rest are drawn smaller underneath. A single-line contact
+    (every landed listing) renders exactly as it always did."""
+    agent_contact_line, *extra_lines = str(agent_contact_line or "").split("\n")
     card = Image.new("RGB", (VW, VH), CARD_BG)
     draw = ImageDraw.Draw(card)
     cx = VW // 2
@@ -1556,6 +1562,11 @@ def _render_contact_card(agent_name, agent_contact_line, agent_photo=None):
     draw.line([cx - 105, divider_y, cx + 105, divider_y], fill=CARD_GOLD, width=3)
     centred("Contact me to arrange for a viewing", invite_y, invite_font, CARD_INK)
     centred(agent_contact_line or "", contact_y, contact_font, CARD_GOLD)
+    y = contact_y + 100
+    for line in (l.strip() for l in extra_lines[:4]):
+        if line:
+            centred(line, y, _fit_text(draw, line, SERIF_REGULAR, 40, max_width), CARD_INK)
+            y += 58
     return card
 
 

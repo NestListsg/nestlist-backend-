@@ -565,7 +565,10 @@ check("attributes normalised, bad year dropped",
 check("landed / old request -> no attributes", NS["_build_listing_attributes"](types.SimpleNamespace(property_type="GCB")) == {})
 check("strata fields always complete, blank for landed",
       NS["_listing_strata_fields"]({"attributes": None}) == {"project_name": "", "tenure": "", "tenure_detail": "",
-                                                             "floor_level": "", "top_year": 0, "lease_start_year": 0})
+                                                             "floor_level": "", "top_year": 0, "lease_start_year": 0,
+                                                             "hide_project_name": False, "price_label": "",
+                                                             "ec_eligibility": "", "owner_consent_confirmed": None,
+                                                             "owner_consent_at": None})
 
 print("\n[6b] unit-number pattern: catches units, not ordinary ranges")
 UR = NS["_UNIT_NUMBER_RE"]
@@ -644,9 +647,13 @@ check("landed FACTS block exactly as before",
 condo_req = req(property_type="Condominium", bedrooms="3", built_up=1100, land_size=5000,
                 tenure="Freehold", floor_level="High", project_name="Parc Esta", features="near park")
 fb = NS["_build_writeup_facts_block"](condo_req, "District 14")
-check("condo FACTS: tenure + floor band, no land size, no project name",
+# Jane 2026-10-20: the project name is public for condo-family listings (unless hidden).
+check("condo FACTS: tenure + floor band + project name, no land size",
       "- Tenure: Freehold" in fb and "- Floor level: High floor" in fb
-      and "Land size" not in fb and "Parc Esta" not in fb, fb)
+      and "Land size" not in fb and "- Project / development name: Parc Esta" in fb, fb)
+check("condo FACTS: hide_project_name keeps it out",
+      "Parc Esta" not in NS["_build_writeup_facts_block"](req(property_type="Condominium", project_name="Parc Esta",
+                                                              hide_project_name=True), "District 14"))
 check("EC FACTS carry nothing about eligibility",
       not re.search(r"eligib|MSOP|privati", NS["_build_writeup_facts_block"](req(property_type="Executive Condominium (EC)"), "Singapore")))
 base_sys = "...HARD RULE...\nYour Vision. Your Legacy. {line}\n...Your Vision. Your Legacy."
@@ -677,8 +684,8 @@ NS["create_claude_message"] = fake_claude
 AGENT = {"id": "a1", "name": "Joshua", "agency": "NL", "specialty": "homes"}
 asyncio.run(NS["_generate_listing_text_only"](AGENT, condo_req, "District 14"))
 p = SEEN[-1]
-check("condo prompt: no land size, no 0-value lines, no project name",
-      "Land size" not in p and ": 0" not in p and "Parc Esta" not in p, p[:400])
+check("condo prompt: no land size, no 0-value lines; project name given as a fact",
+      "Land size" not in p and ": 0" not in p and "- Project / development name: Parc Esta" in p, p[:400])
 check("condo prompt: condo rules + Home closing", "never state or imply who is eligible" in p
       and "Your Home. Your Next Chapter." in p)
 asyncio.run(NS["_generate_listing_text_only"](AGENT, req(property_type="Inter-Terrace", bedrooms="4", land_size=0), "District 15"))
@@ -724,7 +731,8 @@ for t in ("Condominium", "Executive Condominium (EC)", "Apartment"):
 print("\n[13] wiring present in main.py")
 check("public payload uses the project-name scrub", SRC.count("_scrub_project_name(public_") == 2)
 pub = "\n".join(LINES[NODES["_public_listing_payload"].lineno - 1:NODES["_public_listing_payload"].end_lineno])
-check("public payload never returns project_name", '"project_name"' not in pub)
+check("public payload's project_name comes only from the gate",
+      '"project_name": _public_project_name(listing)' in pub and pub.count('"project_name"') == 1)
 check("attributes write is probe-gated on create and update",
       SRC.count("if _attributes_column_supported and _attrs:") == 1 and "if _attributes_column_supported:\n        _prev" in SRC)
 _su = "\n".join(LINES[NODES["startup_event"].lineno - 1:NODES["startup_event"].end_lineno])
@@ -795,11 +803,12 @@ NS.update({
     "_unique_listing_code": lambda *a, **k: "CODE", "MAX_LISTING_PHOTOS": 15,
     "WRITEUP_MAX_IMAGES": 8, "_district_column_supported": False,
     "_property_types_column_supported": False, "os": os, "asyncio": asyncio,
-    "_scrub_own_street": lambda t, loc, d: t,
+    "_scrub_own_street": lambda t, loc, d: t, "_agent_cea_columns_supported": False,
 })
 run_nodes("MAX_PROPERTY_TYPES", "ListingRequest", "CMARequest", "_resolve_property_types", "_resolve_writeup_district",
           "_writeup_district_str", "WRITING_STYLE_OPTIONS", "_apply_writing_style",
-          "generate_listing", "update_listing", "_public_listing_payload", "generate_cma_report")
+          "generate_listing", "update_listing", "_public_listing_payload", "_public_agent_block",
+          "generate_cma_report")
 
 CONDO_BODY = dict(property_type="Condominium", location="Parc Esta #05-11", land_size=4000,
                   bedrooms="3", features="Parc Esta clubhouse", project_name="Parc Esta #05-11",
@@ -820,15 +829,16 @@ asyncio.run(NS["generate_listing"](NS["ListingRequest"](**dict(CONDO_BODY, featu
 ins = [e for e in DB.log if e[1] == "insert"][0][3]
 check("create: features unit-number guarded before the prompt and the row",
       "05-11" not in ins["features"] and "10-15 mins" in ins["features"] and "05-11" not in SEEN[-1], ins["features"])
-check("create: write-up prompt never saw the project name", "Parc Esta\n" not in SEEN[-1]
+check("create: write-up prompt gets the project name, never its unit number",
+      "- Project / development name: Parc Esta\n" in SEEN[-1] and "#05" not in SEEN[-1]
       and "- Agent-noted features: Corner" in SEEN[-1])
 DB.log.clear()
 NS["_attributes_column_supported"] = True
 out = asyncio.run(NS["generate_listing"](NS["ListingRequest"](property_type="Semi-Detached", location="9 X Road",
                                                                land_size=3000, bedrooms="4", features=""), agent=AGENT))
 ins = [e for e in DB.log if e[1] == "insert"][0][3]
-check("create landed: land size kept, no attributes written, no condo warning",
-      ins["land_size"] == 3000 and "attributes" not in ins
+check("create landed: land size kept, only owner consent in attributes, no condo warning",
+      ins["land_size"] == 3000 and ins["attributes"] == {"owner_consent_confirmed": False}
       and not any("doesn't apply" in w for w in out["compliance"]["warnings"]))
 
 async def _boom(*a, **k):
@@ -881,11 +891,12 @@ blob = repr(pub)
 pub_n = NS["_public_listing_payload"]({"id": "L4", "agent_id": "a1", "property_type": "Condominium",
                                        "location": "x", "district": "11", "price": "1", "content": "A home.",
                                        "features": "Newton, high floor",
-                                       "attributes": {"project_name": "Newton"}})
-check("public page: Key Features starting with a one-word project name is scrubbed",
-      pub_n["features"] == "District 11, high floor", pub_n["features"])
-check("public page: no project name anywhere, no TOP year, no unit number",
-      "Parc Esta" not in blob and "2022" not in blob and "#05" not in blob, blob[:300])
+                                       "attributes": {"project_name": "Newton", "hide_project_name": True}})
+check("public page, name HIDDEN: Key Features starting with a one-word project name is scrubbed",
+      pub_n["features"] == "District 11, high floor" and pub_n["project_name"] == "", pub_n["features"])
+check("public page: project name shown (public), no TOP year, no unit number",
+      pub["project_name"] == "Parc Esta" and "Parc Esta is lovely." in pub["content"]
+      and "2022" not in blob and "#05" not in blob, blob[:300])
 check("public page: tenure + floor band shown", pub["tenure"] == "Freehold" and pub["floor_level"] == "High")
 pub_o = NS["_public_listing_payload"]({"id": "L3", "agent_id": "a1", "property_type": "Apartment", "location": "x",
                                        "price": "1", "content": "x", "features": "Corner unit #05-11, unit 12-03",

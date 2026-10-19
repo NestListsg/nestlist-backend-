@@ -274,6 +274,8 @@ async def startup_event():
     asyncio.create_task(asyncio.to_thread(_probe_property_types_column))
     # NestList Home: the optional listings.attributes jsonb column (condo-family fields).
     asyncio.create_task(asyncio.to_thread(_probe_attributes_column))
+    # NestList Home: the optional agents CEA columns (migration 003).
+    asyncio.create_task(asyncio.to_thread(_probe_agent_cea_columns))
     # URA comparables outages on the CMA path go to Telegram (throttled), not just the log.
     ura_market_pulse.set_failure_alert(
         lambda msg: send_telegram_alert_throttled(
@@ -602,14 +604,24 @@ class ListingRequest(BaseModel):
     # Executive Condominium (EC) / Apartment). All optional; landed clients never send them
     # and nothing about a landed listing changes. Normalised by _build_listing_attributes
     # and persisted in the probe-gated `attributes jsonb` column (migration 002). The
-    # project name is AGENT-ONLY: never sent to the write-up model, never in any buyer-
-    # facing payload (see _public_project_name).
+    # project name is PUBLIC for a condo-family listing (Jane, 2026-10-20) -- buyer page and
+    # write-up -- unless the agent ticks hide_project_name (see _public_project_name).
     project_name: str = Field(default="", max_length=120)
     tenure: str = Field(default="", max_length=60)
     tenure_detail: str = Field(default="", max_length=80)
     floor_level: str = Field(default="", max_length=20)
     top_year: int = 0
     lease_start_year: int = 0
+    # Condo family: keep the project name off the buyer page and out of the write-up.
+    hide_project_name: bool = False
+    # Condo family: "Negotiable" | "View to Offer" | "From" | "" -- shown with the price.
+    price_label: str = Field(default="", max_length=20)
+    # EC only: "citizens_prs" (5-10 years after TOP) | "all_buyers" (10+ years) | "".
+    # The ONLY source for any eligibility wording -- never inferred.
+    ec_eligibility: str = Field(default="", max_length=20)
+    # ALL listing types: the agent confirms the owner consents to this listing being
+    # advertised. None (an older client that doesn't send it) is recorded as False.
+    owner_consent_confirmed: Optional[bool] = None
 
 class ListingContentRequest(BaseModel):
     content: str
@@ -634,6 +646,18 @@ class ProfileUpdate(BaseModel):
     poster_template_id: str = "editorial"
     notification_channel: str = "telegram"
     whatsapp_number: str = ""
+    # CEA details (NestList Home). OPTIONAL and only applied when SENT: an older client
+    # that doesn't know them can never wipe them. "" clears. See _apply_cea_profile_fields.
+    cea_reg_no: Optional[str] = Field(default=None, max_length=20)
+    agency_name: Optional[str] = Field(default=None, max_length=120)
+    agency_licence_no: Optional[str] = Field(default=None, max_length=20)
+
+
+class ProfileCEAUpdate(BaseModel):
+    """PATCH /api/profile -- any subset of the CEA fields."""
+    cea_reg_no: Optional[str] = Field(default=None, max_length=20)
+    agency_name: Optional[str] = Field(default=None, max_length=120)
+    agency_licence_no: Optional[str] = Field(default=None, max_length=20)
 
 class AvatarPhotosRequest(BaseModel):
     images: list = []          # base64-encoded, one per photo
@@ -991,7 +1015,7 @@ def _can_use_linkedin_beta(agent) -> bool:
     return agent.get("email") in LINKEDIN_BETA_ALLOWLIST
 
 def _agent_response(agent) -> dict:
-    out = {k: v for k, v in agent.items() if k != "password_hash"}
+    out = _with_cea_fields({k: v for k, v in agent.items() if k != "password_hash"}, agent)
     out["can_use_instagram_beta"] = _can_use_instagram_beta(agent)
     out["can_use_facebook_beta"] = _can_use_facebook_beta(agent)
     out["can_use_linkedin_beta"] = _can_use_linkedin_beta(agent)
@@ -1721,7 +1745,8 @@ async def _generate_listing_text_only(agent, req, district_str: str) -> str:
    clubhouse, BBQ pit, security, playground, MRT access, nearby school or shopping mall unless
    the facts state it. Never state tenure, floor level, facing, view or the project name unless
    it is in the facts. For an executive condominium, never state or imply who is eligible to
-   buy it, and never mention MSOP, privatisation, income ceilings or grants. Do not use landed
+   buy it unless the facts give a "Buyer eligibility" line (then state exactly that, nothing
+   more), and never mention MSOP, privatisation, income ceilings or grants. Do not use landed
    or status words: no "bungalow-like", "landed-like", "estate", "mansion", "grand",
    "prestigious", "exclusive"."""
         closing_item = ("3. A closing in this exact shape: \"Your Home. Your Next Chapter.\" followed by one line\n"
@@ -1913,6 +1938,8 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     _strip_land_fields_for_strata(req, resolved_property_types, warnings)
     # Unit/house numbers out of Key Features before they reach the prompt or the row.
     req.features = _guard_features(req.features) or ""
+    # EC: Minimum Occupation Period / eligibility mismatch (warnings, never blocking).
+    warnings.extend(_ec_compliance_warnings(req.property_type, req.top_year, req.ec_eligibility))
 
     if issues:
         return {"compliance": {"passed": passed, "warnings": warnings, "issues": issues}, "listing": None}
@@ -1970,6 +1997,17 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
         except Exception as e:
             logger.error("text-only write-up failed for agent %s, using basic template: %s", agent["id"], e)
             listing_text = _basic_listing_fallback(gen_agent, req, district_str)
+
+    # CEA details close a condo-family write-up (Jane: Home only -- Prestige/landed never
+    # carries the reg or licence numbers). Missing details: no block, and a warning so the
+    # frontend can send the agent to My Profile.
+    cea_missing = []
+    if _home_listing_needs_cea(req.property_type, resolved_property_types):
+        cea_missing = _cea_missing(agent)
+        if cea_missing:
+            warnings.append(_cea_warning(agent))
+        else:
+            listing_text = _append_cea_block(listing_text, agent)
 
     # Discreet per-agent buyer-link code (nestlist.sg/{handle}/{code}). An
     # agent-supplied override wins (validated); otherwise it's derived from the
@@ -2029,6 +2067,9 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
     # Condo-family fields (NestList Home). Probe-gated exactly like district: before
     # migration 002 runs they are simply not stored -- the insert can never fail on them.
     _attrs = _build_listing_attributes(req)
+    # Owner consent, every listing type: always recorded on a new listing (a client that
+    # doesn't send it is recorded as not confirmed). See _owner_consent_blocks_posting.
+    _attrs.update(_consent_attributes_for_create(req))
     if _attributes_column_supported and _attrs:
         insert_payload["attributes"] = _attrs
     saved = await db_execute_async(lambda db: db.table("listings").insert(insert_payload), what="generate_listing listings insert", idempotent=False)
@@ -2041,7 +2082,9 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
 
     return {
         "compliance": {"passed": passed, "warnings": warnings, "issues": issues},
-        "listing": listing_row
+        "listing": listing_row,
+        # Condo family only: CEA profile fields still blank ([] = complete or not needed).
+        "cea_missing": cea_missing,
     }
 
 
@@ -2341,6 +2384,255 @@ def _bedrooms_display(listing) -> str:
     return "Studio" if _listing_is_studio(src) else str(src.get("bedrooms") if src.get("bedrooms") is not None else "")
 
 
+# ================================
+# NESTLIST HOME -- Jane's decisions of 2026-10-20 (condo family only unless stated).
+# Every helper below is pure and never raises; landed listings never reach any branch
+# that changes what they get.
+# ================================
+
+# --- Price label ---------------------------------------------------------------------
+PRICE_LABEL_OPTIONS = ("Negotiable", "View to Offer", "From")
+
+
+def _normalize_price_label(raw) -> str:
+    low = re.sub(r"\s+", " ", str(raw or "")).strip().lower()
+    for opt in PRICE_LABEL_OPTIONS:
+        if low == opt.lower():
+            return opt
+    return ""
+
+
+def _condo_price_text(price, label) -> str:
+    """The price line a condo-family poster/video shows: the price, openly, with the
+    agent's label. No price -> "View to Offer" when that is the label, else "Price on
+    request" (the landed wording)."""
+    label = _normalize_price_label(label)
+    num = _to_number(price)
+    if num <= 0:
+        return "View to Offer" if label == "View to Offer" else "Price on request"
+    amount = f"SGD {_format_price_millions(price)}"
+    if label == "From":
+        return f"From {amount}"
+    if label == "Negotiable":
+        return f"{amount} (Negotiable)"
+    if label == "View to Offer":
+        return f"{amount} · View to Offer"
+    return amount
+
+
+# --- EC eligibility --------------------------------------------------------------------
+EC_ELIGIBILITY_OPTIONS = ("citizens_prs", "all_buyers")
+_EC_ELIGIBILITY_FACTS = {
+    "citizens_prs": "Singapore Citizens and Permanent Residents only",
+    "all_buyers": "open to all buyers, including foreigners",
+}
+
+
+def _normalize_ec_eligibility(raw) -> str:
+    v = str(raw or "").strip().lower()
+    return v if v in EC_ELIGIBILITY_OPTIONS else ""
+
+
+def _is_ec_type(property_type) -> bool:
+    try:
+        return ura_market_pulse.strata_ura_types(str(property_type or "")) == ("Executive Condominium",)
+    except Exception:
+        return False
+
+
+def _ec_compliance_warnings(property_type, top_year, ec_eligibility) -> list:
+    """Warnings (never blocking) for an EC listing, from the agent's own TOP year and
+    eligibility choice. Under 5 years from TOP an EC is still in its Minimum Occupation
+    Period and cannot be resold on the open market. Nothing is ever inferred FOR the
+    agent -- these only flag a mismatch for them to check."""
+    if not _is_ec_type(property_type):
+        return []
+    out = []
+    ty = _valid_year(top_year)
+    elig = _normalize_ec_eligibility(ec_eligibility)
+    if ty:
+        age = datetime.utcnow().year - ty
+        if age < 5:
+            out.append(f"This EC's TOP year is {ty} (under 5 years ago). An EC can't be resold on the "
+                       "open market until its 5-year Minimum Occupation Period is over -- please check "
+                       "before advertising it.")
+        elif age < 10 and elig == "all_buyers":
+            out.append(f"TOP {ty} is under 10 years ago, so this EC is normally still limited to "
+                       "Singapore Citizens and PRs -- please check the buyer eligibility you selected.")
+        elif age >= 10 and elig == "citizens_prs":
+            out.append(f"TOP {ty} is 10 or more years ago, so this EC is normally open to all buyers "
+                       "-- please check the buyer eligibility you selected.")
+    return out
+
+
+# --- CEA details (agent profile) -------------------------------------------------------
+# Loose shape checks, upper-cased: CEA registration "R123456A" (a letter, 6 digits, a
+# letter) and agency licence "L3008899K" (a letter, 7 digits, a letter). Spaces and hyphens
+# are dropped first, so "r 123456-a" is accepted as R123456A.
+_CEA_REG_RE = re.compile(r"[A-Z]\d{6}[A-Z]")
+_AGENCY_LICENCE_RE = re.compile(r"[A-Z]\d{7}[A-Z]")
+CEA_PROFILE_FIELDS = ("cea_reg_no", "agency_name", "agency_licence_no")
+_CEA_FIELD_LABELS = {"cea_reg_no": "CEA registration number", "agency_name": "agency name",
+                     "agency_licence_no": "agency licence number"}
+
+
+def _normalize_cea_field(field: str, raw):
+    """-> (value, error). "" is a valid value (clears the field)."""
+    if field == "agency_name":
+        return re.sub(r"\s+", " ", str(raw or "")).strip()[:120], ""
+    v = re.sub(r"[\s\-]+", "", str(raw or "")).upper()
+    if not v:
+        return "", ""
+    pattern = _CEA_REG_RE if field == "cea_reg_no" else _AGENCY_LICENCE_RE
+    if not pattern.fullmatch(v):
+        example = "R123456A" if field == "cea_reg_no" else "L3008899K"
+        return "", f"That doesn't look like a {_CEA_FIELD_LABELS[field]} (e.g. {example})."
+    return v, ""
+
+
+def _agent_cea(agent) -> dict:
+    src = agent if isinstance(agent, dict) else {}
+    return {f: str(src.get(f) or "").strip() for f in CEA_PROFILE_FIELDS}
+
+
+def _cea_missing(agent) -> list:
+    """Field names still blank -- [] means the CEA block can be shown."""
+    cea = _agent_cea(agent)
+    return [f for f in CEA_PROFILE_FIELDS if not cea[f]]
+
+
+def _cea_warning(agent) -> str:
+    missing = _cea_missing(agent)
+    if not missing:
+        return ""
+    names = ", ".join(_CEA_FIELD_LABELS[f] for f in missing)
+    return (f"Your CEA details are incomplete ({names}), so they were left off this listing's "
+            "materials. Add them in My Profile -- CEA requires them on property advertisements.")
+
+
+def _cea_licence_line(agent) -> str:
+    """"CEA Reg No: R123456A · Agency: X (Licence No: L3008899K)" or "" when incomplete."""
+    if _cea_missing(agent):
+        return ""
+    c = _agent_cea(agent)
+    return f"CEA Reg No: {c['cea_reg_no']} · Agency: {c['agency_name']} (Licence No: {c['agency_licence_no']})"
+
+
+def _cea_text_block(agent, phone=None) -> str:
+    """The write-up's CEA block (condo family only). "" when the profile is incomplete."""
+    if _cea_missing(agent):
+        return ""
+    c = _agent_cea(agent)
+    src = agent if isinstance(agent, dict) else {}
+    name = str(src.get("name") or "").strip()
+    phone = str(phone if phone is not None else (src.get("contact") or "")).strip()
+    first = " | ".join(x for x in (name, phone) if x)
+    lines = [first] if first else []
+    lines += [f"CEA Reg No: {c['cea_reg_no']}",
+              f"Agency: {c['agency_name']} (Licence No: {c['agency_licence_no']})"]
+    return "\n".join(lines)
+
+
+def _append_cea_block(text, agent) -> str:
+    """Appends the CEA block to a condo-family write-up. Idempotent (a regenerate or a
+    text that already carries a CEA Reg No line is left as is). Never raises."""
+    try:
+        block = _cea_text_block(agent)
+        if not block or not text or "CEA Reg No:" in text:
+            return text
+        return text.rstrip() + "\n\n" + block
+    except Exception as e:
+        logger.error("CEA block not appended (harmless): %s", e)
+        return text
+
+
+def _home_listing_needs_cea(primary_type, types=None) -> bool:
+    """CEA details go on condo-family listings ONLY. A listing with any landed / Prestige
+    type (incl. Penthouse) never gets them -- Jane's decision."""
+    return _is_condo_family_only(primary_type, types)
+
+
+def _home_video_overlay(listing, agent, price_text, stats):
+    """-> (end-slate contact text, price_text, stats) for the video. Landed / Prestige:
+    the agent's contact exactly as before, price_text and stats untouched. Condo family:
+    the price is shown openly (with its label) on the end slate under the contact, then the
+    CEA lines -- one per line ("\n"), which the end slate draws smaller beneath the phone.
+    (The Classic film draws no stats/price_text of its own; they are passed on for any tier
+    that does.) Never raises."""
+    src_agent = agent if isinstance(agent, dict) else {}
+    contact = str(src_agent.get("contact") or "")
+    try:
+        src = listing if isinstance(listing, dict) else {}
+        if not _home_listing_needs_cea(src.get("property_type"), _listing_property_types(src)):
+            return contact, price_text, stats
+        label = _listing_strata_fields(src)["price_label"]
+        price_text = _condo_price_text(src.get("price"), label)
+        extra = []
+        if _to_number(src.get("price")) > 0 or label == "View to Offer":
+            stats = [price_text] + list(stats or [])
+            extra.append(price_text)
+        block = _cea_text_block(src_agent)
+        if block:
+            extra += block.split("\n")[-2:]   # the CEA Reg No + Agency lines
+        return "\n".join([contact] + extra) if extra else contact, price_text, stats
+    except Exception as e:
+        logger.error("Home video overlay skipped (plain contact used): %s", e)
+        return contact, price_text, stats
+
+
+def _with_cea_fields(out: dict, agent) -> dict:
+    """Profile responses: the CEA details always present (blank before migration 003 or
+    when unset), plus which are missing, so the frontend can nudge before a condo listing."""
+    for f in CEA_PROFILE_FIELDS:
+        out[f] = str((agent or {}).get(f) or "")
+    out["cea_missing"] = _cea_missing(agent)
+    out["cea_details_supported"] = bool(_agent_cea_columns_supported)
+    return out
+
+
+# --- Owner consent (ALL listing types) ---------------------------------------------------
+# Rule for auto-posting: a listing whose attributes CARRY owner_consent_confirmed and it is
+# not True is refused. Every listing created after this deploy carries the key (an older
+# client that doesn't send it is recorded as False), so it needs the tick. Listings created
+# BEFORE this deploy have no key and keep posting exactly as before.
+OWNER_CONSENT_REQUIRED_DETAIL = ("This listing hasn't been confirmed as advertised with the owner's "
+                                 "consent. Edit the listing, tick the owner-consent box and save, "
+                                 "then post again.")
+
+
+def _consent_attributes_for_create(req) -> dict:
+    ok = getattr(req, "owner_consent_confirmed", None) is True
+    out = {"owner_consent_confirmed": ok}
+    if ok:
+        out["owner_consent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return out
+
+
+def _consent_attributes_for_update(prev: dict, req) -> dict:
+    """Keys to set on an edit. Only when the client SENT a value: an older form leaves the
+    saved consent alone. Re-confirming keeps the original timestamp."""
+    try:
+        sent = set(getattr(req, "model_fields_set", None) or getattr(req, "__fields_set__", None) or ())
+        value = getattr(req, "owner_consent_confirmed", None)
+        if "owner_consent_confirmed" not in sent or value is None:
+            return {}
+        prev = prev if isinstance(prev, dict) else {}
+        if value is True:
+            if prev.get("owner_consent_confirmed") is True and prev.get("owner_consent_at"):
+                return {"owner_consent_confirmed": True, "owner_consent_at": prev["owner_consent_at"]}
+            return {"owner_consent_confirmed": True,
+                    "owner_consent_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        return {"owner_consent_confirmed": False, "owner_consent_at": None}
+    except Exception as e:
+        logger.error("owner-consent update skipped (saved value kept): %s", e)
+        return {}
+
+
+def _owner_consent_blocks_posting(listing) -> bool:
+    a = _listing_attributes(listing)
+    return "owner_consent_confirmed" in a and a.get("owner_consent_confirmed") is not True
+
+
 def _normalize_floor_level(raw) -> str:
     """A BAND only ("Low"/"Mid"/"High"). A floor or unit number is never stored."""
     low = str(raw or "").strip().lower()
@@ -2374,7 +2666,8 @@ def _valid_year(v) -> int:
 # Keys this backend owns inside listings.attributes. Update merges ONLY these, so any key a
 # later phase adds (HDB town, flat model ...) is never clobbered by a condo edit.
 _STRATA_ATTRIBUTE_KEYS = ("project_name", "tenure", "tenure_detail", "floor_level",
-                          "top_year", "lease_start_year")
+                          "top_year", "lease_start_year", "hide_project_name", "price_label",
+                          "ec_eligibility")
 
 
 def _build_listing_attributes(req) -> dict:
@@ -2399,6 +2692,14 @@ def _build_listing_attributes(req) -> dict:
         ly = _valid_year(getattr(req, "lease_start_year", 0))
         if ly:
             out["lease_start_year"] = ly
+        if getattr(req, "hide_project_name", False) is True:
+            out["hide_project_name"] = True
+        pl = _normalize_price_label(getattr(req, "price_label", ""))
+        if pl:
+            out["price_label"] = pl
+        ec = _normalize_ec_eligibility(getattr(req, "ec_eligibility", ""))
+        if ec:
+            out["ec_eligibility"] = ec
     except Exception as e:
         logger.error("listing attributes could not be built (ignored): %s", e)
         return {}
@@ -2417,6 +2718,7 @@ def _merge_listing_attributes(prev: dict, req) -> dict:
         view = {k: (getattr(req, k) if k in sent_owned else prev.get(k, "")) for k in _STRATA_ATTRIBUTE_KEYS}
         for k in ("top_year", "lease_start_year"):
             view[k] = view[k] or 0
+        view["hide_project_name"] = view["hide_project_name"] is True
         merged = {k: v for k, v in prev.items() if k not in _STRATA_ATTRIBUTE_KEYS}
         merged.update(_build_listing_attributes(types.SimpleNamespace(**view)))
         return merged
@@ -2442,22 +2744,31 @@ def _listing_strata_fields(listing) -> dict:
         "floor_level": str(a.get("floor_level") or ""),
         "top_year": _valid_year(a.get("top_year")),
         "lease_start_year": _valid_year(a.get("lease_start_year")),
+        "hide_project_name": a.get("hide_project_name") is True,
+        "price_label": _normalize_price_label(a.get("price_label")),
+        "ec_eligibility": _normalize_ec_eligibility(a.get("ec_eligibility")),
+        # Absent (a listing from before owner consent existed) -> None, not False, so the
+        # frontend can tell "never asked" from "not confirmed".
+        "owner_consent_confirmed": (a.get("owner_consent_confirmed") is True
+                                    if "owner_consent_confirmed" in a else None),
+        "owner_consent_at": a.get("owner_consent_at") or None,
     }
 
 
-# Jane has NOT approved naming a condo's project in anything a buyer sees: like a street
-# name it pins the location, and the stray-street guard can't recognise project names.
-# So the project name stays agent-only. When/if she approves, the switch is here: flip this
-# to True AND store a per-listing opt-in (attributes["show_project_name"] = True) from the
-# New Listing form -- this function is the single gate every buyer-facing surface uses.
-PROJECT_NAME_PUBLIC_ENABLED = False
-
-
+# Jane, 2026-10-20: a condo-family listing's project name IS public -- buyer page and
+# write-up -- because buyers search by development. Unit numbers are still always
+# stripped (_clean_project_name) and the floor is only ever a band. The agent can opt a
+# listing out with hide_project_name, which brings back the serve-time scrub below.
+# Landed / Prestige listings are untouched: no project name, hide-the-road unchanged.
+# This function is the single gate every buyer-facing surface uses.
 def _public_project_name(listing) -> str:
-    if not PROJECT_NAME_PUBLIC_ENABLED:
+    src = listing if isinstance(listing, dict) else {}
+    if not _is_condo_family_only(src.get("property_type"), _listing_property_types(src)):
         return ""
-    a = _listing_attributes(listing)
-    return str(a.get("project_name") or "") if a.get("show_project_name") is True else ""
+    a = _listing_attributes(src)
+    if a.get("hide_project_name") is True:
+        return ""
+    return _clean_project_name(a.get("project_name"))
 
 
 def _scrub_project_name(text, listing, district_label: str, features: bool = False):
@@ -2525,7 +2836,8 @@ CONDOMINIUM / EXECUTIVE CONDOMINIUM / APARTMENT -- additional HARD RULES
   mentioned in general terms ("a pool in the development") without a name or figure.
 - Never state tenure, floor level, facing, view, MRT or school proximity, or the project name
   unless it is in FACTS. If FACTS has no tenure, do not mention tenure.
-- For an executive condominium, never state or imply who is eligible to buy it, and never
+- For an executive condominium, never state or imply who is eligible to buy it unless FACTS
+  gives a "Buyer eligibility" line -- then state exactly that, nothing more -- and never
   mention MSOP, privatisation, income ceilings or grants unless FACTS says so.
 - Do not use landed or status words for a condo-family home: no "bungalow-like",
   "landed-like", "estate", "mansion", "grand", "prestigious", "exclusive". Warmth is about
@@ -2580,9 +2892,14 @@ def _build_writeup_facts_block(req, district_str: str) -> str:
     if _num(req.land_size) > 0 and not is_non_landed:
         lines.append(f"- Land size: {_fmt_writeup_num(req.land_size)} sqft")
     if is_non_landed or _is_strata_type(ptype):
-        # Condo-family facts (content-studio spec 3.1). Only what the agent supplied; the
-        # project name is deliberately NEVER given to the model (agent-only until Jane
-        # decides), and nothing about EC eligibility/MSOP/privatisation is ever added.
+        # Condo-family facts (content-studio spec 3.1). Only what the agent supplied. The
+        # project name is given (public since 2026-10-20) unless the agent hid it -- unit
+        # numbers already stripped. EC eligibility comes ONLY from the agent's explicit
+        # ec_eligibility choice; nothing about MSOP/privatisation is ever added.
+        if _is_strata_type(ptype) and getattr(req, "hide_project_name", False) is not True:
+            project = _clean_project_name(getattr(req, "project_name", ""))
+            if project:
+                lines.append(f"- Project / development name: {project}")
         tenure, detail = _normalize_tenure(getattr(req, "tenure", ""),
                                            getattr(req, "tenure_detail", ""))
         if tenure == "Other":
@@ -2593,6 +2910,11 @@ def _build_writeup_facts_block(req, district_str: str) -> str:
         floor = _normalize_floor_level(getattr(req, "floor_level", ""))
         if floor:
             lines.append(f"- Floor level: {floor} floor")
+        if _is_ec_type(ptype):
+            elig = _normalize_ec_eligibility(getattr(req, "ec_eligibility", ""))
+            if elig:
+                lines.append(f"- Buyer eligibility (state exactly this, nothing more): "
+                             f"{_EC_ELIGIBILITY_FACTS[elig]}")
     if (req.features or "").strip():
         lines.append(f"- Agent-noted features: {req.features.strip()}")
     return "\n".join(lines)
@@ -2760,6 +3082,22 @@ def _strip_land_fields_for_strata(req, resolved_types, warnings) -> None:
 # 002_listing_attributes.sql). Probed once at startup like district; until present, condo
 # fields are used for the write-up but not stored, and nothing can fail on them.
 _attributes_column_supported = False
+
+
+# Whether the agents table has the CEA columns (migration 003_agent_cea_details.sql).
+# Until it does, profile saves ignore the CEA fields and nothing selects them.
+_agent_cea_columns_supported = False
+
+
+def _probe_agent_cea_columns():
+    global _agent_cea_columns_supported
+    try:
+        get_db().table("agents").select(", ".join(CEA_PROFILE_FIELDS)).limit(1).execute()
+        _agent_cea_columns_supported = True
+        logger.info("agents CEA columns present -- CEA details stored")
+    except Exception:
+        _agent_cea_columns_supported = False
+        logger.warning("agents CEA columns NOT present -- run backend/migrations/003_agent_cea_details.sql")
 
 
 def _probe_attributes_column():
@@ -2944,12 +3282,14 @@ class WriteupRequest(BaseModel):
     # unrecognised -> profile tone.
     writing_style: str = Field(default="", max_length=50)
     # OPTIONAL condo-family facts (NestList Home), same meaning as on ListingRequest. Only
-    # tenure and the floor band reach the FACTS block; project_name is accepted so the form
-    # can send one payload, but it is never given to the model.
+    # tenure, the floor band, the project name (unless hide_project_name) and EC
+    # eligibility reach the FACTS block.
     project_name: str = Field(default="", max_length=120)
     tenure: str = Field(default="", max_length=60)
     tenure_detail: str = Field(default="", max_length=80)
     floor_level: str = Field(default="", max_length=20)
+    hide_project_name: bool = False
+    ec_eligibility: str = Field(default="", max_length=20)
 
 
 # One Opus-5 vision call per request -- rate-limited per agent. This dict is PER WORKER, and
@@ -3007,7 +3347,13 @@ async def generate_writeup(req: WriteupRequest, agent=Depends(get_current_agent)
     _hits.append(datetime.utcnow())
     _generate_writeup_hits[agent["id"]] = _hits
 
-    return {"writeup": writeup}
+    cea_missing = []
+    if _home_listing_needs_cea(req.property_type):
+        cea_missing = _cea_missing(agent)
+        if not cea_missing:
+            writeup = _append_cea_block(writeup, agent)
+    return {"writeup": writeup, "cea_missing": cea_missing,
+            "warnings": [_cea_warning(agent)] if cea_missing else []}
 
 MAX_LISTING_PHOTOS = 15  # per listing, not per request -- see _process_and_upload_images
 
@@ -4381,6 +4727,8 @@ def post_to_facebook(listing_id: str, req: FacebookPostRequest, agent=Depends(ge
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
+    if _owner_consent_blocks_posting(listing):
+        raise HTTPException(status_code=409, detail=OWNER_CONSENT_REQUIRED_DETAIL)
 
     if not listing.get("poster_url"):
         raise HTTPException(status_code=400, detail="Generate a poster before posting to Facebook")
@@ -4424,6 +4772,8 @@ def post_to_linkedin(listing_id: str, req: LinkedInPostRequest, agent=Depends(ge
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
+    if _owner_consent_blocks_posting(listing):
+        raise HTTPException(status_code=409, detail=OWNER_CONSENT_REQUIRED_DETAIL)
 
     access_token = agent.get("linkedin_access_token")
     person_urn = agent.get("linkedin_person_urn")
@@ -4622,6 +4972,16 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     # profile contact. Only affects what is drawn on THIS poster -- the profile is untouched.
     contact_line = phone_override if phone_override else agent.get("contact", "")
 
+    # NestList Home (condo family ONLY): price shown openly with the agent's label, and the
+    # CEA line drawn as a footer. Landed / Prestige: nothing here changes.
+    compliance_line, poster_warnings, cea_missing = "", [], []
+    if _home_listing_needs_cea(listing.get("property_type"), _listing_property_types(listing)):
+        price_text = _condo_price_text(price_source, _listing_strata_fields(listing)["price_label"])
+        cea_missing = _cea_missing(agent)
+        compliance_line = _cea_licence_line(agent)
+        if cea_missing:
+            poster_warnings.append(_cea_warning(agent))
+
     try:
         poster_image = poster_renderer.render_poster(
             property_type=property_type_text,
@@ -4633,6 +4993,7 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
             property_photo_url=images[photo_index],
             agent_photo_url=agent.get("photo_url"),
             template_id=chosen_template_id,
+            compliance_line=compliance_line,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Poster rendering failed: {e}")
@@ -4658,7 +5019,8 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
         update_payload["poster_template_id"] = template_id
     db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_poster listings update")
 
-    return {"poster_url": poster_url, "poster_template_id": chosen_template_id}
+    return {"poster_url": poster_url, "poster_template_id": chosen_template_id,
+            "warnings": poster_warnings, "cea_missing": cea_missing}
 
 DEFAULT_VIDEO_TEMPLATE_ID = "classic"
 
@@ -4841,6 +5203,8 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
     # (Confirmed: the Classic tier doesn't draw price_text anyway -- see video_renderer.py
     # ~1305 -- so this only affects any tier that does; either way it's never empty garbage.)
     price_text = f"SGD {_format_price_millions(listing.get('price'))}" if price_num > 0 else "Price on request"
+    # NestList Home (condo family ONLY): price openly in the stats, CEA on the end slate.
+    video_contact_line, price_text, stats = _home_video_overlay(listing, agent, price_text, stats)
 
     video_bytes, degradations, captions_used = video_renderer.render_property_video(
         image_urls=images,
@@ -4849,7 +5213,7 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
         price_text=price_text,
         stats=stats,
         agent_name=agent["name"],
-        agent_contact_line=agent.get("contact", ""),
+        agent_contact_line=video_contact_line,
         style=chosen_video_template_id,
         photo_index=photo_index,
         agent_photo_url=agent.get("photo_url"),
@@ -5417,6 +5781,8 @@ def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
+    if _owner_consent_blocks_posting(listing):
+        raise HTTPException(status_code=409, detail=OWNER_CONSENT_REQUIRED_DETAIL)
 
     if not listing.get("poster_url"):
         raise HTTPException(status_code=400, detail="Generate a poster before posting to Instagram")
@@ -5469,13 +5835,46 @@ def post_to_instagram(listing_id: str, req: InstagramPostRequest, agent=Depends(
 # ================================
 # PROFILE ROUTE
 # ================================
+def _cea_profile_updates(req) -> dict:
+    """Normalised CEA fields the request actually SENT (None / not sent = leave alone).
+    Raises a 400 with a plain message on a malformed number."""
+    sent = set(getattr(req, "model_fields_set", None) or getattr(req, "__fields_set__", None) or ())
+    out = {}
+    for f in CEA_PROFILE_FIELDS:
+        raw = getattr(req, f, None)
+        if f not in sent or raw is None:
+            continue
+        value, err = _normalize_cea_field(f, raw)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        out[f] = value
+    return out
+
+
 @app.put("/api/profile")
 def update_profile(req: ProfileUpdate, agent=Depends(get_current_agent)):
     if req.notification_channel not in ("telegram", "whatsapp", "both"):
         raise HTTPException(status_code=400, detail="Invalid notification channel")
-    db_execute(lambda db: db.table("agents").update(req.dict()).eq("id", agent["id"]), what="update_profile agents update")
+    cea = _cea_profile_updates(req)   # validated BEFORE anything is written
+    payload = req.dict(exclude=set(CEA_PROFILE_FIELDS))
+    if _agent_cea_columns_supported:
+        payload.update(cea)
+    db_execute(lambda db: db.table("agents").update(payload).eq("id", agent["id"]), what="update_profile agents update")
     result = db_execute(lambda db: db.table("agents").select("*").eq("id", agent["id"]), what="update_profile agents select")
     agent = result.data[0]
+    return _agent_response(agent)
+
+
+@app.patch("/api/profile")
+def patch_profile_cea(req: ProfileCEAUpdate, agent=Depends(get_current_agent)):
+    """Update any subset of the CEA details (cea_reg_no, agency_name, agency_licence_no)."""
+    cea = _cea_profile_updates(req)
+    if cea:
+        if not _agent_cea_columns_supported:
+            raise HTTPException(status_code=503, detail="CEA details can't be saved yet -- please try again later.")
+        db_execute(lambda db: db.table("agents").update(cea).eq("id", agent["id"]), what="patch_profile_cea agents update")
+        result = db_execute(lambda db: db.table("agents").select("*").eq("id", agent["id"]), what="patch_profile_cea agents select")
+        agent = result.data[0]
     return _agent_response(agent)
 
 @app.get("/api/profile")
@@ -6432,9 +6831,15 @@ def _public_listing_payload(listing) -> dict:
     # unreachable, serve the property anyway with a blank agent block: a buyer
     # looking at the home with the agent name missing is a far better outcome
     # than "Listing Not Found" on a link the agent just shared.
+    # NestList Home: a condo-family listing's page carries the agent's CEA details (only
+    # once migration 003 has added the columns -- before that the select stays as it was).
+    _home = _home_listing_needs_cea(listing.get("property_type"), _listing_property_types(listing))
+    _agent_cols = "name, agency, specialty"
+    if _home and _agent_cea_columns_supported:
+        _agent_cols += ", contact, " + ", ".join(CEA_PROFILE_FIELDS)
     try:
         agent_result = db_execute(
-            lambda db: db.table("agents").select("name, agency, specialty").eq("id", listing["agent_id"]),
+            lambda db: db.table("agents").select(_agent_cols).eq("id", listing["agent_id"]),
             what="public listing agent lookup",
         )
         agent_info = agent_result.data[0] if agent_result.data else {}
@@ -6464,8 +6869,8 @@ def _public_listing_payload(listing) -> dict:
     # Features are agent free text and never went through the copy guard: strip any
     # house/unit number before the street scrub (older rows were saved unguarded).
     public_features = _scrub_own_street(_guard_features(listing.get("features")), own_location, district_label)
-    # Condo family: the project name pins the location the way a street does, and it is
-    # agent-only until Jane decides otherwise -- scrub it from outward text too.
+    # Condo family: the project name is public (2026-10-20) and this scrub is then a no-op;
+    # it only removes the name when the agent ticked hide_project_name.
     public_content = _scrub_project_name(public_content, listing, district_label)
     public_features = _scrub_project_name(public_features, listing, district_label, features=True)
     _strata = _listing_strata_fields(listing)
@@ -6518,8 +6923,27 @@ def _public_listing_payload(listing) -> dict:
         # (it could carry anything); "Other" alone tells a buyer nothing, so it is blank.
         "tenure": _strata["tenure"] if _strata["tenure"] != "Other" else "",
         "floor_level": _strata["floor_level"],
-        "agent": {"name": agent_info.get("name"), "agency": agent_info.get("agency")}
+        # Condo family (blank otherwise): the development name unless the agent hid it --
+        # never a unit number -- the price label, and (EC only) the agent's own eligibility
+        # choice. Never a floor or unit number, never the TOP/lease year.
+        "project_name": _public_project_name(listing),
+        "price_label": _strata["price_label"] if _home else "",
+        "ec_eligibility": (_strata["ec_eligibility"]
+                           if _home and _is_ec_type(listing.get("property_type")) else ""),
+        "agent": _public_agent_block(agent_info, _home),
     }
+
+
+def _public_agent_block(agent_info, home: bool) -> dict:
+    """{name, agency} as before; a condo-family listing also gets the CEA details (blank
+    when incomplete). Landed / Prestige: never the reg or licence numbers."""
+    out = {"name": agent_info.get("name"), "agency": agent_info.get("agency")}
+    if home:
+        complete = not _cea_missing(agent_info)
+        for f in CEA_PROFILE_FIELDS:
+            out[f] = str(agent_info.get(f) or "").strip() if complete else ""
+        out["contact"] = str(agent_info.get("contact") or "").strip() if complete else ""
+    return out
 
 
 def _ilike_literal(value: str) -> str:
@@ -7058,6 +7482,7 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
         _prev = existing.data[0].get("attributes")
         _prev = _prev if isinstance(_prev, dict) else {}
         update_payload["attributes"] = _merge_listing_attributes(_prev, req)
+        update_payload["attributes"].update(_consent_attributes_for_update(_prev, req))
     # Discreet buyer-link code. An override sets it; otherwise we only *fill in* a
     # code when the listing has none yet -- an ordinary field edit must never
     # clobber an existing code (e.g. the demo listing's YOE). Wrapped whole so it
@@ -7080,6 +7505,9 @@ def update_listing(listing_id: str, req: ListingRequest, agent=Depends(get_curre
     updated = db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="update_listing listings update")
     row = updated.data[0]
     row.update(_listing_strata_fields(row))
+    _saved = _listing_strata_fields(row)
+    row["compliance_warnings"] = _ec_compliance_warnings(row.get("property_type"), _saved["top_year"],
+                                                         _saved["ec_eligibility"])
     return row
 
 MAX_LISTING_CONTENT_CHARS = 20000
@@ -7864,7 +8292,12 @@ def get_sellers(agent=Depends(get_current_agent)):
 
 @app.post("/api/sellers")
 def create_seller(req: SellerLeadRequest, agent=Depends(get_current_agent)):
-    result = db_execute(lambda db: db.table("listings").insert(_seller_lead_payload(req, agent["id"])), what="create_seller listings insert", idempotent=False)
+    payload = _seller_lead_payload(req, agent["id"])
+    # A lead becomes a listing through the edit form; recorded as not-yet-confirmed so it
+    # needs the owner-consent tick before auto-posting, like any new listing.
+    if _attributes_column_supported:
+        payload["attributes"] = {"owner_consent_confirmed": False}
+    result = db_execute(lambda db: db.table("listings").insert(payload), what="create_seller listings insert", idempotent=False)
     return result.data[0]
 
 @app.get("/api/sellers/{seller_id}")
