@@ -590,6 +590,27 @@ check("one-word name: ordinary uses untouched, the name itself scrubbed",
 check("scrub is case-sensitive to how the agent typed the name",
       NS["_scrub_project_name"]("a view of the horizon", {"attributes": {"project_name": "Horizon Towers"}}, "D")
       == "a view of the horizon")
+sail = {"attributes": {"project_name": "The Sail @ Marina Bay"}}
+for t in ("the sail @ marina bay", "THE SAIL @ MARINA BAY", "The Sail @ Marina Bay"):
+    check(f"multi-word name scrubbed whatever the capitals: {t!r}",
+          NS["_scrub_project_name"](f"Live at {t}. {t} has a pool.", sail, "District 1")
+          == "Live at District 1. District 1 has a pool.")
+    check(f"multi-word name scrubbed in Key Features too: {t!r}",
+          NS["_scrub_project_name"](f"{t}, high floor", sail, "District 1", features=True) == "District 1, high floor")
+newton = {"attributes": {"project_name": "Newton"}}
+sf = lambda t: NS["_scrub_project_name"](t, newton, "District 11", features=True)
+check("Key Features: one-word name at the very start is scrubbed", sf("Newton, high floor") == "District 11, high floor")
+check("Key Features: after a comma", sf("High floor, Newton, pool") == "High floor, District 11, pool")
+check("Key Features: after a bullet / on a new line",
+      sf("• Newton\n- Newton\nNewton views") == "• District 11\n- District 11\nDistrict 11 views", sf("• Newton\n- Newton\nNewton views"))
+check("Key Features: one-word names still exact-capitals", sf("newton's cradle, high floor") == "newton's cradle, high floor")
+check("Key Features: '26 Newton' goes whole", sf("26 Newton, high floor") == "District 11, high floor")
+check("prose: one-word name at a sentence start still left alone",
+      NS["_scrub_project_name"]("Newton fans will love it. Live at Newton.", newton, "District 11")
+      == "Newton fans will love it. Live at District 11.")
+check("Reflections in Key Features: ordinary lowercase use untouched, the name scrubbed",
+      NS["_scrub_project_name"]("Reflections, sea view, reflections on the water", refl, "District 4", features=True)
+      == "District 4, sea view, reflections on the water")
 check("short one-word names are not scrubbed (would eat ordinary words)",
       NS["_scrub_project_name"]("Sky views", {"attributes": {"project_name": "Sky"}}, "District 1") == "Sky views")
 check("scrub is a no-op on landed", NS["_scrub_project_name"]("A home", {}, "District 10") == "A home")
@@ -846,6 +867,12 @@ pub = NS["_public_listing_payload"]({"id": "L1", "agent_id": "a1", "property_typ
                                      "attributes": {"project_name": "Parc Esta", "tenure": "Freehold",
                                                     "floor_level": "High", "top_year": 2022}})
 blob = repr(pub)
+pub_n = NS["_public_listing_payload"]({"id": "L4", "agent_id": "a1", "property_type": "Condominium",
+                                       "location": "x", "district": "11", "price": "1", "content": "A home.",
+                                       "features": "Newton, high floor",
+                                       "attributes": {"project_name": "Newton"}})
+check("public page: Key Features starting with a one-word project name is scrubbed",
+      pub_n["features"] == "District 11, high floor", pub_n["features"])
 check("public page: no project name anywhere, no TOP year, no unit number",
       "Parc Esta" not in blob and "2022" not in blob and "#05" not in blob, blob[:300])
 check("public page: tenure + floor band shown", pub["tenure"] == "Freehold" and pub["floor_level"] == "High")

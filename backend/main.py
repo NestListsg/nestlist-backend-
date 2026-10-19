@@ -2322,34 +2322,46 @@ def _public_project_name(listing) -> str:
     return str(a.get("project_name") or "") if a.get("show_project_name") is True else ""
 
 
-def _scrub_project_name(text, listing, district_label: str):
+def _scrub_project_name(text, listing, district_label: str, features: bool = False):
     """Serve-time: remove this listing's own project name from outward text (it may be in
     agent-typed features or hand-edited copy), unless the agent has opted to show it.
 
-    Matching is CASE-SENSITIVE, whole name only, exactly as the agent typed it -- so a
-    project called "Reflections" or "Horizon" removes "Reflections"/"Horizon" the name,
-    never "reflections of light" in ordinary prose. A one-word name is additionally left
-    alone at the start of a sentence, where any ordinary word is capitalised, and names
-    under 6 characters are never scrubbed. Never raises."""
+    MULTI-WORD names ("The Sail @ Marina Bay") match whatever the capitals -- "the sail @
+    marina bay" or "THE SAIL @ MARINA BAY" pin the location just as well, and a phrase that
+    long can't be an ordinary run of words.
+
+    ONE-WORD names ("Reflections", "Newton") match only with the capitals the agent typed,
+    so "reflections of light" in prose is never touched. In prose (`features=False`) a
+    one-word name is also left alone at the start of a sentence, where any ordinary word
+    is capitalised. Key Features (`features=True`) is a list, not prose: there it is only
+    left alone after a full stop/!/?, never at the very start, after a comma or a bullet,
+    or at the start of a line -- so "Newton, high floor" is scrubbed.
+
+    Names under 6 characters (one word) are never scrubbed. Never raises."""
     if not text:
         return text
     try:
         name = str(_listing_attributes(listing).get("project_name") or "").strip()
         if not name or _public_project_name(listing):
             return text
-        if len(name) < 6 and " " not in name:
+        single_word = " " not in name
+        if single_word and len(name) < 6:
             return text
         # A number written in front of the name ("26 Newton" when the stored name is just
         # "Newton") goes WITH it, so the result can never read "26 District 11".
         replacement = district_label or "the development"
-        pattern = re.compile(r"(?<!\w)(?:\d{1,4}[A-Za-z]?\s+)?" + re.escape(name) + r"(?!\w)")
-        single_word = " " not in name
+        pattern = re.compile(r"(?<!\w)(?:\d{1,4}[A-Za-z]?\s+)?" + re.escape(name) + r"(?!\w)",
+                             0 if single_word else re.IGNORECASE)
+        sentence_enders = ".!?" if features else ".!?\n:\"'("
 
         def _sub(m):
             if single_word:
-                before = text[:m.start()].rstrip()
-                if not before or before[-1] in ".!?\n:\"'(":
-                    return m.group(0)   # sentence-initial: could be an ordinary word
+                before = text[:m.start()].rstrip(" \t")
+                if features:
+                    if before and before[-1] in sentence_enders:
+                        return m.group(0)
+                elif not before.strip() or before[-1] in sentence_enders:
+                    return m.group(0)   # sentence-initial in prose: could be an ordinary word
             return replacement
         return pattern.sub(_sub, text)
     except Exception as e:
@@ -6312,7 +6324,7 @@ def _public_listing_payload(listing) -> dict:
     # Condo family: the project name pins the location the way a street does, and it is
     # agent-only until Jane decides otherwise -- scrub it from outward text too.
     public_content = _scrub_project_name(public_content, listing, district_label)
-    public_features = _scrub_project_name(public_features, listing, district_label)
+    public_features = _scrub_project_name(public_features, listing, district_label, features=True)
     _strata = _listing_strata_fields(listing)
     # The listing's own videos, so the buyer's page can actually play the tour the
     # "Reply with Listing" copy promises. Both are optional and both default to null:
