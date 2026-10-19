@@ -520,10 +520,15 @@ def cma_strata_types(nestlist_type: str) -> tuple:
 # nothing. Matching is now in two tiers, and deliberately conservative -- valuing a home
 # against the WRONG development is worse than falling back to its street:
 #   1. exact, after dropping case, punctuation and the words "the" / "at" / "and";
-#   2. close: one name is the other's leading words ("sail" -> "sail marina bay"), or
-#      every word the agent typed (2+ words) is in URA's name. Accepted ONLY when exactly
-#      ONE URA development fits (after the street check below) -- "Parc" alone fits dozens,
-#      so it matches none. When the agent also gave a street, a close match must be on it.
+#   2. close: URA's name STARTS WITH what the agent typed ("pearl bank" is in "one pearl
+#      bank"; "sail" starts "sail marina bay"), or contains every word of it (2+ words).
+#      URA's name is never allowed to be the SHORTER one: "Riviere Tower" never matches
+#      RIVIERE. A close match is accepted ONLY when exactly one development fits, and:
+#        - the agent typed 2+ significant words (after dropping the/at/and), or
+#        - the agent typed ONE word and gave a street, and exactly one development on
+#          that street fits. One word with no street ("Dunman": Dunman View? Grand
+#          Dunman?) is ambiguous -- nothing is chosen and the street is used instead.
+#      When a street is given, a close match must also be on it.
 # The URA name actually used is reported back (matched_project) so the agent can see it.
 _PROJECT_STOPWORDS = {"the", "at", "and"}
 _CONDO_FAMILY_TYPES = ("Condominium", "Apartment", "Executive Condominium")
@@ -534,20 +539,21 @@ def _project_tokens(name) -> tuple:
 
 
 def _is_close_project(wanted: tuple, ura: tuple) -> bool:
-    if not wanted or not ura:
+    """Is URA's name `ura` a close fit for what the agent typed (`wanted`)? URA's name
+    must be at least as long as the agent's -- it never matches by being a prefix of it."""
+    if not wanted or not ura or len(ura) < len(wanted):
         return False
-    short, long_ = (wanted, ura) if len(wanted) <= len(ura) else (ura, wanted)
     # Too little to go on ("8", "one", "sky") -> never a close match.
-    if len("".join(short)) < 4 or all(t.isdigit() for t in short):
+    if len("".join(wanted)) < 4 or all(t.isdigit() for t in wanted):
         return False
-    if long_[:len(short)] == short:
+    if ura[:len(wanted)] == wanted:
         return True
     return len(wanted) >= 2 and set(wanted) <= set(ura)
 
 
 def _match_projects(projects: list, project_name: str, street_keyword: str) -> tuple:
     """-> (candidate projects, how, URA names matched). how: "exact", "close",
-    "ambiguous" (several developments fit, none chosen) or "" (none)."""
+    "ambiguous" (could be more than one development, none chosen) or "" (none)."""
     wanted = _project_tokens(project_name)
     if not wanted:
         return [], "", []
@@ -557,6 +563,9 @@ def _match_projects(projects: list, project_name: str, street_keyword: str) -> t
     close = [p for p in projects if _is_close_project(wanted, _project_tokens(p.get("project", "")))]
     if street_keyword:
         close = [p for p in close if _matches_street_keyword(p.get("street", ""), street_keyword)]
+    elif len(wanted) < 2:
+        # One word, no street: too easy to pick the wrong development.
+        return [], ("ambiguous" if close else ""), []
     names = {_project_tokens(p.get("project", "")) for p in close}
     if len(names) == 1:
         return close, "close", sorted({str(p.get("project", "")).strip() for p in close})

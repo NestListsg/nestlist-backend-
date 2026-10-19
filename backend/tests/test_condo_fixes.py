@@ -182,6 +182,16 @@ PH_RAW = [
             contractDate=mmyy(50))]},
     {"project": "SUMANG CONDO", "street": "SUMANG WALK", "transaction": [
         txn(typeOfArea="Strata", propertyType="Condominium", price="1450000", area="100", district="19")]},
+    {"project": "RIVIERE", "street": "JIAK KIM STREET", "transaction": [
+        txn(typeOfArea="Strata", propertyType="Apartment", price="3000000", area="120", district="03")]},
+    {"project": "DUNMAN VIEW", "street": "DUNMAN ROAD", "transaction": [
+        txn(typeOfArea="Strata", propertyType="Condominium", price="1700000", area="110", district="15")]},
+    {"project": "GRAND DUNMAN", "street": "DUNMAN ROAD", "transaction": [
+        txn(typeOfArea="Strata", propertyType="Condominium", price="2100000", area="100", district="15")]},
+    {"project": "REFLECTIONS AT KEPPEL BAY", "street": "KEPPEL BAY VIEW", "transaction": [
+        txn(typeOfArea="Strata", propertyType="Condominium", price="2800000", area="140", district="04")]},
+    {"project": "ONE PEARL BANK", "street": "PEARL BANK", "transaction": [
+        txn(typeOfArea="Strata", propertyType="Condominium", price="1900000", area="80", district="03")]},
 ]
 
 
@@ -238,9 +248,39 @@ check("landed response: no new strata keys", landed["valuation_basis"] == "land_
 print("\n[6] project-name matching: close but conservative, then street")
 D = NEW._extract_strata_comparables_detailed
 CA = ("Condominium", "Apartment")
-r = D(PH_RAW, "", CA, 24, "The Sail")
-check("'The Sail' -> URA 'THE SAIL @ MARINA BAY' (close)",
+r = D(PH_RAW, "Marina Boulevard", CA, 24, "The Sail")
+check("'The Sail' + its street -> URA 'THE SAIL @ MARINA BAY' (close)",
       r["matched_on"] == "project" and r["project_match"] == "close" and r["matched_project"] == "THE SAIL @ MARINA BAY")
+r = D(PH_RAW, "", CA, 24, "The Sail")
+check("'The Sail' with no street: one significant word -> ambiguous, nothing chosen",
+      r["project_match"] == "ambiguous" and r["records"] == [] and r["matched_project"] == "")
+r = D(PH_RAW, "", CA, 24, "Riviere Tower")
+check("S1: 'Riviere Tower' never matches RIVIERE (URA name shorter)",
+      r["matched_project"] == "" and r["records"] == [] and r["project_match"] == "")
+r = D(PH_RAW, "Jiak Kim Street", CA, 24, "Riviere Tower")
+check("S1: ...not even with RIVIERE's own street (street sales used, labelled street)",
+      r["matched_on"] == "street" and r["matched_project"] == "")
+r = D(PH_RAW, "", CA, 24, "Dunman")
+check("S1: 'Dunman' with no street -> ambiguous, no DUNMAN VIEW guess",
+      r["project_match"] == "ambiguous" and r["records"] == [] and r["matched_project"] == "")
+r = D(PH_RAW, "Dunman Road", CA, 24, "Dunman")
+check("S1: 'Dunman' + Dunman Road: only DUNMAN VIEW starts with it -> that one",
+      r["matched_project"] == "DUNMAN VIEW" and [x["price"] for x in r["records"]] == [1700000.0])
+r = D(PH_RAW, "Dunman Road", CA, 24, "Grand Dunman")
+check("'Grand Dunman' -> exact GRAND DUNMAN", r["project_match"] == "exact" and r["matched_project"] == "GRAND DUNMAN")
+r = D(PH_RAW, "", CA, 24, "Reflections")
+check("'Reflections' (one word) with no street -> ambiguous", r["project_match"] == "ambiguous" and not r["records"])
+r = D(PH_RAW, "Keppel Bay View", CA, 24, "Reflections")
+check("'Reflections' + Keppel Bay View -> REFLECTIONS AT KEPPEL BAY",
+      r["matched_project"] == "REFLECTIONS AT KEPPEL BAY" and r["project_match"] == "close")
+r = D(PH_RAW, "", CA, 24, "Reflections Keppel Bay")
+check("'Reflections Keppel Bay' (3 words, no street) -> REFLECTIONS AT KEPPEL BAY",
+      r["matched_project"] == "REFLECTIONS AT KEPPEL BAY")
+r = D(PH_RAW, "", CA, 24, "Pearl Bank")
+check("'Pearl Bank' (2 words, no street) -> ONE PEARL BANK",
+      r["matched_project"] == "ONE PEARL BANK" and r["project_match"] == "close")
+r = D(PH_RAW, "", CA, 24, "One Pearl Bank")
+check("'One Pearl Bank' -> exact", r["project_match"] == "exact")
 r = D(PH_RAW, "", CA, 24, "the sail at marina bay")
 check("'the sail at marina bay' -> exact ('@' = 'at')", r["project_match"] == "exact" and len(r["records"]) == 2)
 r = D(PH_RAW, "", CA, 24, "Marina Bay")
@@ -272,8 +312,9 @@ check("named development with no sales in window -> street fallback",
 r = D(PH_RAW, "", CA, 24, "Old Tower")
 check("...and with no street -> empty, not everything", r["records"] == [] and r["matched_on"] == "")
 check("2-value wrapper still returns (records, matched_on)",
-      NEW._extract_strata_comparables(PH_RAW, "", CA, 24, "The Sail")[1] == "project")
-check("_is_close_project guards", not NEW._is_close_project((), ("a",)) and not NEW._is_close_project(("12",), ("12", "x")))
+      NEW._extract_strata_comparables(PH_RAW, "Marina Boulevard", CA, 24, "The Sail")[1] == "project")
+check("_is_close_project guards", not NEW._is_close_project((), ("a",)) and not NEW._is_close_project(("12",), ("12", "x"))
+      and not NEW._is_close_project(("riviere", "tower"), ("riviere",)))
 
 # ---------------------------------------------------------------------------
 # main.py, executed from source.
