@@ -198,6 +198,14 @@ class FakeURA:
     async def fetch(self, key, token, batch_timeout=None):
         self.calls += 1
         self.batch_timeout = batch_timeout
+        self.active = getattr(self, "active", 0) + 1
+        self.max_active = max(getattr(self, "max_active", 0), self.active)
+        try:
+            return await self._fetch_body()
+        finally:
+            self.active -= 1
+
+    async def _fetch_body(self):
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.fail:
@@ -379,6 +387,78 @@ NEW.CMA_BATCH_BUDGET_SECONDS, _saved_budget = NEW.CMA_BATCH_BUDGET_SECONDS, NEW.
 asyncio.run(scenario_batch_budget())
 NEW.CMA_BATCH_BUDGET_SECONDS = _saved_budget
 
+print("\n[5c] startup warm-up, one download at a time, partial copy freed")
+
+
+async def scenario_warm():
+    reset_cache()
+    fake = FakeURA(delay=0.2)
+    install(fake)
+    stored = await NEW.warm_cma_cache(0.05)
+    check("warm-up on an empty worker pulls one copy", stored and fake.calls == 1 and NEW._cma_copy_is_fresh())
+    again = await NEW.warm_cma_cache(0)
+    check("warm-up with a fresh copy downloads nothing", again is False and fake.calls == 1)
+    reset_cache()
+    fake = FakeURA(delay=0.3)
+    install(fake)
+    res = await asyncio.gather(NEW.warm_cma_cache(0), NEW.generate_cma("Nassim Road", "", 0, 24),
+                               NEW.warm_cma_cache(0.05))
+    check("warm-ups racing a first request share ONE download", fake.calls == 1 and res[1]["comparable_count"] > 0,
+          fake.calls)
+    reset_cache()
+    NEW._cma_cache["last_failure_at"] = time.time()
+    fake = FakeURA()
+    install(fake)
+    check("warm-up respects the failure cool-down", (await NEW.warm_cma_cache(0)) is False and fake.calls == 0)
+    reset_cache()
+    install(FakeURA(fail=RuntimeError("down")))
+    check("warm-up never raises when URA is down", (await NEW.warm_cma_cache(0)) is False)
+
+asyncio.run(scenario_warm())
+
+
+async def scenario_one_download():
+    reset_cache()
+    install(FakeURA())
+    await NEW.generate_cma("Nassim Road", "", 0, 24)
+    NEW._cma_cache["fetched_at"] -= NEW.CMA_CACHE_TTL_SECONDS + 1     # expired -> background refresh
+    fake = FakeURA(delay=0.3)
+    install(fake)
+    await asyncio.gather(NEW.refresh_market_pulse(), NEW.generate_cma("Nassim Road", "", 0, 24))
+    await drain_background()
+    check("Market Pulse pull and CMA refresh never download at the same time", fake.max_active == 1,
+          fake.max_active)
+    check("...and the one complete download serves both, whichever goes first", fake.calls == 1,
+          fake.calls)
+    reset_cache()
+    fake = FakeURA(delay=0.3)
+    install(fake)
+    install_order = await asyncio.gather(NEW.generate_cma("Nassim Road", "", 0, 24), NEW.refresh_market_pulse())
+    pulse = install_order[1]
+    check("cold worker: CMA pull first, Market Pulse reuses it (same GCB figures as a raw pull)",
+          fake.calls == 1 and pulse["ok"] and
+          {k: v for k, v in pulse["stats"].items() if k != "refreshed_at"}
+          == {k: v for k, v in OLD.compute_market_pulse_stats(RAW).items() if k != "refreshed_at"}, fake.calls)
+    diag = await NEW.refresh_market_pulse(include_survey=True)
+    check("admin diagnostics never reuse -- always a fresh pull", fake.calls == 2 and diag["batches_ok"] == 4)
+
+asyncio.run(scenario_one_download())
+
+
+async def scenario_partial_freed():
+    reset_cache()
+    saved = NEW.CMA_FAILURE_COOLDOWN_SECONDS
+    NEW.CMA_FAILURE_COOLDOWN_SECONDS = 0.2
+    install(FakeURA(partial=True))
+    r = await NEW.generate_cma("Nassim Road", "", 0, 24)
+    held = NEW._cma_cache["partial_projects"] is not None
+    await asyncio.sleep(0.5)
+    check("partial copy held during the cool-down, freed when it ends (no request needed)",
+          r["data_partial"] and held and NEW._cma_cache["partial_projects"] is None)
+    NEW.CMA_FAILURE_COOLDOWN_SECONDS = saved
+
+asyncio.run(scenario_partial_freed())
+
 print("\n[5b] URA token is cached by the SINGAPORE day")
 from datetime import timezone, timedelta  # noqa: E402
 check("_sgt_today is UTC+8", NEW._sgt_today() == datetime.now(timezone(timedelta(hours=8))).date())
@@ -502,6 +582,14 @@ check("a number in front of a scrubbed name goes with it (never '26 District 11'
       == "Live at 26 Newton today." and
       NS["_scrub_project_name"]("Live at 26 Newton Suites today.", {"attributes": {"project_name": "Newton Suites"}}, "District 11")
       == "Live at District 11 today.")
+refl = {"attributes": {"project_name": "Reflections"}}
+check("one-word name: ordinary uses untouched, the name itself scrubbed",
+      NS["_scrub_project_name"]("Reflections of light fill the room. The reflections dance. Live at Reflections today.",
+                                refl, "District 4")
+      == "Reflections of light fill the room. The reflections dance. Live at District 4 today.")
+check("scrub is case-sensitive to how the agent typed the name",
+      NS["_scrub_project_name"]("a view of the horizon", {"attributes": {"project_name": "Horizon Towers"}}, "D")
+      == "a view of the horizon")
 check("short one-word names are not scrubbed (would eat ordinary words)",
       NS["_scrub_project_name"]("Sky views", {"attributes": {"project_name": "Sky"}}, "District 1") == "Sky views")
 check("scrub is a no-op on landed", NS["_scrub_project_name"]("A home", {}, "District 10") == "A home")
@@ -580,6 +668,9 @@ check("condo: land size/plot zeroed, agent told", r.land_size == 0 and r.plot_wi
 r = req(property_type="Condominium", land_size=5000, plot_width=0, plot_depth=0, site_coverage=0)
 NS["_strip_land_fields_for_strata"](r, ["Condominium", "Semi-Detached"], [])
 check("mixed condo + landed listing keeps land size", r.land_size == 5000)
+r = req(property_type="Condominium", land_size=5000, plot_width=0, plot_depth=0, site_coverage=0)
+NS["_strip_land_fields_for_strata"](r, ["Condominium", "Penthouse"], [])
+check("mixed Condominium + Penthouse keeps land size (frontend treats Penthouse as landed)", r.land_size == 5000)
 r = req(property_type="Semi-Detached", land_size=5000, plot_width=9, plot_depth=0, site_coverage=0)
 NS["_strip_land_fields_for_strata"](r, [], [])
 check("landed untouched", r.land_size == 5000 and r.plot_width == 9)
@@ -604,6 +695,9 @@ pub = "\n".join(LINES[NODES["_public_listing_payload"].lineno - 1:NODES["_public
 check("public payload never returns project_name", '"project_name"' not in pub)
 check("attributes write is probe-gated on create and update",
       SRC.count("if _attributes_column_supported and _attrs:") == 1 and "if _attributes_column_supported:\n        _prev" in SRC)
+_su = "\n".join(LINES[NODES["startup_event"].lineno - 1:NODES["startup_event"].end_lineno])
+check("non-owner workers warm the CMA copy at startup, jittered; the owner relies on its pull",
+      "else:" in _su and "ura_market_pulse.warm_cma_cache(_warm_delay)" in _su and "random.uniform" in _su)
 check("market pulse GET carries the source notice", SRC.count("ura_market_pulse.source_notice()") >= 3)
 mig = io.open(os.path.join(BACKEND, "migrations", "002_listing_attributes.sql"), encoding="utf-8").read()
 check("migration is additive + re-asserts the lock",

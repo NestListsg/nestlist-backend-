@@ -242,12 +242,26 @@ async def refresh_market_pulse_loop():
                 f"⚠️ <b>NestList Warning</b>\n\nMarket Pulse auto-refresh from URA failed: {e}\n\nThe panel will keep showing its last known values.")
         await asyncio.sleep(86400)  # URA recommends refreshing daily
 
+# Strong references to fire-and-forget startup tasks, so they can't be garbage-collected
+# mid-run.
+_BACKGROUND_TASKS = set()
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(monitor_api_key())
     if _acquire_refresh_singleton():
         asyncio.create_task(refresh_market_pulse_loop())
         logger.info("This worker owns the Market Pulse daily refresh loop.")
+        # No separate CMA warm-up here: the loop's first pull (right now) seeds the CMA copy.
+    else:
+        # Warm the CMA copy in the background so the first pricing report after a deploy
+        # doesn't wait on URA. Jittered 20-140s per worker so the 3 non-owner workers don't
+        # hit URA in the same second (and the owner's pull usually lands first). Respects
+        # the download lock and the failure cool-down; never raises.
+        _warm_delay = 20 + (os.getpid() % 4) * 30 + random.uniform(0, 20)
+        _warm_task = asyncio.create_task(ura_market_pulse.warm_cma_cache(_warm_delay))
+        _BACKGROUND_TASKS.add(_warm_task)
+        _warm_task.add_done_callback(_BACKGROUND_TASKS.discard)
     asyncio.create_task(asyncio.to_thread(_probe_market_pulse_columns))
     # Reclaims abandoned staged photos (reference-aware; never touches a live listing).
     asyncio.create_task(sweep_staging_loop())
@@ -2157,7 +2171,9 @@ def _is_strata_type(property_type) -> bool:
 
 def _is_landed_type(property_type) -> bool:
     t = str(property_type or "").strip().lower()
-    return any(k in t for k in ("bungalow", "gcb", "good class", "detached", "terrace"))
+    # "penthouse" counts as landed here, matching the frontend: a mixed Condominium +
+    # Penthouse listing keeps its land figures rather than having them stripped.
+    return any(k in t for k in ("bungalow", "gcb", "good class", "detached", "terrace", "penthouse"))
 
 
 # Canonical tenure values the frontend offers. Free-typed / Smart-Fill variants are folded
@@ -2309,8 +2325,12 @@ def _public_project_name(listing) -> str:
 def _scrub_project_name(text, listing, district_label: str):
     """Serve-time: remove this listing's own project name from outward text (it may be in
     agent-typed features or hand-edited copy), unless the agent has opted to show it.
-    Only names of 2+ words or 6+ characters are scrubbed, so a one-word name can't eat an
-    ordinary word in the prose. Never raises."""
+
+    Matching is CASE-SENSITIVE, whole name only, exactly as the agent typed it -- so a
+    project called "Reflections" or "Horizon" removes "Reflections"/"Horizon" the name,
+    never "reflections of light" in ordinary prose. A one-word name is additionally left
+    alone at the start of a sentence, where any ordinary word is capitalised, and names
+    under 6 characters are never scrubbed. Never raises."""
     if not text:
         return text
     try:
@@ -2321,8 +2341,17 @@ def _scrub_project_name(text, listing, district_label: str):
             return text
         # A number written in front of the name ("26 Newton" when the stored name is just
         # "Newton") goes WITH it, so the result can never read "26 District 11".
-        return re.sub(r"(?<!\w)(?:\d{1,4}[A-Za-z]?\s+)?" + re.escape(name) + r"(?!\w)",
-                      district_label or "the development", text, flags=re.IGNORECASE)
+        replacement = district_label or "the development"
+        pattern = re.compile(r"(?<!\w)(?:\d{1,4}[A-Za-z]?\s+)?" + re.escape(name) + r"(?!\w)")
+        single_word = " " not in name
+
+        def _sub(m):
+            if single_word:
+                before = text[:m.start()].rstrip()
+                if not before or before[-1] in ".!?\n:\"'(":
+                    return m.group(0)   # sentence-initial: could be an ordinary word
+            return replacement
+        return pattern.sub(_sub, text)
     except Exception as e:
         logger.error("project-name scrub failed (returning text as-is): %s", e)
         return text

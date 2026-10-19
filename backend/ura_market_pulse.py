@@ -738,6 +738,9 @@ CMA_FAILURE_COOLDOWN_SECONDS = 120
 # before. There is deliberately NO overall cap: the old code had none, and a cap on the
 # whole pull threw away batches that had already arrived.
 CMA_BATCH_BUDGET_SECONDS = 200
+# The daily Market Pulse pull reuses a complete CMA download younger than this instead of
+# downloading the market again (only ever happens when the two collide on one worker).
+PULSE_REUSE_CMA_COPY_SECONDS = 600
 
 _PROJECT_KEEP = ("street", "project")
 _TXN_KEEP = ("typeOfArea", "propertyType", "contractDate", "price", "area", "district",
@@ -804,6 +807,52 @@ def store_cma_projects(projects: list, already_slim: bool = False) -> None:
     _cma_cache["partial_projects"] = None
 
 
+def _get_cma_lock():
+    """The per-worker download lock, created lazily inside the running event loop."""
+    global _cma_lock
+    if _cma_lock is None:
+        _cma_lock = asyncio.Lock()
+    return _cma_lock
+
+
+def _drop_expired_partial() -> None:
+    """Free the partial copy once its cool-down window is over (it is never served after)."""
+    import time
+    if (_cma_cache["partial_projects"] is not None
+            and time.time() - _cma_cache["partial_at"] >= CMA_FAILURE_COOLDOWN_SECONDS):
+        _cma_cache["partial_projects"] = None
+        _cma_cache["partial_as_of"] = None
+
+
+def _cma_copy_is_fresh() -> bool:
+    import time
+    return (_cma_cache["projects"] is not None
+            and time.time() - _cma_cache["fetched_at"] < CMA_CACHE_TTL_SECONDS)
+
+
+async def warm_cma_cache(delay_seconds: float = 0.0) -> bool:
+    """Startup warm-up: after `delay_seconds`, pull the CMA copy in the background so the
+    first pricing report on a freshly started worker doesn't wait on URA. Respects the
+    single-flight lock (a request or the Market Pulse pull already downloading -> this
+    just waits and then finds the copy fresh) and the failure cool-down. Never raises.
+    Returns True if this call stored a fresh copy."""
+    import time
+    try:
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+        if not os.environ.get("URA_ACCESS_KEY", "") or _cma_copy_is_fresh():
+            return False
+        if time.time() - _cma_cache["last_failure_at"] < CMA_FAILURE_COOLDOWN_SECONDS:
+            return False
+        async with _get_cma_lock():
+            if _cma_copy_is_fresh():
+                return False
+            return await _fetch_into_cache()
+    except Exception as e:
+        print(f"CMA warm-up skipped: {type(e).__name__}: {e}")
+        return False
+
+
 def _cached_meta(stale: bool):
     return _cma_cache["projects"], {"data_as_of": _cma_cache["as_of"], "stale": stale, "partial": False}
 
@@ -850,6 +899,11 @@ async def _fetch_into_cache() -> bool:
         _cma_cache["partial_projects"] = await asyncio.to_thread(_slim_projects, projects)
         _cma_cache["partial_at"] = time.time()
         _cma_cache["partial_as_of"] = _sgt_today().isoformat()
+        # Free it when the cool-down ends rather than holding it until the next request.
+        try:
+            asyncio.get_running_loop().call_later(CMA_FAILURE_COOLDOWN_SECONDS + 0.1, _drop_expired_partial)
+        except Exception:
+            pass
     return False
 
 
@@ -864,10 +918,7 @@ def _ensure_background_refresh() -> None:
         return
 
     async def _run():
-        global _cma_lock
-        if _cma_lock is None:
-            _cma_lock = asyncio.Lock()
-        async with _cma_lock:
+        async with _get_cma_lock():
             if time.time() - _cma_cache["fetched_at"] < CMA_CACHE_TTL_SECONDS:
                 return   # someone else already refreshed it
             await _fetch_into_cache()
@@ -889,7 +940,7 @@ async def _get_cma_projects():
                                          arrived are served, flagged partial.
     """
     import time
-    global _cma_lock
+    _drop_expired_partial()
     now = time.time()
     age = now - _cma_cache["fetched_at"]
     if _cma_cache["projects"] is not None and age < CMA_CACHE_TTL_SECONDS:
@@ -898,9 +949,7 @@ async def _get_cma_projects():
         _ensure_background_refresh()
         return _cached_meta(True)
 
-    if _cma_lock is None:
-        _cma_lock = asyncio.Lock()
-    async with _cma_lock:
+    async with _get_cma_lock():
         now = time.time()
         if _cma_cache["projects"] is not None and now - _cma_cache["fetched_at"] < CMA_CACHE_TTL_SECONDS:
             return _cached_meta(False)   # another request refreshed it while we waited
@@ -995,7 +1044,36 @@ async def refresh_market_pulse(include_survey: bool = False) -> dict:
         result["error"] = str(e) or "URA token request failed"
         return result
 
-    projects, batch_report = await fetch_all_transactions(access_key, token)
+    # ONE download at a time per worker: the CMA cache refresh and this daily pull share
+    # _cma_lock, so on the worker that owns the Market Pulse loop they never run side by
+    # side (double the URA quota, double the peak memory). A complete pull here also seeds
+    # the CMA copy (below), so a CMA refresh waiting on the lock then finds it fresh and
+    # downloads nothing -- one download serves both.
+    reused = False
+    async with _get_cma_lock():
+        import time
+        age = time.time() - _cma_cache["fetched_at"]
+        if (not include_survey and _cma_cache["projects"] is not None
+                and age < PULSE_REUSE_CMA_COPY_SECONDS):
+            # A complete CMA download finished moments ago (it held the lock while we
+            # waited): reuse it instead of pulling the whole market a second time. The
+            # slim copy keeps every field the GCB stats read (tested identical). Admin
+            # diagnostics (include_survey) always pull fresh -- they are the raw truth.
+            projects = _cma_cache["projects"]
+            batch_report = [{"batch": b, "ok": True, "status": "Reused", "projects": 0,
+                             "message": f"reused the pricing-report download from {int(age)}s ago"}
+                            for b in (1, 2, 3, 4)]
+            reused = True
+        else:
+            projects, batch_report = await fetch_all_transactions(access_key, token)
+            if len(batch_report) == 4 and all(b["ok"] for b in batch_report) and projects:
+                # A complete pull is exactly what CMA needs too: hand it over -- still
+                # inside the lock, so a CMA refresh queued behind us finds it fresh and
+                # downloads nothing. Never allowed to break the refresh itself.
+                try:
+                    store_cma_projects(await asyncio.to_thread(_slim_projects, projects), already_slim=True)
+                except Exception as e:
+                    print(f"CMA cache seed from Market Pulse refresh failed (harmless): {e}")
     batches_ok = sum(1 for b in batch_report if b["ok"])
     result["batch_report"] = batch_report
     result["batches_ok"] = batches_ok
@@ -1004,14 +1082,6 @@ async def refresh_market_pulse(include_survey: bool = False) -> dict:
 
     stats = compute_market_pulse_stats(projects)
     result["stats"] = stats  # exposed for diagnostics even when incomplete
-    if batches_ok == 4 and projects:
-        # A complete pull is exactly what CMA needs too: hand it over so this worker's
-        # next CMA doesn't fetch the whole market a second time. Never allowed to break
-        # the refresh itself.
-        try:
-            store_cma_projects(await asyncio.to_thread(_slim_projects, projects), already_slim=True)
-        except Exception as e:
-            print(f"CMA cache seed from Market Pulse refresh failed (harmless): {e}")
     result["ok"] = (batches_ok == 4 and stats is not None)
 
     if include_survey:
