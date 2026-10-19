@@ -222,6 +222,9 @@ def base_ns(**extra):
         _to_number=lambda v: float(v or 0),
         _format_price_millions=lambda v: "4.2M",
         _listing_district_label=lambda listing: "District 15",
+        # Studio rule (condo-family "0" bedrooms). The fixture is a Semi-Detached, so the
+        # real helper would say False too; stubbed because main.py is executed piecemeal.
+        _listing_is_studio=lambda listing: False,
         apply_listing_copy_guards=lambda text, context=None: text,
         _agent_caption_overrides=lambda stored: {},
         get_current_agent=lambda: None,
