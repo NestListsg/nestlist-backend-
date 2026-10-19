@@ -119,11 +119,22 @@ LANDED_CASES = ["Good Class Bungalow (GCB)", "Detached/Bungalow", "Semi-Detached
                 "Inter-Terrace", "Corner Terrace", "Penthouse", "", "Something Unknown"]
 
 print("\n[1] landed CMA: identical to the pre-change module, raw and slimmed")
+# Two DELIBERATE differences from the frozen module (condo-fixes commit), both bugs:
+#   * newest-first is by real date: the old text sort put "12/2025" above "01/2026", so
+#     the old list is re-sorted by (year, month) before comparing (same rows, same ties);
+#   * Semi-Detached: the old map sent it to Detached sales -- checked separately in
+#     tests/test_condo_fixes.py, so it is not in this byte-for-byte list.
 SLIM = NEW._slim_projects(RAW)
-for ptype in LANDED_CASES:
+
+
+def _by_real_date(recs):
+    return sorted(recs, key=lambda r: (int(r["contract_date"][3:]), int(r["contract_date"][:2])), reverse=True)
+
+
+for ptype in [t for t in LANDED_CASES if t != "Semi-Detached"]:
     for street in ("Nassim Road", "nassim", "9 Nassim Road #01-01"):
         for win in (12, 24, 60):
-            old_recs = OLD.extract_comparable_transactions(RAW, street, ptype, win)
+            old_recs = _by_real_date(OLD.extract_comparable_transactions(RAW, street, ptype, win))
             new_recs = NEW.extract_comparable_transactions(RAW, street, ptype, win)
             slim_recs = NEW.extract_comparable_transactions(SLIM, street, ptype, win)
             ok = old_recs == new_recs == slim_recs
@@ -891,7 +902,8 @@ CALLS = []
 async def fake_gen(street, ptype, land, win, project_name="", built_up_sqft=0):
     CALLS.append((street, ptype, land, win, project_name, built_up_sqft))
     return {"ok": True}
-NS["ura_market_pulse"] = types.SimpleNamespace(is_strata_type=NEW.is_strata_type, generate_cma=fake_gen)
+NS["ura_market_pulse"] = types.SimpleNamespace(is_strata_type=NEW.is_strata_type,
+                                               cma_strata_types=NEW.cma_strata_types, generate_cma=fake_gen)
 os.environ["URA_ACCESS_KEY"] = "test-placeholder-not-a-real-key"
 CR = NS["CMARequest"]
 asyncio.run(NS["generate_cma_report"](CR(street="", property_type="Condominium", project_name="Parc Esta #05-11",

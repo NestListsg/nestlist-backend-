@@ -118,6 +118,18 @@ GCB_DISTRICTS = {"10", "11", "20", "21", "23"}
 def _norm_street(s: str) -> str:
     return " ".join((s or "").upper().split())
 
+
+def _norm_ura_type(value) -> str:
+    """URA propertyType compared without case, spaces or hyphens: "Semi-detached",
+    "Semi-Detached", "SEMI DETACHED" and "Semidetached" are all "semidetached". URA's own
+    spelling has been seen in more than one form, and an exact string compare silently
+    returned zero comparables when it differed from ours. Distinct types stay distinct:
+    "Detached" -> "detached", "Strata Detached" -> "stratadetached"."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+_DETACHED = _norm_ura_type("Detached")
+
 # {normalised street name -> GCBA name}. Exact-match lookup.
 _GCB_STREET_TO_AREA = {}
 for _area, _streets in GCBA_STREETS.items():
@@ -268,7 +280,7 @@ def survey_detached_land_streets(projects: list, window_months: int = 24) -> lis
     for project in projects:
         street = (project.get("street", "") or "").strip()
         for txn in project.get("transaction", []):
-            if txn.get("propertyType") != "Detached":
+            if _norm_ura_type(txn.get("propertyType")) != _DETACHED:
                 continue
             if txn.get("typeOfArea") != "Land":
                 continue
@@ -322,7 +334,7 @@ def _extract_gcb_transactions(projects: list, window_months: int = 12) -> list:
         if not _street_in_gcb_whitelist(street):
             continue
         for txn in project.get("transaction", []):
-            if txn.get("propertyType") != "Detached":
+            if _norm_ura_type(txn.get("propertyType")) != _DETACHED:
                 continue
             if txn.get("typeOfArea") != "Land":
                 continue
@@ -388,22 +400,40 @@ def compute_market_pulse_stats(projects: list) -> dict:
 # "propertyType" values, loosely (substring match), since the exact URA
 # vocabulary isn't publicly documented in detail and this only needs to
 # narrow comparables, not exactly reproduce URA's internal taxonomy.
+#
+# Matched on the label with spaces/hyphens removed, and SEMI-D IS CHECKED FIRST: the old
+# order tested "detached" before "semi-detached", and "semi-detached" contains
+# "detached", so every Semi-Detached report was quietly built from Detached sales.
+# The URA side is compared with _norm_ura_type, so "Semi-detached" / "Semi-Detached"
+# both match whatever spelling URA uses.
 _PROPERTY_TYPE_MAP = [
-    ("good class bungalow", "Detached"),
-    ("detached/bungalow", "Detached"),
+    ("semidetached", "Semi-Detached"),
+    ("semid", "Semi-Detached"),
+    ("goodclassbungalow", "Detached"),
     ("detached", "Detached"),
-    ("semi-detached", "Semi-Detached"),
-    ("inter-terrace", "Terrace"),
-    ("corner terrace", "Terrace"),
+    ("bungalow", "Detached"),
     ("terrace", "Terrace"),
 ]
 
 def _map_property_type(nestlist_type: str) -> str:
-    key = (nestlist_type or "").strip().lower()
-    for prefix, ura_type in _PROPERTY_TYPE_MAP:
-        if prefix in key:
+    key = re.sub(r"[^a-z]+", "", str(nestlist_type or "").lower())
+    if not key:
+        return ""
+    for token, ura_type in _PROPERTY_TYPE_MAP:
+        if token in key:
             return ura_type
     return ""
+
+
+def _contract_date_key(display_date: str) -> tuple:
+    """Sort key for a record's "MM/YYYY" contract_date: (year, month). Sorting the text
+    itself ranks "12/2025" above "01/2026", so the newest-20 cut dropped the latest sales
+    whenever the window crossed a new year. Unparseable -> sorts last."""
+    try:
+        mm, yyyy = str(display_date).split("/", 1)
+        return (int(yyyy), int(mm))
+    except (TypeError, ValueError):
+        return (0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -458,32 +488,91 @@ def _norm_project(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
 
 
-def _extract_strata_comparables(projects: list, street_keyword: str, ura_types: tuple,
-                                window_months: int, project_name: str = "") -> tuple:
-    """Condo-family comparables. Returns (records, matched_on).
+# Penthouses are strata units: URA records their sales as Condominium / Apartment
+# (typeOfArea "Strata"), never as Land. Valuing one on LAND PSF compared it with houses.
+# The CMA therefore routes Penthouse through the strata path -- but ONLY the CMA: the rest
+# of the app (write-up, listing fields, Prestige classification) still treats Penthouse
+# exactly as before, which is why this is a separate function from strata_ura_types.
+_PENTHOUSE_COMPARABLE_TYPES = ("Condominium", "Apartment")
+PENTHOUSE_CAVEAT = ("Penthouses usually sell at a premium to other units in the same "
+                    "development (more space, private roof terraces, top-floor views). URA does "
+                    "not label penthouse sales separately, so these comparables include ordinary "
+                    "units -- treat the PSF range as a floor, not a ceiling.")
 
-    Matching: when the agent gave a project name and URA has sales in a project of that
-    name, comps are THAT development (the most like-for-like comparison there is);
-    otherwise the street keyword, exactly as landed matches. matched_on is "project",
-    "street" or "" (nothing matched) so the report can say which it used.
 
-    Granularity: project + street + a floor RANGE ("06-10") is the finest URA publishes --
-    there are no unit numbers in this feed at all, and none are produced here."""
+def is_penthouse_type(nestlist_type: str) -> bool:
+    return "penthouse" in str(nestlist_type or "").lower()
+
+
+def cma_strata_types(nestlist_type: str) -> tuple:
+    """URA types for the CMA's built-up-PSF (strata) path: the condo family, plus
+    Penthouse. () => the landed (land-PSF) path. Never raises."""
+    types = strata_ura_types(nestlist_type)
+    if types:
+        return types
+    if is_penthouse_type(nestlist_type):
+        return _PENTHOUSE_COMPARABLE_TYPES
+    return ()
+
+
+# --- Project-name matching ------------------------------------------------------------
+# Agents type "The Sail"; URA records "THE SAIL @ MARINA BAY". Exact matching found
+# nothing. Matching is now in two tiers, and deliberately conservative -- valuing a home
+# against the WRONG development is worse than falling back to its street:
+#   1. exact, after dropping case, punctuation and the words "the" / "at" / "and";
+#   2. close: one name is the other's leading words ("sail" -> "sail marina bay"), or
+#      every word the agent typed (2+ words) is in URA's name. Accepted ONLY when exactly
+#      ONE URA development fits (after the street check below) -- "Parc" alone fits dozens,
+#      so it matches none. When the agent also gave a street, a close match must be on it.
+# The URA name actually used is reported back (matched_project) so the agent can see it.
+_PROJECT_STOPWORDS = {"the", "at", "and"}
+_CONDO_FAMILY_TYPES = ("Condominium", "Apartment", "Executive Condominium")
+
+
+def _project_tokens(name) -> tuple:
+    return tuple(t for t in _norm_project(name).split() if t not in _PROJECT_STOPWORDS)
+
+
+def _is_close_project(wanted: tuple, ura: tuple) -> bool:
+    if not wanted or not ura:
+        return False
+    short, long_ = (wanted, ura) if len(wanted) <= len(ura) else (ura, wanted)
+    # Too little to go on ("8", "one", "sky") -> never a close match.
+    if len("".join(short)) < 4 or all(t.isdigit() for t in short):
+        return False
+    if long_[:len(short)] == short:
+        return True
+    return len(wanted) >= 2 and set(wanted) <= set(ura)
+
+
+def _match_projects(projects: list, project_name: str, street_keyword: str) -> tuple:
+    """-> (candidate projects, how, URA names matched). how: "exact", "close",
+    "ambiguous" (several developments fit, none chosen) or "" (none)."""
+    wanted = _project_tokens(project_name)
+    if not wanted:
+        return [], "", []
+    exact = [p for p in projects if _project_tokens(p.get("project", "")) == wanted]
+    if exact:
+        return exact, "exact", sorted({str(p.get("project", "")).strip() for p in exact})
+    close = [p for p in projects if _is_close_project(wanted, _project_tokens(p.get("project", "")))]
+    if street_keyword:
+        close = [p for p in close if _matches_street_keyword(p.get("street", ""), street_keyword)]
+    names = {_project_tokens(p.get("project", "")) for p in close}
+    if len(names) == 1:
+        return close, "close", sorted({str(p.get("project", "")).strip() for p in close})
+    if len(names) > 1:
+        return [], "ambiguous", []
+    return [], "", []
+
+
+def _strata_records(candidates: list, ura_types: tuple, window_months: int) -> list:
     now = datetime.utcnow()
 
     def within_window(year, month):
         months_ago = (now.year - year) * 12 + (now.month - month)
         return 0 <= months_ago < window_months
 
-    wanted_project = _norm_project(project_name)
-    candidates = []
-    if wanted_project:
-        candidates = [p for p in projects if _norm_project(p.get("project", "")) == wanted_project]
-    matched_on = "project" if candidates else ""
-    if not candidates and street_keyword:
-        candidates = [p for p in projects if _matches_street_keyword(p.get("street", ""), street_keyword)]
-        matched_on = "street" if candidates else ""
-
+    wanted_types = {_norm_ura_type(t) for t in ura_types}
     records = []
     seen = set()
     for project in candidates:
@@ -492,7 +581,7 @@ def _extract_strata_comparables(projects: list, street_keyword: str, ura_types: 
         for txn in project.get("transaction", []) or []:
             if txn.get("typeOfArea") != "Strata":
                 continue
-            if txn.get("propertyType") not in ura_types:
+            if _norm_ura_type(txn.get("propertyType")) not in wanted_types:
                 continue
             # A bulk purchase of several units is reported as one record with the
             # combined price and area -- not a comparable for one home.
@@ -535,10 +624,60 @@ def _extract_strata_comparables(projects: list, street_keyword: str, ura_types: 
                 "floor_range": str(txn.get("floorRange", "") or "").strip(),
                 "sale_type": _SALE_TYPE_LABELS.get(str(txn.get("typeOfSale", "")).strip(), ""),
             })
-    # Newest first. Sorted on (year, month), not on the "MM/YYYY" display string, so a
-    # December sale never sorts above a later January one.
-    records.sort(key=lambda r: (r["contract_date"][3:], r["contract_date"][:2]), reverse=True)
-    return records, matched_on
+    # Newest first, by real (year, month) -- see _contract_date_key.
+    records.sort(key=lambda r: _contract_date_key(r["contract_date"]), reverse=True)
+    return records
+
+
+def _extract_strata_comparables_detailed(projects: list, street_keyword: str, ura_types: tuple,
+                                         window_months: int, project_name: str = "") -> dict:
+    """Condo-family / penthouse comparables, with how they were found.
+
+    -> {"records", "matched_on" ("project" | "street" | ""), "project_match" ("exact" |
+        "close" | "ambiguous" | ""), "matched_project" (URA name(s) used, "" if none),
+        "type_note" ("" or a sentence when the development's sales are of another
+        condo-family type than the one selected)}
+
+    Order: the named development (exact, then a unique close match) -> if URA records that
+    development under another condo-family type than the agent picked (an EC entered as
+    "Condominium"), its own sales are still the right comparison and are used, with a
+    note -> otherwise the street, exactly as before. A named development with no sales in
+    the window now falls back to the street instead of returning nothing.
+
+    Granularity: project + street + a floor RANGE ("06-10") is the finest URA publishes --
+    there are no unit numbers in this feed at all, and none are produced here."""
+    out = {"records": [], "matched_on": "", "project_match": "", "matched_project": "",
+           "type_note": ""}
+    candidates, how, names = _match_projects(projects, project_name, street_keyword)
+    out["project_match"] = how
+    if candidates:
+        records = _strata_records(candidates, ura_types, window_months)
+        if not records:
+            other = tuple(t for t in _CONDO_FAMILY_TYPES
+                          if _norm_ura_type(t) not in {_norm_ura_type(u) for u in ura_types})
+            records = _strata_records(candidates, other, window_months)
+            if records:
+                found = sorted({r["property_type"] for r in records if r["property_type"]})
+                out["type_note"] = (f"URA records this development as {' / '.join(found)}, "
+                                    "so it is compared with those sales.")
+        if records:
+            out.update(records=records, matched_on="project", matched_project=" / ".join(names))
+            return out
+    if street_keyword:
+        street_candidates = [p for p in projects
+                             if _matches_street_keyword(p.get("street", ""), street_keyword)]
+        records = _strata_records(street_candidates, ura_types, window_months)
+        if records:
+            out.update(records=records, matched_on="street")
+    return out
+
+
+def _extract_strata_comparables(projects: list, street_keyword: str, ura_types: tuple,
+                                window_months: int, project_name: str = "") -> tuple:
+    """(records, matched_on) -- the original two-value shape, kept for callers/tests."""
+    d = _extract_strata_comparables_detailed(projects, street_keyword, ura_types,
+                                             window_months, project_name)
+    return d["records"], d["matched_on"]
 
 # Generic road-type words agents commonly append/guess (e.g. typing "Road"
 # when URA's gazetted name actually uses "Walk" or no suffix at all). These
@@ -614,7 +753,7 @@ def extract_comparable_transactions(projects: list, street_keyword: str, propert
         for txn in project.get("transaction", []):
             if txn.get("typeOfArea") != "Land":
                 continue
-            if ura_type and txn.get("propertyType") != ura_type:
+            if ura_type and _norm_ura_type(txn.get("propertyType")) != _norm_ura_type(ura_type):
                 continue
             parsed = _parse_contract_date(txn.get("contractDate", ""))
             if not parsed or not within_window(*parsed):
@@ -654,7 +793,8 @@ def extract_comparable_transactions(projects: list, street_keyword: str, propert
                 "district": f"D{district_code}" if district_code else "",
                 "tenure": txn.get("tenure", ""),
             })
-    records.sort(key=lambda r: r["contract_date"], reverse=True)
+    # Newest first, by real (year, month) -- see _contract_date_key.
+    records.sort(key=lambda r: _contract_date_key(r["contract_date"]), reverse=True)
     return records
 
 def compute_cma_stats(records: list, subject_land_size_sqft: float = 0) -> dict:
@@ -979,17 +1119,29 @@ async def generate_cma(street_keyword: str, property_type: str = "", land_size_s
 
     CONDO family (Condominium / Executive Condominium (EC) / Apartment): Strata-type
     sales in the named project (or on the street), valued on BUILT-UP PSF x the
-    subject's built-up size. Land size is ignored for these."""
+    subject's built-up size. Land size is ignored for these. PENTHOUSE takes this path too
+    (it is a strata unit), with a premium caveat in valuation_caveat."""
     projects, meta = await _get_cma_projects()
-    ura_types = strata_ura_types(property_type)
+    ura_types = cma_strata_types(property_type)
     if ura_types:
-        records, matched_on = _extract_strata_comparables(
+        # Extraction walks the whole market: off the event loop so 50 agents' reports
+        # don't hold up each other's requests on this worker.
+        found = await asyncio.to_thread(
+            _extract_strata_comparables_detailed,
             projects, street_keyword, ura_types, window_months, project_name)
+        records = found["records"]
+        # Built-up PSF x built-up size. Land size is never used here -- a penthouse has
+        # none of its own, so it gets a PSF range without an estimate until a built-up
+        # size is entered.
         stats = compute_cma_stats(records, built_up_sqft)
         stats["valuation_basis"] = "built_up_psf"
         stats["subject_area_sqft"] = built_up_sqft or 0
-        stats["matched_on"] = matched_on
+        stats["matched_on"] = found["matched_on"]
         stats["project_name"] = project_name or ""
+        stats["matched_project"] = found["matched_project"]
+        stats["project_match"] = found["project_match"]
+        stats["type_note"] = found["type_note"]
+        stats["valuation_caveat"] = PENTHOUSE_CAVEAT if is_penthouse_type(property_type) else ""
     else:
         records = extract_comparable_transactions(projects, street_keyword, property_type, window_months)
         stats = compute_cma_stats(records, land_size_sqft)

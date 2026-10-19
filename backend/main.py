@@ -824,12 +824,62 @@ def create_token(agent_id: str, abs_exp: "Optional[datetime]" = None) -> str:
 
 _last_alert_times = {}
 
+# Alert keys throttled across ALL uvicorn workers, not just per worker. Each worker has
+# its own _last_alert_times, so an outage that every worker notices (URA down for the
+# pricing-report cache) used to send up to 4 identical alerts per cooldown.
+_CROSS_WORKER_ALERT_KEYS = {"ura_cma_fetch_failed"}
+_ALERT_MARKER_DIR = "/tmp"
+
+
+def _claim_alert_across_workers(key: str, cooldown_seconds: int) -> bool:
+    """True if THIS worker should send `key` now. A tiny marker file per key holds the
+    last send time, read-and-updated under a non-blocking flock, so only one worker per
+    cooldown wins. Never blocks (a worker that finds the lock busy is mid-claim by a
+    sibling, which will send). Any filesystem trouble -> True, i.e. fall back to the old
+    per-worker throttle rather than ever swallowing an alert."""
+    safe = re.sub(r"[^a-z0-9_]+", "_", key.lower())[:60]
+    try:
+        fh = open(os.path.join(_ALERT_MARKER_DIR, f"nestlist_alert_{safe}.marker"), "a+")
+    except OSError:
+        return True
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        fh.seek(0)
+        try:
+            last = float((fh.read() or "0").strip() or "0")
+        except ValueError:
+            last = 0.0
+        now = time.time()
+        # abs(): the stored time is rounded, so a sibling's claim a moment ago can read as
+        # a hair in the future -- that is still "just sent". A marker far off either way
+        # (clock jump, junk) is treated as stale, so an alert is never swallowed for long.
+        if abs(now - last) < cooldown_seconds:
+            return False
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{now:.3f}")
+        fh.flush()
+        return True
+    except OSError:
+        return True
+    finally:
+        try:
+            fh.close()   # also releases the flock
+        except OSError:
+            pass
+
+
 async def send_telegram_alert_throttled(key: str, message: str, cooldown_seconds: int = 600):
     now = datetime.utcnow()
     last = _last_alert_times.get(key)
     if last and (now - last).total_seconds() < cooldown_seconds:
         return
     _last_alert_times[key] = now
+    if key in _CROSS_WORKER_ALERT_KEYS and not _claim_alert_across_workers(key, cooldown_seconds):
+        return
     await send_telegram_alert(message)
 
 async def get_current_agent(response: Response, credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -1320,12 +1370,25 @@ _HOUSE_NUMBER_PREFIX_RE = re.compile(r"^\s*\d{1,4}[A-Za-z]?\s+(?=\D)")
 #     "..-103"). Ordinary ranges in prose ("10-15 minutes", "20-30 guests", "2018-2020",
 #     "$1.2-1.5M", "12-03-2024") don't have that shape, and a trailing time/measure word
 #     rules out the rest.
+#   The bare form is further NOT a unit when (audit false positives):
+#     - a word in front makes it a range or a reference: "Districts 09-11", "lot 12-345",
+#       "year 99-103", "renovated in 08-09", "from 05-10", "floors 06-10";
+#     - it is one of URA's own floor bands, "01-05" / "06-10" (e.g. "(06-10)");
+#     - a time follows: "09-11 am", "09-11pm";
+#     - a unit of measure is glued on: "10-100m" (only a CAPITAL letter, other than M/K,
+#       counts as a unit suffix like "12-103A" on the bare form).
 _UNIT_NUMBER_RE = re.compile(
     r"#\s?\d{1,3}\s?-\s?\d{1,5}[A-Za-z]?"
     r"|\b(?:unit|apt|apartment)\.?\s*(?:no\.?\s*)?#?\d{1,3}-\d{1,5}[A-Za-z]?\b"
-    r"|(?<![\w$.,/#-])(?:0[1-9]-\d{2,4}|\d{2}-(?:0\d{1,3}|\d{3,4}))[A-Za-z]?(?![\w%/-])"
+    r"|(?<![\w$.,/#-])"
+    r"(?<!\bdistrict\s)(?<!\bdistricts\s)(?<!\bdist\s)(?<!\blot\s)(?<!\blots\s)(?<!\bmk\s)"
+    r"(?<!\bmukim\s)(?<!\byear\s)(?<!\byears\s)(?<!\byr\s)(?<!\byrs\s)(?<!\bin\s)"
+    r"(?<!\bfrom\s)(?<!\bsince\s)(?<!\bbetween\s)(?<!\bcirca\s)(?<!\bfloors\s)"
+    r"(?<!\bstoreys\s)(?<!\blevels\s)"
+    r"(?!(?:01-05|06-10)(?!\d))"
+    r"(?:0[1-9]-\d{2,4}|\d{2}-(?:0\d{1,3}|\d{3,4}))(?-i:(?![MK])[A-Z])?(?![\w%/-])"
     r"(?!\s*(?:min|hr|hour|day|week|month|year|yr|sq|km|m\b|metre|meter|storey|stor|%|per|"
-    r"bed|bath|room|pax|people|guest|car|floor|level|lvl|psf|k\b|deg))",
+    r"bed|bath|room|pax|people|guest|car|floor|level|lvl|psf|k\b|deg|am\b|pm\b|a\.m|p\.m))",
     re.IGNORECASE,
 )
 
@@ -1570,7 +1633,10 @@ def apply_listing_copy_guards(text: str, price=None, built_up=None, context: str
         cleaned, address_hits = _strip_address_numbers(text)
         cleaned, price_hits = _strip_price_leaks(cleaned, price, built_up)
         if address_hits:
-            logger.warning("copy guard [%s]: stripped house/unit number(s) %s", context, address_hits)
+            # Count only -- never the numbers themselves: a house/unit number is exactly what
+            # this guard keeps private, and Railway logs are not the place to collect them.
+            logger.warning("copy guard [%s]: stripped %d house/unit number(s) (values redacted)",
+                           context, len(address_hits))
         if price_hits:
             logger.warning("copy guard [%s]: stripped price leak(s) %s", context, price_hits)
         return cleaned if cleaned.strip() else text
@@ -1722,7 +1788,9 @@ def _basic_listing_fallback(agent, req, district_str: str) -> str:
     loc = (district_str or "").strip()
     where = f" in {loc}" if loc and loc.lower() != "singapore" else ""
     bits = []
-    if (req.bedrooms or "").strip():
+    if _req_is_studio(req):
+        bits.append("a studio layout")
+    elif (req.bedrooms or "").strip():
         bits.append(f"{req.bedrooms.strip()} bedrooms")
     if (req.bathrooms or "").strip():
         bits.append(f"{req.bathrooms.strip()} bathrooms")
@@ -2203,6 +2271,76 @@ def _normalize_tenure(raw, detail=""):
     return "Other", (d or t)[:80]
 
 
+# Buyer tenure preference -> the lowest tenure that satisfies it. A buyer who asks for
+# 99-year leasehold is not put off by a freehold home (price is filtered separately), but
+# one who asks for freehold does not want a 99-year lease -- so the preference is a FLOOR.
+# Strictly: 999-year is still a leasehold, so it does NOT satisfy "Freehold".
+_TENURE_RANK = {"Freehold": 3, "999-year leasehold": 2, "99-year leasehold": 1}
+_TENURE_PREF_NONE = {"", "any", "any tenure", "no preference", "none", "n/a", "na", "either", "-",
+                     "-- select --"}
+
+
+def _tenure_pref_rank(raw) -> int:
+    """Buyer's tenure_pref -> minimum rank (0 = no filter). Blank / "Any" / unrecognised
+    text -> 0: an unreadable preference never hides listings from the agent."""
+    if str(raw or "").strip().lower() in _TENURE_PREF_NONE:
+        return 0
+    tenure, _ = _normalize_tenure(raw, "")
+    return _TENURE_RANK.get(tenure, 0)
+
+
+def _listing_tenure(listing) -> tuple:
+    """(canonical tenure, detail) for a stored listing: listings.attributes first (where
+    the New Listing form stores it), then a legacy top-level `tenure` key. ("", "") when
+    the listing has none."""
+    src = listing if isinstance(listing, dict) else {}
+    a = _listing_attributes(src)
+    return _normalize_tenure(a.get("tenure") or src.get("tenure") or "", a.get("tenure_detail") or "")
+
+
+def _listing_tenure_text(listing) -> str:
+    tenure, detail = _listing_tenure(listing)
+    return detail if tenure == "Other" else tenure
+
+
+# STUDIO. The New Listing form sends bedrooms "0" to mean a studio, for condo-family
+# listings only. On those, "0" is shown as "Studio" -- never "0 Rooms" / "0 bedrooms".
+# A landed listing's "0" keeps exactly its previous behaviour.
+def _is_condo_family_only(primary_type, types=None) -> bool:
+    all_types = [str(t).strip() for t in list(types or []) + [primary_type] if str(t or "").strip()]
+    return bool(all_types) and _is_strata_type(primary_type) and all(_is_strata_type(t) for t in all_types)
+
+
+def _is_studio(bedrooms, primary_type, types=None) -> bool:
+    """True when a bedrooms value means "studio": 0 (or the word) on a condo-family-only
+    listing. Never raises."""
+    try:
+        s = str(bedrooms if bedrooms is not None else "").strip()
+        if not s:
+            return False
+        if s.lower() != "studio":
+            if float(s) != 0:
+                return False
+        return _is_condo_family_only(primary_type, types)
+    except (TypeError, ValueError):
+        return False
+
+
+def _listing_is_studio(listing) -> bool:
+    src = listing if isinstance(listing, dict) else {}
+    return _is_studio(src.get("bedrooms"), src.get("property_type"), _listing_property_types(src))
+
+
+def _req_is_studio(req) -> bool:
+    return _is_studio(getattr(req, "bedrooms", ""), getattr(req, "property_type", ""),
+                      getattr(req, "property_types", None) or [])
+
+
+def _bedrooms_display(listing) -> str:
+    src = listing if isinstance(listing, dict) else {}
+    return "Studio" if _listing_is_studio(src) else str(src.get("bedrooms") if src.get("bedrooms") is not None else "")
+
+
 def _normalize_floor_level(raw) -> str:
     """A BAND only ("Low"/"Mid"/"High"). A floor or unit number is never stored."""
     low = str(raw or "").strip().lower()
@@ -2429,7 +2567,9 @@ def _build_writeup_facts_block(req, district_str: str) -> str:
     if ptype:
         lines.append(f"- Property type: {ptype}")
     lines.append(f"- District (area context only — never name the street): {district_str}")
-    if (req.bedrooms or "").strip():
+    if _req_is_studio(req):
+        lines.append("- Bedrooms: Studio (no separate bedroom)")
+    elif (req.bedrooms or "").strip():
         lines.append(f"- Bedrooms: {req.bedrooms.strip()}")
     if (req.bathrooms or "").strip():
         lines.append(f"- Bathrooms: {req.bathrooms.strip()}")
@@ -2477,7 +2617,8 @@ def _strip_stray_street_names(text: str, context: str = "writeup") -> str:
         cleaned = _STRAY_STREET_RE.sub("", text)
         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
         cleaned = re.sub(r"\s+([,.;])", r"\1", cleaned)
-        logger.warning("copy guard [%s]: stripped stray street name(s) %s", context, hits)
+        logger.warning("copy guard [%s]: stripped %d stray street name(s) (values redacted)",
+                       context, len(hits))
         return cleaned.strip() if cleaned.strip() else text
     except Exception as e:
         logger.error("stray-street guard [%s] failed, returning ungated text: %s", context, e)
@@ -4467,7 +4608,7 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     district_text = district_label.upper() if district_label else ""
 
     stats = [
-        f"{bedrooms_val} Rooms" if bedrooms_val else "",
+        "Studio" if _listing_is_studio(listing) else (f"{bedrooms_val} Rooms" if bedrooms_val else ""),
         f"{bathrooms_val} Baths" if bathrooms_val else "",
         f"{built_up_num:,.0f} sqft" if built_up_num else "",
         f"SGD {price_psf:,} psf" if price_psf else "",
@@ -4690,7 +4831,7 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
     district_text = district_label.upper() if district_label else ""
 
     stats = [
-        f"{bedrooms_val} Rooms" if bedrooms_val else "",
+        "Studio" if _listing_is_studio(listing) else (f"{bedrooms_val} Rooms" if bedrooms_val else ""),
         f"{bathrooms_val} Baths" if bathrooms_val else "",
         f"{built_up_num:,.0f} sqft" if built_up_num else "",
         f"SGD {price_psf:,} psf" if price_psf else "",
@@ -6039,7 +6180,9 @@ async def market_pulse_diagnostics(agent=Depends(get_current_agent)):
 @app.post("/api/cma/generate")
 async def generate_cma_report(req: CMARequest, agent=Depends(get_current_agent)):
     street = (req.street or "").strip()
-    is_strata = ura_market_pulse.is_strata_type(req.property_type)
+    # Condo family AND Penthouse: both are strata units valued on built-up PSF, so both
+    # can be matched by project name (see ura_market_pulse.cma_strata_types).
+    is_strata = bool(ura_market_pulse.cma_strata_types(req.property_type))
     # Agent-only screen, but the project name is still sanitised: a unit number typed
     # into it must never travel anywhere (and URA has none to match against anyway).
     project_name = _clean_project_name(req.project_name) if is_strata else ""
@@ -7245,7 +7388,7 @@ def _build_propertyguru_text_block(listing: dict) -> str:
     add("Floor Level", f"{_strata['floor_level']} floor" if _strata["floor_level"] else "")
     add("TOP Year", _strata["top_year"] or "")
     add("Asking Price", _pg_export_price(listing.get("price")))
-    add("Bedrooms", _pg_export_count(listing.get("bedrooms")))
+    add("Bedrooms", "Studio" if _listing_is_studio(listing) else _pg_export_count(listing.get("bedrooms")))
     add("Bathrooms", _pg_export_count(listing.get("bathrooms")))
     add("Built-up Area", _pg_export_measure(listing.get("built_up"), " sqft"))
     add("Land Area", _pg_export_measure(listing.get("land_size"), " sqft"))
@@ -7538,6 +7681,21 @@ def _extract_district_token(location: str) -> str:
     match = re.search(r"district\s*(\d+)", str(location or ""), re.IGNORECASE)
     return f"D{match.group(1)}" if match else ""
 
+
+def _listing_match_district(listing) -> str:
+    """"D15"-style district for buyer matching. The STORED district (the New Listing
+    dropdown) wins; the address text is only a fallback for older listings without one --
+    almost no address actually says "District 15", so reading only the text left most
+    listings with no district and every district-filtered buyer unmatched. Leading zeros
+    are dropped ("District 09" -> "D9") to line up with the buyer form's D1..D28."""
+    src = listing if isinstance(listing, dict) else {}
+    d = _normalize_district(src.get("district")) or _normalize_district(_extract_district_token(src.get("location")))
+    return f"D{d}" if d else ""
+
+
+def _buyer_match_districts(raw) -> set:
+    return {f"D{d}" for d in (_normalize_district(x) for x in str(raw or "").split(",")) if d}
+
 def _compute_buyer_listing_match(buyer: dict, listing: dict) -> dict:
     """A match requires every preference the buyer actually set to be satisfied --
     an unset preference (empty district list, no budget, etc.) is treated as "no
@@ -7560,10 +7718,10 @@ def _compute_buyer_listing_match(buyer: dict, listing: dict) -> dict:
         else:
             return {"is_match": False, "reasons": []}
 
-    buyer_districts = [d for d in (buyer.get("districts") or "").split(",") if d]
+    buyer_districts = _buyer_match_districts(buyer.get("districts"))
     if buyer_districts:
         criteria_checked = True
-        listing_district = _extract_district_token(listing.get("location"))
+        listing_district = _listing_match_district(listing)
         if listing_district and listing_district in buyer_districts:
             reasons.append(f"In preferred area ({listing_district})")
         else:
@@ -7593,7 +7751,29 @@ def _compute_buyer_listing_match(buyer: dict, listing: dict) -> dict:
         else:
             return {"is_match": False, "reasons": []}
 
-    return {"is_match": criteria_checked and len(reasons) > 0, "reasons": reasons}
+    # Tenure preference (landed and condo alike). Blank / "Any" = no filter. The
+    # preference is a minimum (see _TENURE_RANK). A listing with NO tenure recorded (or an
+    # unusual one, e.g. "103-year leasehold") is NOT excluded -- most landed listings
+    # predate the tenure field, and hiding them would silently lose real matches -- but it
+    # is marked tenure_unconfirmed, ranked below confirmed matches, and the reason tells
+    # the agent to check.
+    tenure_unconfirmed = False
+    pref_rank = _tenure_pref_rank(buyer.get("tenure_pref"))
+    if pref_rank:
+        criteria_checked = True
+        pref_label, _ = _normalize_tenure(buyer.get("tenure_pref"), "")
+        listing_tenure, _ = _listing_tenure(listing)
+        listing_rank = _TENURE_RANK.get(listing_tenure, 0)
+        if listing_rank and listing_rank >= pref_rank:
+            reasons.append(f"Tenure: {listing_tenure}")
+        elif listing_rank:
+            return {"is_match": False, "reasons": []}
+        else:
+            tenure_unconfirmed = True
+            reasons.append(f"Tenure not confirmed on listing (buyer wants {pref_label})")
+
+    return {"is_match": criteria_checked and len(reasons) > 0, "reasons": reasons,
+            "tenure_unconfirmed": tenure_unconfirmed}
 
 @app.get("/api/listings/{listing_id}/matches")
 def get_listing_matches(listing_id: str, agent=Depends(get_current_agent)):
@@ -7608,9 +7788,13 @@ def get_listing_matches(listing_id: str, agent=Depends(get_current_agent)):
         if result["is_match"]:
             matches.append({
                 "buyer_id": buyer["id"], "name": buyer["name"], "phone": buyer.get("phone", ""),
-                "temperature": buyer.get("temperature"), "reasons": result["reasons"]
+                "temperature": buyer.get("temperature"), "reasons": result["reasons"],
+                "tenure_unconfirmed": bool(result.get("tenure_unconfirmed")),
             })
-    matches.sort(key=lambda m: {"HOT": 0, "WARM": 1, "COLD": 2}.get(m["temperature"], 9))
+    # Temperature first (as before); within it, confirmed-tenure matches above ones the
+    # agent still has to check.
+    matches.sort(key=lambda m: ({"HOT": 0, "WARM": 1, "COLD": 2}.get(m["temperature"], 9),
+                                m["tenure_unconfirmed"]))
     return matches
 
 @app.get("/api/buyers/{buyer_id}/matches")
@@ -7627,8 +7811,11 @@ def get_buyer_matches(buyer_id: str, agent=Depends(get_current_agent)):
             matches.append({
                 "listing_id": listing["id"], "location": listing["location"], "price": listing["price"],
                 "property_type": listing["property_type"],
-                "property_types": _listing_property_types(listing), "reasons": result["reasons"]
+                "property_types": _listing_property_types(listing), "reasons": result["reasons"],
+                "tenure_unconfirmed": bool(result.get("tenure_unconfirmed")),
             })
+    # Confirmed-tenure matches first; otherwise the database order, as before (stable sort).
+    matches.sort(key=lambda m: m["tenure_unconfirmed"])
     return matches
 
 # ================================
@@ -7733,7 +7920,7 @@ The agent is using NestList Prestige, a web app for real estate agents specializ
 - Enquiries: buyer enquiries submitted through public listing pages, each with an AI-generated lead score.
 - Buyer Management: buyer profiles and buyer-to-listing matching.
 - Sellers: seller leads, which can be converted into a full listing.
-- Pricing Reports: generates a comparable-transaction pricing report from live URA data (landed properties only).
+- Pricing Reports: generates a comparable-transaction pricing report from live URA data. Works for landed homes (valued on land price per sq ft), and for condominiums, executive condominiums (ECs), apartments and penthouses (valued on built-up price per sq ft, matched to the same development where possible, otherwise the same street). HDB flats are not covered.
 - Dashboard: overview stats and the Singapore Market Pulse panel (live GCB market data from URA).
 - My Profile: update agent details/photo, connect Instagram/Facebook for direct posting, set up notifications.
 - Billing: subscription/plan management.
@@ -7760,9 +7947,9 @@ The agent currently has this listing open. If their question refers to "this pro
 - Location: {listing.get('location', '')}
 - Price: SGD {listing.get('price', '')}
 - Built-up area: {listing.get('built_up', '')} sqft
-- Bedrooms: {listing.get('bedrooms', '')}
+- Bedrooms: {_bedrooms_display(listing)}
 - Bathrooms: {listing.get('bathrooms', '')}
-- Tenure: {listing.get('tenure', '')}"""
+- Tenure: {_listing_tenure_text(listing)}"""
 
     system_prompt = (
         f"You are Mary, NestList's AI Assistant, helping a Singapore real estate agent "
