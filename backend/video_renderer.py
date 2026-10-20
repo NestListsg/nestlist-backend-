@@ -2394,26 +2394,67 @@ def _presenter_opening_clip(src_path, out_path, timeout=TIMEOUT_CLIP):
     # Foreground: contain. decrease fits the clip INSIDE 1080x1920 whole, so a portrait
     # clip fills the frame, a squarer one gets blurred bands, and nothing is ever cut.
     fg = f"scale=w={VW}:h={VH}:force_original_aspect_ratio=decrease:flags=lanczos"
-    _run_ffmpeg([
-        "ffmpeg", "-y", "-v", "error",
-        # -stream_loop so a clip shorter than a slide still fills one rather than
-        # freezing on a black tail.
-        "-stream_loop", "-1", "-i", src_path, "-t", "%.3f" % SECONDS_PER_PHOTO,
-        "-filter_complex",
-        # The repair, when there is one, goes in BEFORE the split, so it is done once
-        # and both the sharp foreground and the blurred backdrop come from converted
-        # frames. Empty for every healthy clip, which leaves this graph exactly as it
-        # was.
-        (f"[0:v]{repair + ',' if repair else ''}fps={FPS},split=2[bgin][fgin];"
-         f"[bgin]{bg}[b];"
-         f"[fgin]{fg}[f];"
-         f"[b][f]overlay=(W-w)/2:(H-h)/2:shortest=0,setsar=1,format=yuv420p[v]"),
-        "-map", "[v]",
-        # Slide zero states bt709 explicitly, so the stream-copy concat can never
-        # publish the film under whatever colour description the agent's phone chose.
-        # See COLOUR_TAG_ARGS for why it is here and not in _ENCODE_ARGS.
-    ] + _ENCODE_ARGS + COLOUR_TAG_ARGS + [out_path], timeout)
-    return note
+    def build(with_repair, with_tags):
+        return [
+            "ffmpeg", "-y", "-v", "error",
+            # -stream_loop so a clip shorter than a slide still fills one rather than
+            # freezing on a black tail.
+            "-stream_loop", "-1", "-i", src_path, "-t", "%.3f" % SECONDS_PER_PHOTO,
+            "-filter_complex",
+            # The repair, when there is one, goes in BEFORE the split, so it is done
+            # once and both the sharp foreground and the blurred backdrop come from
+            # converted frames. Empty for every healthy clip, which leaves this graph
+            # exactly as it was.
+            (f"[0:v]{repair + ',' if (with_repair and repair) else ''}fps={FPS},"
+             f"split=2[bgin][fgin];"
+             f"[bgin]{bg}[b];"
+             f"[fgin]{fg}[f];"
+             f"[b][f]overlay=(W-w)/2:(H-h)/2:shortest=0,setsar=1,format=yuv420p[v]"),
+            "-map", "[v]",
+            # Slide zero states bt709 explicitly, so the stream-copy concat can never
+            # publish the film under whatever colour description the agent's phone
+            # chose. See COLOUR_TAG_ARGS for why it is here and not in _ENCODE_ARGS.
+        ] + _ENCODE_ARGS + (COLOUR_TAG_ARGS if with_tags else []) + [out_path]
+
+    # COLOUR MUST NEVER COST THE VIDEO.
+    #
+    # This is the one stage of a Signature that cannot degrade -- a film without the
+    # agent in it is a Classic -- so anything that CAN fail here fails the whole render
+    # and the agent is told their clip could not be read. That is exactly what happened
+    # on the first production Signature after the colour fix shipped: the repair chain
+    # was refused by Railway's ffmpeg build, and an agent with a perfectly good
+    # recording was told to go and record another one.
+    #
+    # The repair and the colour tags are both COSMETIC. They are worth having, they are
+    # never worth a failed render, and a probe that says a filter exists is not a
+    # promise that this particular graph will run. So they are attempted in descending
+    # order of niceness and the last rung is byte-for-byte the command that shipped
+    # before any of this existed.
+    attempts = [
+        (True, True),    # converted and tagged -- the right answer
+        (False, True),   # tagged only: the card and photos are right, the agent flat
+        (False, False),  # exactly the pre-colour-fix command; wrong colours, but a film
+    ]
+    if not repair:
+        attempts = [(False, True), (False, False)]
+    last_error = None
+    for i, (with_repair, with_tags) in enumerate(attempts):
+        try:
+            _run_ffmpeg(build(with_repair, with_tags), timeout)
+        except Exception as e:
+            last_error = e
+            logger.warning("presenter opening clip failed (repair=%s tags=%s): %s",
+                           with_repair, with_tags, str(e)[:300])
+            continue
+        if with_repair:
+            return note
+        if with_tags:
+            return VIDEO_NOTE_HDR_NOT_TONEMAPPED if repair else note
+        logger.error("presenter opening clip fell all the way back to the untagged "
+                     "command; this film will carry the clip's own colour description")
+        return VIDEO_NOTE_HDR_NOT_TONEMAPPED if repair else note
+    # Every rung failed, so the clip really is unreadable and raising is correct.
+    raise last_error
 
 
 def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=None,
