@@ -1131,20 +1131,39 @@ def _agent_response(agent) -> dict:
 #
 # TWO counters, because on a single count a busy shared office and a brute-force
 # run look identical:
-#   _login_hits          -- a loose flood cap on EVERY request, checked before
-#                           the email lookup, so the endpoint can't be hammered
-#                           and the email column can't be walked for enumeration.
-#   _login_failure_hits  -- a tight cap on FAILURES only. A Singapore agency
-#                           behind one office NAT address (50 agents signing in
-#                           on onboarding day) pays nothing for succeeding, while
-#                           an attacker produces nothing but failures and hits
-#                           the tight brake almost immediately.
+#   _login_hits          -- a loose flood cap on EVERY request, keyed on IP ALONE,
+#                           checked before the email lookup. This is the brake that
+#                           bounds a password-spray: an attacker rotating through a
+#                           stolen email list from one address still can't make more
+#                           than 60 attempts / 10 min no matter how many addresses
+#                           they cycle through, and the endpoint can't be hammered
+#                           for enumeration.
+#   _login_failure_hits  -- a tight cap on FAILURES only, keyed on (IP + email).
+#                           A Singapore agency behind one office NAT address (50
+#                           agents signing in on onboarding day) pays nothing for
+#                           succeeding; and when ONE agent fat-fingers their own
+#                           password ten times, only THAT agent's (IP+email) bucket
+#                           locks -- their colleagues, and their own correct password,
+#                           keep working. Keyed on IP alone this cap would lock the
+#                           whole office out on one person's typos.
 #
-# Both are keyed on IP and never on the email: the limiter must not become a way
-# to test which addresses are registered, and nobody should be able to lock a
-# named agent out by hammering their address. Both return the identical 429.
+# Why (IP + email) does not create the two problems IP-only avoided:
+#   * Enumeration: unknown-email and wrong-password are counted on this bucket and
+#     answered with the IDENTICAL 429/401, so the counter still leaks nothing about
+#     which addresses are registered.
+#   * Targeted lockout: a bucket is (IP + email), so an attacker hammering a victim's
+#     address only fills THEIR OWN (attacker-IP + victim-email) bucket -- the victim's
+#     (victim-IP + victim-email) bucket is untouched, so they can still log in from
+#     their own location. The IP flood cap above is what stops the attacker's spray.
+# Both return the identical 429.
 _login_hits = {}
 _login_failure_hits = {}
+
+def _login_failure_key(client_ip: str, email: str) -> str:
+    # Scope the failure budget to one account at one location. Email is normalised
+    # (trim + lowercase) so case/whitespace variants of the same address share one
+    # bucket and can't each be handed a fresh 10-failure allowance.
+    return f"{client_ip}|{(email or '').strip().lower()}"
 
 @app.post("/api/login")
 def login(req: LoginRequest, request: Request):
@@ -1152,11 +1171,15 @@ def login(req: LoginRequest, request: Request):
     if _rate_limited(_login_hits, client_ip, limit=60, window_seconds=600):
         raise HTTPException(status_code=429, detail="Too many login attempts — please try again in a few minutes")
 
+    # The failure budget is scoped to this ONE account at this ONE location, so a
+    # shared office IP can't be locked out of login by one colleague's typos.
+    failure_key = _login_failure_key(client_ip, req.email)
+
     # PEEKED here rather than counted. The failure budget has to be enforced
     # BEFORE the password is checked -- a counter consulted only afterwards
     # still lets every guess be tested, which is no brake at all -- but it must
     # only be SPENT on a guess that actually turned out wrong.
-    if _rate_limited(_login_failure_hits, client_ip, limit=10, window_seconds=600, record=False):
+    if _rate_limited(_login_failure_hits, failure_key, limit=10, window_seconds=600, record=False):
         raise HTTPException(status_code=429, detail="Too many login attempts — please try again in a few minutes")
 
     result = db_execute(
@@ -1165,7 +1188,7 @@ def login(req: LoginRequest, request: Request):
     agent = result.data[0] if result.data else None
     if agent is None or not verify_password(req.password, agent["password_hash"]):
         # Unknown email and wrong password are counted and answered identically.
-        _rate_limited(_login_failure_hits, client_ip, limit=10, window_seconds=600)
+        _rate_limited(_login_failure_hits, failure_key, limit=10, window_seconds=600)
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     token = create_token(str(agent["id"]))
