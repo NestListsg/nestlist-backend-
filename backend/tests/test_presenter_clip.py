@@ -46,7 +46,7 @@ if subprocess.run(["which","ffmpeg"], capture_output=True).returncode != 0:
 with tempfile.TemporaryDirectory() as tmp:
     print("\n[1] a normal phone-shaped clip is accepted and normalised")
     src = os.path.join(tmp, "portrait.mp4"); make(src, 6, 720, 1280)
-    data, secs = vr.prepare_presenter_clip(open(src,"rb").read(), tmp)
+    data, secs, _note = vr.prepare_presenter_clip(open(src,"rb").read(), tmp)
     check("returns bytes", isinstance(data, bytes) and len(data) > 1000, str(len(data)))
     check("a duration is returned", secs > 0, "%.2f" % secs)
     out = os.path.join(tmp,"o.mp4"); open(out,"wb").write(data)
@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     print("\n[2] an over-long recording is trimmed, not rejected")
     src2 = os.path.join(tmp,"long.mp4"); make(src2, 20, 640, 360)
-    _d2, secs2 = vr.prepare_presenter_clip(open(src2,"rb").read(), tmp)
+    _d2, secs2, _n2 = vr.prepare_presenter_clip(open(src2,"rb").read(), tmp)
     check("never reports longer than the cap", secs2 <= vr.PRESENTER_MAX_SECONDS + 0.6, "%.2f" % secs2)
     o2 = os.path.join(tmp,"o2.mp4"); open(o2,"wb").write(_d2)
     real = subprocess.run(["ffmpeg","-v","error","-i",o2,"-f","null","-"],capture_output=True)
@@ -66,7 +66,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     print("\n[3] landscape is handled too, not just portrait")
     src3 = os.path.join(tmp,"wide.mp4"); make(src3, 4, 1920, 1080)
-    d3, _ = vr.prepare_presenter_clip(open(src3,"rb").read(), tmp)
+    d3, _s3, _n3 = vr.prepare_presenter_clip(open(src3,"rb").read(), tmp)
     open(os.path.join(tmp,"o3.mp4"),"wb").write(d3)
     _, w3, h3 = streaminfo(os.path.join(tmp,"o3.mp4"))
     check("landscape long edge capped (%dx%d)" % (w3,h3), max(w3,h3) <= vr.PRESENTER_LONG_EDGE)

@@ -99,7 +99,7 @@ check("a file ffmpeg cannot read -> no trim, no raise",
 print("\n[7] end to end: the stored clip starts on the speech")
 raw = open(clip("upload", 12, speech_from=2.4), "rb").read()
 with tempfile.TemporaryDirectory() as wd:
-    data, seconds = vr.prepare_presenter_clip(raw, wd)
+    data, seconds, _note = vr.prepare_presenter_clip(raw, wd)
 out = os.path.join(TMP, "prepared.mp4")
 open(out, "wb").write(data)
 check("the dead air is gone from what we store", seconds < 10.5, "%.2fs stored" % seconds)

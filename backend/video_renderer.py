@@ -22,11 +22,17 @@ Every optional stage degrades instead of failing. The ladder, worst-case last:
     captions fail    -> caption-free slideshow
     card fails       -> slideshow with no closing card
     a photo fails    -> that photo is skipped
+    HDR cannot be    -> the film is still published bt709 (so the closing card is
+    tonemapped          right); only the agent looks a little flat. See HDR_TRANSFERS
 Only "no usable photos at all" raises. Which degradations fired is returned to the
 caller (and logged) so a quietly-degraded render is visible in Railway's logs rather
 than looking like a normal success.
 
-Requires the `ffmpeg` binary (with `ffprobe`) on PATH -- see railpack.json.
+Requires the `ffmpeg` binary on PATH -- see railpack.json. ffprobe is used where it
+helps but is NEVER required: it is a separate binary, a worker can have a working
+ffmpeg without it, and assuming otherwise has caused two bugs here already. Anything
+that must be read from a file is read from ffmpeg's own banner instead
+(_duration_via_ffmpeg, _source_colour).
 """
 import base64
 import hashlib
@@ -540,6 +546,54 @@ _SHRINK_STEPS = ((0.34, "25"), (0.42, "26"), (0.50, "27"), (0.56, "28"), (0.66, 
 # rather than exactly at it.
 _SHRINK_MARGIN = 0.90
 TIMEOUT_SHRINK = 180
+
+# Say bt709 OUT LOUD, so the film's colour description is never INHERITED.
+#
+# This is the structural half of the HDR fix further down (see HDR_TRANSFERS). The
+# assembly is a stream-copy concat, and a stream copy takes its colour description from
+# the FIRST input -- so one clip carrying surprising colour tags relabels the ENTIRE
+# film. That is exactly how an HLG presenter clip published a 41s film tagged HDR and
+# turned the closing contact card teal.
+#
+# APPLIED ONLY TO THE PRESENTER OPENING CLIP, which is deliberate and was arrived at by
+# measurement, not taste. The presenter clip is the only EXTERNAL video that ever enters
+# the timeline -- every other clip is built here from a BMP or a JPEG we just wrote, so
+# it has no colour tags to smuggle in. Tagging slide zero is therefore enough to
+# guarantee the published film says bt709, and it has the large extra benefit that a
+# clip uploaded BEFORE this fix (Janel's is stored HLG right now) stops relabelling the
+# film as HDR too: her card comes out right on her next render, with only her own
+# colour still flat until she re-uploads.
+#
+# WHY NOT ON EVERY CLIP (_ENCODE_ARGS). Tried, measured, REVERTED. Today's clips are
+# encoded through swscale's bt601 matrix and shipped with NO tag, and the two things
+# that read them disagree: ffmpeg/VLC assume bt601 and show the designed colours, while
+# phones, browsers and social players assume bt709 and show them slightly
+# over-saturated (measured up to 21/255 on a saturated patch). Stating bt709 on every
+# clip forces everyone onto the bt709 reading -- which moved a real Classic render on
+# EVERY ONE of its 445 frames, worst channel 73/255. There is no spelling that is both
+# unambiguous and unchanged for every viewer, because the ambiguity IS the difference.
+# Resolving it is a grading decision about hundreds of films Jane has already approved,
+# so it is written up for her rather than bundled into a colour hotfix.
+#
+# WHY -x264-params AND NOT -colorspace. MEASURED, all four spellings, same source:
+#
+#   form                                            tags written          pixels
+#   -colorspace bt709                               matrix only           CHANGED
+#   -colorspace/-color_primaries/-color_trc         matrix only           CHANGED
+#   same, stream-suffixed (:v)                      matrix only           CHANGED
+#   -x264-params colorprim/transfer/colormatrix     all three             identical
+#
+# Two separate traps there. First, ffmpeg SILENTLY IGNORES -color_primaries and
+# -color_trc when the frames reaching the encoder do not already state them, so the
+# obvious spelling writes the matrix and drops the other two -- which are precisely the
+# two that carried the HLG curve. Second, -colorspace does not merely label: ffmpeg
+# hands it to swscale, which then really converts the matrix. -x264-params only labels.
+#
+# Not probed, unlike the `cas` filter: this is a libx264 private option, and libx264 is
+# already a hard dependency of every encode in this file, so there is no build where
+# this option is missing and the renderer otherwise works.
+COLOUR_TAG_ARGS = ["-x264-params",
+                   "colorprim=bt709:transfer=bt709:colormatrix=bt709"]
 
 # Identical encoder settings on every clip, so the final concat can be a stream copy
 # (no re-encode) without mismatched stream parameters.
@@ -1061,6 +1115,186 @@ def _speech_start_seconds(path, duration, keep_at_least):
     return start
 
 
+# ---------------------------------------------------------------------------
+# HDR (HLG/PQ) presenter clips -> true SDR bt709
+# ---------------------------------------------------------------------------
+# WHAT WENT WRONG, so nobody re-derives it from the symptom. Modern iPhones record HDR
+# by default: Janel's clip probes as yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67) --
+# arib-std-b67 is HLG. The old transcode here brought it down to 8-bit yuv420p but did
+# NOT tonemap and did NOT retag, so the stored clip kept HLG-curve samples AND the
+# bt2020/HLG labels. That clip becomes slide zero of a Signature, and because the
+# assembly is a stream-copy concat (which takes its stream parameters from the FIRST
+# input), the whole 41s film was published tagged as HDR. Players then applied an
+# HDR->SDR transform to footage that was mostly ordinary SDR, and the closing contact
+# card -- designed warm off-white -- came out teal on Jane's screen.
+#
+# MEASURED, so the blame is not guesswork: the card's PIXELS are correct and byte-for-
+# byte identical to the ones a Classic ships (same md5 on the raw YUV), and a Classic
+# carries no colour tags at all. Same pixels, different label, different picture. The
+# card renderer is not involved.
+#
+# Relabelling the finished film bt709 does fix the card, but it leaves the AGENT flat
+# and washed out, because her samples really are HLG-encoded: measured on the real HDR
+# sample, mean colourfulness 0.105 relabelled against 0.163 properly tonemapped. The
+# agent is the whole point of a Signature, so the conversion belongs HERE, once, at
+# upload -- after which the stored clip matches everything else and nothing downstream
+# has to know.
+#
+# The transfer characteristics that mean "this is HDR and needs converting". Anything
+# else -- bt709, smpte170m, an untagged recording -- is left COMPLETELY alone, argument
+# for argument, so an SDR upload comes through exactly as it did before this change.
+HDR_TRANSFERS = ("arib-std-b67", "smpte2084")   # HLG, PQ
+
+# Rung 1. zscale (libzimg) to linear light, tonemap, back out to bt709.
+#
+# The numbers are MEASURED on the real HLG sample (an iPhone 16 Pro Max HLG recording),
+# averaged over four frames, against the relabel-only result as the baseline. Do not
+# re-tune these from first principles; the alternatives were tested and rejected:
+#
+#   tonemap   npl   desat   mean luma   contrast   colourfulness   blown highlights
+#   (none)      -       -       180.4      203.5         0.105            0.0%   <- relabel only
+#   hable     100     0.0       182.4      208.5         0.163            0.1%   <- SHIPPED
+#   hable     203     0.0       155.1      188.9         0.163            0.0%   too dark
+#   hable     100     0.5       208.2      222.5         0.092           59.1%   blows out
+#   mobius    100     0.0       205.3      203.1         0.161           51.2%   blows out
+#   reinhard  100     0.0       200.8      200.3         0.162           24.5%   blows out
+#   clip      100       -       211.9      206.0         0.151           79.8%   blows out
+#
+# hable at npl=100 with desat=0 is the only row that holds the exposure Jane already
+# approved (182 against 180) while recovering the colour (0.163 against 0.105) and
+# blowing nothing. desat defaults to 2, which rolls highlights towards white to protect
+# hue -- on a face lit by a window that clipped 59% of the frame, so it is turned OFF
+# deliberately. npl is the nominal peak the source is read against: 1000 (HLG's nominal
+# peak) renders her two stops dark, because HLG is scene-referred and this footage is
+# graded for a normal room, not a 1000-nit highlight.
+#
+# zscale needs its INPUT colour fully specified or zimg answers "no path between
+# colorspaces" and the encode fails -- which is why _source_colour reads the real tags
+# off the source rather than letting the filter guess.
+TONEMAP_ALGO = "hable"
+TONEMAP_PEAK_NITS = 100
+# Rung 2. No zscale (libzimg is a build-time option and Railway installs Debian's
+# ffmpeg), so linear light is unreachable and so is tonemap, which only eats float.
+# `colorspace` is core libavfilter and can still fix the MATRIX and the GAMUT, which is
+# most of the cast; it cannot undo the HLG curve, so the agent stays slightly flat.
+# MEASURED on the same sample: colourfulness 0.131 against 0.105 relabelled and 0.163
+# properly tonemapped -- about 45% of the gap closed, exposure and contrast untouched,
+# nothing blown. HLG only: PQ read as a gamma curve comes out very dark, so a PQ clip
+# skips this rung.
+GAMUT_ONLY_FILTER = "colorspace=all=bt709:iall=bt2020:fast=0"
+# Rung 3 is no filter at all -- the clip is merely RELABELLED bt709. Strictly better
+# than today (the card and the photos come out right), but the agent is flat, so it is
+# logged and reported as a degradation rather than passing silently.
+VIDEO_NOTE_HDR_NOT_TONEMAPPED = (
+    "your clip was recorded in HDR and this server could not convert it fully, so you "
+    "may look a little flat in the video"
+)
+
+_hdr_rung_cache = None
+_hdr_rung_lock = threading.Lock()
+
+
+def _source_colour(path):
+    """The colour tags ffmpeg reports for `path`, read off its BANNER.
+
+    Returns {"range","matrix","primaries","transfer"} with None for anything the file
+    does not state, or None if the banner could not be read at all.
+
+    Banner, not ffprobe. ffprobe is a separate binary and this codebase has already
+    been bitten twice by assuming it is installed -- see _duration_via_ffmpeg. ffmpeg
+    prints the colour description inside the pixel-format parentheses, in one of two
+    shapes depending on whether the three values agree:
+
+        yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67)   <- matrix/primaries/transfer
+        yuv420p(tv, bt709, progressive)                 <- all three are bt709
+        yuvj420p(pc, bt470bg/unknown/unknown, progressive)
+        yuv420p(progressive)                            <- states nothing at all
+    """
+    try:
+        err = subprocess.run(["ffmpeg", "-hide_banner", "-i", path],
+                             capture_output=True, timeout=TIMEOUT_PROBE
+                             ).stderr.decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.warning("could not read colour tags from ffmpeg for %s (%s)", path, e)
+        return None
+
+    line = next((l for l in err.splitlines() if "Video:" in l), None)
+    if not line:
+        return None
+    # The range flag is the anchor: ffmpeg only prints a colour description when it
+    # prints tv/pc in front of it, so finding one finds the other.
+    m = re.search(r"\b(tv|pc|limited|full)\s*,\s*([\w-]+)(?:/([\w-]+)/([\w-]+))?", line)
+    if not m:
+        return {"range": None, "matrix": None, "primaries": None, "transfer": None}
+
+    def clean(v):
+        return None if (not v or v == "unknown") else v
+
+    rng, first, second, third = m.group(1), m.group(2), m.group(3), m.group(4)
+    if second is None:
+        # The single-value shape: one name standing for matrix, primaries and transfer.
+        matrix = primaries = transfer = clean(first)
+    else:
+        matrix, primaries, transfer = clean(first), clean(second), clean(third)
+    return {"range": {"limited": "tv", "full": "pc"}.get(rng, rng),
+            "matrix": matrix, "primaries": primaries, "transfer": transfer}
+
+
+def _hdr_to_sdr_filter(colour):
+    """The best HDR->SDR chain this ffmpeg build can actually run for `colour`.
+
+    Returns (filter_string, note). An empty filter_string means rung 3 -- relabel only
+    -- and `note` is then the degradation to report. Worked out once per process and
+    cached, because it is two filter probes and it would otherwise run per upload.
+
+    Probing rather than assuming is the house rule here: an unknown filter name makes
+    ffmpeg exit non-zero, and this string goes into the ONE encode an agent is sitting
+    and waiting for. See _clarity_filter, which does the same thing for `cas` and for
+    the same reason.
+    """
+    global _hdr_rung_cache
+    with _hdr_rung_lock:
+        if _hdr_rung_cache is None:
+            if _has_ffmpeg_filter("zscale") and _has_ffmpeg_filter("tonemap"):
+                _hdr_rung_cache = "tonemap"
+            elif _has_ffmpeg_filter("colorspace"):
+                logger.warning("ffmpeg has no 'zscale'/'tonemap' filter; HDR clips will "
+                               "be gamut-corrected only and will look slightly flat")
+                _hdr_rung_cache = "gamut"
+            else:
+                logger.warning("ffmpeg can neither tonemap nor convert gamut; HDR clips "
+                               "will only be relabelled bt709")
+                _hdr_rung_cache = "relabel"
+        rung = _hdr_rung_cache
+
+    matrix = colour.get("matrix") or "bt2020nc"
+    primaries = colour.get("primaries") or "bt2020"
+    transfer = colour.get("transfer")
+    rng = colour.get("range") or "tv"
+
+    if rung == "tonemap":
+        logger.info("presenter clip is HDR (%s); tonemapping to bt709", transfer)
+        return (
+            # Into linear light, with the source's own tags spelled out -- zimg refuses
+            # to work from guesses.
+            f"zscale=min={matrix}:pin={primaries}:tin={transfer}:rin={rng}"
+            f":t=linear:npl={TONEMAP_PEAK_NITS}:p={primaries}:m={matrix},"
+            # tonemap only accepts floating-point linear light.
+            "format=gbrpf32le,"
+            f"tonemap=tonemap={TONEMAP_ALGO}:desat=0,"
+            # ...and back out to a plain SDR bt709 video range.
+            "zscale=p=bt709:t=bt709:m=bt709:r=tv"
+        ), None
+    if rung == "gamut" and transfer == "arib-std-b67":
+        logger.warning("presenter clip is HLG and this ffmpeg cannot tonemap; "
+                       "correcting the gamut only -- the agent will look a little flat")
+        return GAMUT_ONLY_FILTER, VIDEO_NOTE_HDR_NOT_TONEMAPPED
+    logger.warning("presenter clip is HDR (%s) and this ffmpeg cannot convert it; "
+                   "relabelling bt709 so the rest of the film is right, but the agent "
+                   "will look flat", transfer)
+    return "", VIDEO_NOTE_HDR_NOT_TONEMAPPED
+
+
 def prepare_presenter_clip(raw_bytes, workdir):
     """Normalise an agent's uploaded clip into something the renderer can always read.
 
@@ -1073,8 +1307,12 @@ def prepare_presenter_clip(raw_bytes, workdir):
     agent is still looking at the screen, instead of silently breaking a video they
     ordered three days later.
 
-    Returns (mp4_bytes, seconds). Raises ValueError with a sentence the agent can act
-    on -- this runs on a path where a human is waiting.
+    Returns (mp4_bytes, seconds, note). `note` is None on the normal path, and a
+    sentence for the agent when the clip was HDR and this ffmpeg could not convert it
+    all the way -- see HDR_TRANSFERS above for why that matters and what it costs.
+
+    Raises ValueError with a sentence the agent can act on -- this runs on a path where
+    a human is waiting.
     """
     src = os.path.join(workdir, "presenter_in")
     out = os.path.join(workdir, "presenter_out.mp4")
@@ -1087,11 +1325,27 @@ def prepare_presenter_clip(raw_bytes, workdir):
     # be installed on the worker at all.
     start_at = _speech_start_seconds(src, _duration_via_ffmpeg(src), SECONDS_PER_PHOTO)
 
+    # Is this an HDR recording? Modern iPhones say yes by default. Only an HDR clip gets
+    # converted; an SDR one takes the branch below with the argument list it has always
+    # had, untouched, so nothing about an ordinary upload changes.
+    colour = _source_colour(src) or {}
+    is_hdr = colour.get("transfer") in HDR_TRANSFERS
+    note = None
+    hdr_chain = ""
+    if is_hdr:
+        hdr_chain, note = _hdr_to_sdr_filter(colour)
+
+    # The scale is unchanged; the conversion (when there is one) goes AFTER it, so the
+    # expensive float tonemap runs on the 1280-long-edge frame rather than the phone's
+    # full 4K -- same result, a fraction of the work.
+    scale = ("scale='if(gt(iw,ih),min(%d,iw),-2)':'if(gt(iw,ih),-2,min(%d,ih))'"
+             % (PRESENTER_LONG_EDGE, PRESENTER_LONG_EDGE))
+
     # ffmpeg IS the validator. An earlier version probed the input first and treated a
     # failed probe as "not a video" -- which would have rejected every upload on a
     # worker where ffprobe was missing, while ffmpeg itself was working fine. Let the
     # transcode decide: if it cannot read the file, it is not a file we can use.
-    try:
+    def transcode(chain):
         _run_ffmpeg([
             "ffmpeg", "-y", "-v", "error",
             # Before -i: seek the INPUT, so -t below counts from the first word rather
@@ -1100,9 +1354,12 @@ def prepare_presenter_clip(raw_bytes, workdir):
             "-i", src, "-t", "%.2f" % PRESENTER_MAX_SECONDS,
             # Scale the LONG edge, whichever way up it was filmed, and keep both
             # dimensions even -- H.264 refuses odd ones.
-            "-vf", ("scale='if(gt(iw,ih),min(%d,iw),-2)':'if(gt(iw,ih),-2,min(%d,ih))',"
-                    "format=yuv420p" % (PRESENTER_LONG_EDGE, PRESENTER_LONG_EDGE)),
+            "-vf", ",".join([scale] + ([chain] if chain else []) + ["format=yuv420p"]),
             "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+            # Only on the HDR branch, so an SDR upload runs the argument list it always
+            # has. On an HDR one the tag is the whole point: even when the conversion
+            # falls through to the bottom rung, the film must stop claiming to be HDR.
+            ] + (COLOUR_TAG_ARGS if is_hdr else []) + [
             # Even out how loud they recorded, so the film's balance does not depend on
             # how they held the phone. Single-pass loudnorm: approximate, but the gap it
             # is closing is tens of dB, not tenths.
@@ -1111,10 +1368,29 @@ def prepare_presenter_clip(raw_bytes, workdir):
             "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
             "-movflags", "+faststart", out,
         ], timeout=240)
+
+    try:
+        transcode(hdr_chain)
     except RuntimeError as e:
-        logger.warning("presenter clip rejected: %s", str(e)[:300])
-        raise ValueError("That file does not look like a video we can read. "
-                         "An MP4 or MOV straight from your phone works best.")
+        if hdr_chain:
+            # The colour conversion is the ONLY thing that can have gone wrong that is
+            # not the agent's file -- zimg is fussy about unusual inputs, and a tonemap
+            # that will not run must never cost a good recording. Drop to the bottom
+            # rung (relabel bt709, no pixel change) and try once more; the agent still
+            # gets a usable clip, and the card still comes out right.
+            logger.warning("HDR conversion failed for this presenter clip (%s); "
+                           "falling back to relabelling it bt709", str(e)[:200])
+            note = VIDEO_NOTE_HDR_NOT_TONEMAPPED
+            try:
+                transcode("")
+            except RuntimeError as e2:
+                logger.warning("presenter clip rejected: %s", str(e2)[:300])
+                raise ValueError("That file does not look like a video we can read. "
+                                 "An MP4 or MOV straight from your phone works best.")
+        else:
+            logger.warning("presenter clip rejected: %s", str(e)[:300])
+            raise ValueError("That file does not look like a video we can read. "
+                             "An MP4 or MOV straight from your phone works best.")
 
     if not os.path.exists(out) or os.path.getsize(out) < 1000:
         raise ValueError("That file does not look like a video we can read. "
@@ -1137,7 +1413,7 @@ def prepare_presenter_clip(raw_bytes, workdir):
 
     with open(out, "rb") as f:
         data = f.read()
-    return data, seconds
+    return data, seconds, note
 
 
 def _duration_via_ffmpeg(path):
@@ -2082,7 +2358,24 @@ def _presenter_opening_clip(src_path, out_path, timeout=TIMEOUT_CLIP):
 
     Silent (_ENCODE_ARGS carries -an). Their voice is mixed back over the finished film,
     where it can duck the music rather than fight it.
+
+    Returns a note for the agent, or None. A clip stored BEFORE the HDR fix is still
+    HLG on disk, and it is repaired HERE rather than left for the agent to re-upload --
+    MEASURED, the repair of the stored 8-bit clip is as good as converting the 10-bit
+    original again (colourfulness 0.166 against 0.165, contrast 208.0 against 207.1,
+    248 against 249 distinct luma levels, so the 8-bit round trip costs nothing
+    visible). That matters because the alternative was asking every agent who uploaded
+    before today to go and do it again. A clip stored since the fix already reads
+    bt709, so this costs a healthy render nothing but one header read.
     """
+    colour = _source_colour(src_path) or {}
+    note = None
+    repair = ""
+    if colour.get("transfer") in HDR_TRANSFERS:
+        logger.warning("stored presenter clip is still HDR (%s) -- it predates the "
+                       "colour fix; converting it on the way into the film",
+                       colour.get("transfer"))
+        repair, note = _hdr_to_sdr_filter(colour)
     # Backdrop: cover-scale, then crop. force_original_aspect_ratio=increase guarantees
     # the scaled frame is at least as large as the crop in BOTH dimensions -- the first
     # cut used `scale=1080:-1,crop=1080:1920`, which on any clip squarer than 9:16
@@ -2107,12 +2400,20 @@ def _presenter_opening_clip(src_path, out_path, timeout=TIMEOUT_CLIP):
         # freezing on a black tail.
         "-stream_loop", "-1", "-i", src_path, "-t", "%.3f" % SECONDS_PER_PHOTO,
         "-filter_complex",
-        (f"[0:v]fps={FPS},split=2[bgin][fgin];"
+        # The repair, when there is one, goes in BEFORE the split, so it is done once
+        # and both the sharp foreground and the blurred backdrop come from converted
+        # frames. Empty for every healthy clip, which leaves this graph exactly as it
+        # was.
+        (f"[0:v]{repair + ',' if repair else ''}fps={FPS},split=2[bgin][fgin];"
          f"[bgin]{bg}[b];"
          f"[fgin]{fg}[f];"
          f"[b][f]overlay=(W-w)/2:(H-h)/2:shortest=0,setsar=1,format=yuv420p[v]"),
         "-map", "[v]",
-    ] + _ENCODE_ARGS + [out_path], timeout)
+        # Slide zero states bt709 explicitly, so the stream-copy concat can never
+        # publish the film under whatever colour description the agent's phone chose.
+        # See COLOUR_TAG_ARGS for why it is here and not in _ENCODE_ARGS.
+    ] + _ENCODE_ARGS + COLOUR_TAG_ARGS + [out_path], timeout)
+    return note
 
 
 def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=None,
@@ -2531,6 +2832,17 @@ def _build_card_clip(body_path, card_img, out_path, workdir):
     nothing surfaces as an error) -- the bug documented in prototypes/assemble_v16.py
     that cost several prototype rounds. Keeping the dissolve on two one-frame inputs
     means the body is only ever stream-copied and can never be truncated.
+
+    KNOWN, NOT FIXED HERE: both inputs are JPEGs, and JPEG is FULL range, so this is the
+    one clip in the film encoded full-range -- it probes yuvj420p(pc) while every photo
+    clip probes limited. The stream-copy concat throws that label away and keeps the
+    first clip's, so the card's samples are read as limited range and the designed
+    (250,248,245) off-white clips towards white (the charcoal name text measures 43 ->
+    31). It is pre-existing, it is sub-perceptual on a flat off-white, and it is NOT the
+    teal bug -- but it is real. Fixing it means either converting these two stills to
+    limited range or feeding the encoder BMP instead of JPEG, both of which change how
+    every Classic's closing card decodes, so it is written up for Jane to decide rather
+    than smuggled into a colour hotfix. See the report that shipped with this change.
     """
     last_frame = os.path.join(workdir, "last_frame.jpg")
     _run_ffmpeg(["ffmpeg", "-y", "-sseof", "-0.2", "-i", body_path,
@@ -2772,7 +3084,13 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             if presenter_path:
                 opening_clip = os.path.join(workdir, "clip_presenter.mp4")
                 try:
-                    _presenter_opening_clip(presenter_path, opening_clip)
+                    # Answers a note only when the stored clip was HDR AND this ffmpeg
+                    # could not convert it properly. A clip stored before the HDR fix is
+                    # repaired in there rather than reported, so the agent does not have
+                    # to re-upload anything.
+                    hdr_note = _presenter_opening_clip(presenter_path, opening_clip)
+                    if hdr_note:
+                        degradations.append(hdr_note)
                 except Exception as e:
                     logger.error("presenter opening clip failed (%s)", e)
                     raise RuntimeError(

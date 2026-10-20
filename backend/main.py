@@ -6719,7 +6719,7 @@ async def upload_presenter_video(file: UploadFile = File(...), agent=Depends(get
 
     try:
         with tempfile.TemporaryDirectory() as workdir:
-            clip, seconds = await asyncio.to_thread(
+            clip, seconds, note = await asyncio.to_thread(
                 video_renderer.prepare_presenter_clip, raw, workdir)
     except ValueError as e:
         # Raised deliberately with wording meant for the agent, not a stack trace.
@@ -6748,7 +6748,13 @@ async def upload_presenter_video(file: UploadFile = File(...), agent=Depends(get
         }).eq("id", agent["id"]),
         what="upload_presenter_video agents update",
     )
-    return {"presenter_video_url": url, "seconds": round(seconds, 2)}
+    # `note` is ADDITIVE and only present when there is something to say (an HDR clip
+    # this server could not convert all the way). Existing frontend code ignores it, so
+    # nothing breaks by it appearing; new code can show it next to the upload.
+    result = {"presenter_video_url": url, "seconds": round(seconds, 2)}
+    if note:
+        result["note"] = note
+    return result
 
 
 @app.delete("/api/profile/presenter-video")
