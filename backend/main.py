@@ -5384,11 +5384,37 @@ def _note_signature_columns(listing_row) -> bool:
                 "listings.%s NOT present -- Signature videos are off until the migration "
                 "in backend/migrations/ is run. The Classic tier is unaffected.",
                 SIGNATURE_DETECT_COLUMN)
-    return _signature_columns_supported is True
+    # Learn either way, but ANSWER through the one gate. generate_signature asks this
+    # function rather than _signature_columns_available, so returning the raw learned
+    # value here would leave the endpoint reachable with the tier switched off -- and a
+    # stale browser tab is enough to hit it.
+    return _signature_columns_available()
+
+
+# THE SIGNATURE TIER IS OFF.
+#
+# Jane's call, 2026-10-21, after watching the first automated films end to end:
+# "the signature video is not up to standard yet so please do not let it go live. real
+# janel against a bad wall background followed by the property is not good at all."
+#
+# The machinery works -- render, queue, colour, captions are all correct and tested.
+# What is not right is the FILM: an agent talking to camera against whatever wall they
+# happened to stand in front of, cut to a property they are visibly not standing in.
+# That is a product problem, not a defect, and the fix under discussion is filming the
+# clip inside the listing itself.
+#
+# So this is a switch, not a removal. Nothing is deleted, every test still runs, and the
+# day the opener is right this becomes SIGNATURE_ENABLED=1 in Railway with no deploy.
+#
+# With it off: `signature_available` is false so My Listings never offers the button,
+# POST /generate-signature answers the 503 the frontend already understands as "not
+# switched on yet" and hides the panel for, and GET /signature-status answers "none".
+# An agent who already has a Signature keeps the file; it simply is not offered again.
+SIGNATURE_ENABLED = os.environ.get("SIGNATURE_ENABLED", "").strip() in ("1", "true", "yes")
 
 
 def _signature_columns_available() -> bool:
-    return _signature_columns_supported is True
+    return SIGNATURE_ENABLED and _signature_columns_supported is True
 
 
 def _probe_signature_columns():

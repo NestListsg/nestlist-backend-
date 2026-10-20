@@ -254,6 +254,13 @@ PRELUDE = span("_VideoVariant", "_download_presenter_clip")
 def with_prelude(**extra):
     ns = base_ns(**extra)
     exec(compile(PRELUDE, "main.py:prelude", "exec"), ns)
+    # The tier ships SWITCHED OFF (Jane, 2026-10-21: the film is not up to standard
+    # yet). Everything below tests what the machinery does when it IS on, so the switch
+    # is turned on here explicitly rather than silently inherited -- and
+    # test_signature_switch.py separately pins that the default is off and that every
+    # door really is closed when it is.
+    ns.setdefault("SIGNATURE_ENABLED", True)
+    ns["SIGNATURE_ENABLED"] = True
     return ns
 
 
