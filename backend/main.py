@@ -64,7 +64,7 @@ async def send_telegram_alert(message: str, chat_id: str = None):
     if not bot_token or not target_chat_id:
         return
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
                 f"https://api.telegram.org/bot{bot_token}/sendMessage",
                 json={"chat_id": target_chat_id, "text": message, "parse_mode": "HTML"}
@@ -245,6 +245,84 @@ async def refresh_market_pulse_loop():
                 f"⚠️ <b>NestList Warning</b>\n\nMarket Pulse auto-refresh from URA failed: {e}\n\nThe panel will keep showing its last known values.")
         await asyncio.sleep(86400)  # URA recommends refreshing daily
 
+# Facebook Page access tokens minted at connect time last about 60 days and then
+# stop working SILENTLY -- the agent's scheduled Facebook/Instagram posts simply
+# start failing with no warning. A Page connected in December would lapse around
+# February and nobody would know until a post didn't go out. This daily check asks
+# Facebook for each connected token's real expiry (the debug_token endpoint) and
+# warns on Telegram while there is still time to reconnect. It reads the live
+# expiry rather than storing one, so it needs no schema change and self-corrects
+# the moment an agent reconnects. Same throttled-Telegram pattern as the alerts above.
+FB_TOKEN_EXPIRY_WARN_WITHIN_DAYS = 10
+
+async def _check_fb_page_token_expiries():
+    app_id = os.environ.get("FB_APP_ID", "")
+    app_secret = os.environ.get("FB_APP_SECRET", "")
+    # Without the app credentials a token cannot be validated -- nothing to do, the
+    # same degrade-quietly stance as every other optional integration in this file.
+    if not (app_id and app_secret):
+        return
+    result = await db_execute_async(
+        lambda db: db.table("agents").select(
+            "id, name, email, fb_page_id, fb_page_name, fb_page_access_token"),
+        what="fb_token_expiry agents select")
+    agents = [a for a in (result.data or []) if a.get("fb_page_access_token")]
+    if not agents:
+        return
+    app_token = f"{app_id}|{app_secret}"
+    now = time.time()
+    warn_horizon = now + FB_TOKEN_EXPIRY_WARN_WITHIN_DAYS * 86400
+    async with httpx.AsyncClient(timeout=10) as client:
+        for agent in agents:
+            try:
+                resp = await client.get(
+                    "https://graph.facebook.com/v25.0/debug_token",
+                    params={"input_token": agent["fb_page_access_token"],
+                            "access_token": app_token},
+                )
+                data = resp.json().get("data", {})
+            except Exception:
+                # A network/Facebook blip on one token: skip it, tomorrow's run retries.
+                # One flaky lookup must not stop the others being checked.
+                continue
+            page = agent.get("fb_page_name") or agent.get("fb_page_id") or "their Facebook Page"
+            who = agent.get("name") or agent.get("email") or agent["id"]
+            expires_at = data.get("expires_at")
+            is_valid = data.get("is_valid", True)
+            # Per-agent throttle key: one agent's warning never suppresses another's,
+            # and a 24h cooldown turns the daily loop into a daily reminder (within the
+            # warning window) rather than a flood.
+            throttle_key = f"fb_token_expiry_{agent['id']}"
+            if not is_valid:
+                await send_telegram_alert_throttled(
+                    throttle_key,
+                    f"🚨 <b>NestList Alert</b>\n\n{who}'s Facebook connection ({page}) has "
+                    f"STOPPED WORKING — their auto-posts to Facebook/Instagram will fail until "
+                    f"they reconnect (My Profile → Connect Facebook).",
+                    cooldown_seconds=86400,
+                )
+            elif isinstance(expires_at, (int, float)) and 0 < expires_at <= warn_horizon:
+                days_left = max(0, int((expires_at - now) // 86400))
+                when = datetime.utcfromtimestamp(expires_at).strftime("%d %b %Y")
+                await send_telegram_alert_throttled(
+                    throttle_key,
+                    f"⚠️ <b>NestList Warning</b>\n\n{who}'s Facebook connection ({page}) expires "
+                    f"in {days_left} day(s) (on {when}). Ask them to reconnect "
+                    f"(My Profile → Connect Facebook) before then, or their auto-posts will stop.",
+                    cooldown_seconds=86400,
+                )
+
+async def fb_token_expiry_check_loop():
+    # Runs only on the single worker that owns the daily refresh (see startup_event),
+    # so 4 uvicorn workers don't each ping Facebook for every token. Never raises out
+    # of the loop -- one bad day must not kill the daily cadence.
+    while True:
+        try:
+            await _check_fb_page_token_expiries()
+        except Exception as e:
+            logger.warning("FB Page token expiry check failed: %s", e)
+        await asyncio.sleep(86400)
+
 # Strong references to fire-and-forget startup tasks, so they can't be garbage-collected
 # mid-run.
 _BACKGROUND_TASKS = set()
@@ -254,6 +332,9 @@ async def startup_event():
     asyncio.create_task(monitor_api_key())
     if _acquire_refresh_singleton():
         asyncio.create_task(refresh_market_pulse_loop())
+        # Same single-owner worker runs the daily Facebook Page token expiry check,
+        # so only one worker pings Facebook per token per day.
+        asyncio.create_task(fb_token_expiry_check_loop())
         logger.info("This worker owns the Market Pulse daily refresh loop.")
         # No separate CMA warm-up here: the loop's first pull (right now) seeds the CMA copy.
     else:
@@ -1078,7 +1159,9 @@ def login(req: LoginRequest, request: Request):
     if _rate_limited(_login_failure_hits, client_ip, limit=10, window_seconds=600, record=False):
         raise HTTPException(status_code=429, detail="Too many login attempts — please try again in a few minutes")
 
-    result = get_db().table("agents").select("*").eq("email", req.email).execute()
+    result = db_execute(
+        lambda db: db.table("agents").select("*").eq("email", req.email),
+        what="login agents select")
     agent = result.data[0] if result.data else None
     if agent is None or not verify_password(req.password, agent["password_hash"]):
         # Unknown email and wrong password are counted and answered identically.
@@ -1131,7 +1214,9 @@ def _handle_available(h):
     if not _handle_valid(h):
         return False
     try:
-        existing = get_db().table("agents").select("id").ilike("code", h).limit(1).execute()
+        existing = db_execute(
+            lambda db: db.table("agents").select("id").ilike("code", h).limit(1),
+            what="handle_available agents select")
     except Exception:
         return False
     return not existing.data
