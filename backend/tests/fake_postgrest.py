@@ -62,6 +62,10 @@ class _Query:
         self.filters.append(("lt", column, value))
         return self
 
+    def neq(self, column, value):
+        self.filters.append(("neq", column, value))
+        return self
+
     def gt(self, column, value):
         self.filters.append(("gt", column, value))
         return self
@@ -88,6 +92,9 @@ class _Query:
             current = row.get(column)
             if kind == "eq":
                 if current != value:
+                    return False
+            elif kind == "neq":
+                if current == value:
                     return False
             elif kind == "in":
                 if current not in value:

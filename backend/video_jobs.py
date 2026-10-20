@@ -1103,7 +1103,27 @@ def describe(job):
             .lt("created_at", job["created_at"]),
             what="video_jobs position queued")
         ahead = int(getattr(ahead_queued, "count", None) or len(ahead_queued.data or []))
-        ahead += _running_count_cached(job_type)
+        # Running jobs count as ahead -- EXCEPT this one.
+        #
+        # `job` is the row as it was when it was enqueued, and a worker can claim it
+        # between that insert and this call. When that happens the job is already
+        # RUNNING, so counting running jobs by type counts the job against itself: the
+        # agent who is first in the queue is told "2nd in line" and quoted roughly
+        # double the real wait. Seen on the first two production Signatures, both of
+        # which said "2nd in line, about 3 minutes" with an empty queue behind them.
+        #
+        # Excluding by id rather than re-reading the status also covers the simpler
+        # race where it is claimed a moment after we read it. Uncached deliberately:
+        # describe() runs once per generate request, not per poll, so the load this
+        # cache exists to prevent does not arise here, and a two-second-stale count is
+        # exactly what produces the off-by-one.
+        running_others = _exec(
+            lambda db: db.table(TABLE).select("id", count="exact")
+            .eq("job_type", job_type).eq("status", STATUS_RUNNING)
+            .neq("id", job["id"]),
+            what="video_jobs position running")
+        ahead += int(getattr(running_others, "count", None)
+                     or len(running_others.data or []))
     except Exception:
         return out
 
