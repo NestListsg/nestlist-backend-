@@ -43,6 +43,9 @@ if COVER:
     threading.settrace(_tracer)
 
 import ura_market_pulse as NEW  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+# Each test run gets its own snapshot directory (the shared on-disk copy).
+NEW.URA_SNAPSHOT_DIR = _tempfile.mkdtemp(prefix="nl-ura-snap-")
 
 _spec = importlib.util.spec_from_file_location(
     "ura_pre_condo", os.path.join(_HERE, "golden", "ura_market_pulse_pre_condo.py"))
@@ -202,11 +205,12 @@ class FakeURA:
     async def token(self, key):
         return "tok"
 
-    async def fetch(self, key, token, batch_timeout=None):
+    async def fetch(self, key, token, batch_timeout=None, on_batch=None):
         return list(self.projects), [{"batch": b, "ok": True} for b in (1, 2, 3, 4)]
 
 
 def reset_cache():
+    NEW._clear_shared_snapshot()
     NEW._cma_cache.update({"projects": None, "fetched_at": 0.0, "as_of": None, "last_failure_at": 0.0,
                            "partial_projects": None, "partial_at": 0.0, "partial_as_of": None})
     NEW._cma_lock = None

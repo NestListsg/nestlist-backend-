@@ -39,6 +39,9 @@ BACKEND = os.path.dirname(_HERE)
 sys.path.insert(0, BACKEND)
 
 import ura_market_pulse as NEW  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+# Each test run gets its own snapshot directory (the shared on-disk copy).
+NEW.URA_SNAPSHOT_DIR = _tempfile.mkdtemp(prefix="nl-ura-snap-")
 import video_renderer as VR     # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
@@ -206,7 +209,7 @@ class FakeURA:
     async def token(self, key):
         return "tok"
 
-    async def fetch(self, key, token, batch_timeout=None):
+    async def fetch(self, key, token, batch_timeout=None, on_batch=None):
         self.calls += 1
         self.batch_timeout = batch_timeout
         self.active = getattr(self, "active", 0) + 1
@@ -226,6 +229,7 @@ class FakeURA:
 
 
 def reset_cache():
+    NEW._clear_shared_snapshot()
     NEW._cma_cache.update({"projects": None, "fetched_at": 0.0, "as_of": None, "last_failure_at": 0.0,
                            "partial_projects": None, "partial_at": 0.0, "partial_as_of": None})
     NEW._cma_lock = None
@@ -303,6 +307,7 @@ async def scenario_swr():
     install(FakeURA())
     await NEW.generate_cma("Nassim Road", "", 0, 24)
     NEW._cma_cache["fetched_at"] -= NEW.CMA_CACHE_TTL_SECONDS + 1     # expired, < 7 days
+    NEW._clear_shared_snapshot()   # the on-disk copy is just as old
     slow = FakeURA(delay=1.0)
     install(slow)
     t0 = time.time()
@@ -324,6 +329,7 @@ async def scenario_outage():
     install(FakeURA())
     await NEW.generate_cma("Nassim Road", "", 0, 24)
     NEW._cma_cache["fetched_at"] -= NEW.CMA_CACHE_TTL_SECONDS + 1
+    NEW._clear_shared_snapshot()   # the on-disk copy is just as old
     down = FakeURA(fail=RuntimeError("URA down"))
     install(down)
     r = await NEW.generate_cma("Nassim Road", "", 0, 24)
@@ -345,6 +351,7 @@ async def scenario_outage():
     install(FakeURA())
     await NEW.generate_cma("Nassim Road", "", 0, 24)
     NEW._cma_cache["fetched_at"] -= NEW.CMA_MAX_STALE_SECONDS + 1     # far too old
+    NEW._clear_shared_snapshot()   # the on-disk copy is just as old
     install(FakeURA(fail=RuntimeError("URA down")))
     try:
         await NEW.generate_cma("Nassim Road", "", 0, 24)
@@ -433,6 +440,7 @@ async def scenario_one_download():
     install(FakeURA())
     await NEW.generate_cma("Nassim Road", "", 0, 24)
     NEW._cma_cache["fetched_at"] -= NEW.CMA_CACHE_TTL_SECONDS + 1     # expired -> background refresh
+    NEW._clear_shared_snapshot()   # the on-disk copy is just as old
     fake = FakeURA(delay=0.3)
     install(fake)
     await asyncio.gather(NEW.refresh_market_pulse(), NEW.generate_cma("Nassim Road", "", 0, 24))

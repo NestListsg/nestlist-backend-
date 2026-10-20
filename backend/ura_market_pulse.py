@@ -189,7 +189,8 @@ async def get_token(access_key: str) -> str:
         return token
 
 
-async def fetch_all_transactions(access_key: str, token: str, batch_timeout: float = None):
+async def fetch_all_transactions(access_key: str, token: str, batch_timeout: float = None,
+                                 on_batch=None):
     """Fetch all 4 batches of PMI_Resi_Transaction (split by postal district
     ranges). GCB areas live in specific districts (D10/D11/D21/D23 etc.) that
     fall in specific batches, so a single dropped batch silently removes whole
@@ -207,7 +208,12 @@ async def fetch_all_transactions(access_key: str, token: str, batch_timeout: flo
     batch_timeout (seconds, optional): a hard ceiling on ONE batch, retries included. A
     batch that runs past it is recorded as failed and the next batch still runs, so the
     batches that did finish are kept. None (the Market Pulse refresh) = no extra ceiling,
-    exactly the original behaviour."""
+    exactly the original behaviour.
+
+    on_batch (optional): called with each successful batch's projects (in a worker
+    thread) INSTEAD of collecting them -- the caller turns each batch into its compact form
+    and the parsed JSON is freed before the next batch arrives, so peak memory is about
+    one batch, not four. The returned project list is then empty."""
     headers = {**BROWSER_HEADERS, "AccessKey": access_key, "Token": token}
     all_projects = []
     batch_report = []
@@ -223,9 +229,13 @@ async def fetch_all_transactions(access_key: str, token: str, batch_timeout: flo
                 status = data.get("Status")
                 if status == "Success":
                     projects = data.get("Result", []) or []
-                    all_projects.extend(projects)
+                    if on_batch is not None:
+                        await asyncio.to_thread(on_batch, projects)
+                    else:
+                        all_projects.extend(projects)
                     batch_report.append({"batch": batch, "ok": True, "status": status,
                                          "projects": len(projects), "message": None})
+                    del data, projects
                 else:
                     # Valid JSON but not a success (rate-limit, token expiry mid-run,
                     # a URA-side error). Previously this was printed and skipped, which
@@ -958,13 +968,391 @@ def _slim_projects(projects: list) -> list:
     return slim
 
 
-def store_cma_projects(projects: list, already_slim: bool = False) -> None:
-    """Seed the CMA cache from a COMPLETE (all four batches) fetch -- the daily Market
-    Pulse refresh calls this so the worker that owns it never fetches twice."""
+# ---------------------------------------------------------------------------
+# COMPACT MARKET COPY + ONE SHARED SNAPSHOT PER CONTAINER (memory).
+#
+# Measured on a synthetic 125k-transaction market: the slimmed list-of-dicts copy is
+# ~55 MB of objects, but a worker that parsed the raw feed then sits at ~260 MB, because
+# the freed JSON objects are not handed back to the OS. With 4 workers each pulling and
+# keeping their own copy that is ~1 GB -- the jump seen after the condo launch.
+#
+# Now:
+#   * The copy is COLUMNS (one array per field, strings stored once in a vocabulary):
+#     a few MB instead of ~55 MB, with the same answers (materialised back into exactly
+#     the dicts _slim_projects produced, for the few projects a report actually touches).
+#   * The raw feed is turned into columns ONE BATCH AT A TIME, so the worker that pulls
+#     peaks at roughly one batch of parsed JSON instead of all four.
+#   * ONE worker per container pulls from URA (a cross-worker file lock); it writes the
+#     compact copy to an on-disk snapshot by atomic rename, and the other workers load
+#     that snapshot instead of pulling and parsing the feed themselves. A reader always
+#     sees either the old file or the new one, never half of one.
+#   * The disk is per-deploy and may be empty: no snapshot just means "pull", exactly as
+#     before; any disk trouble falls back to the per-worker behaviour, never to an error.
+# The serialisation is `marshal` of plain lists/bytes (no code execution on load, unlike
+# pickle), in a 0700 directory only this service writes.
+# ---------------------------------------------------------------------------
+import array as _array
+import marshal as _marshal
+import math as _math
+import sys as _sys
+
+_STR_FIELDS = ("typeOfArea", "propertyType", "contractDate", "district", "tenure", "floorRange",
+               "typeOfSale", "noOfUnits")
+_SNAPSHOT_VERSION = 1
+
+
+class CompactMarket:
+    """The CMA market copy as columns. Read-only once built (safe to share across the
+    worker's threads). candidates() returns, in the ORIGINAL feed order, every project a
+    report could possibly use -- so running the unchanged extraction code on that small
+    list gives exactly the result it gives on the full market."""
+
+    def __init__(self):
+        self.streets, self.names = [], []
+        self.starts = _array.array("I", [0])
+        self.cols = {f: _array.array("I") for f in _STR_FIELDS}
+        self.price, self.area = _array.array("d"), _array.array("d")
+        self.vocab, self._vocab_index = [], {}
+        self.odd = {}           # txn index -> the original slim dict (rows that don't fit)
+        self._finish_indexes()
+
+    # -- building ---------------------------------------------------------------------
+    def _v(self, s):
+        i = self._vocab_index.get(s)
+        if i is None:
+            i = self._vocab_index[s] = len(self.vocab)
+            self.vocab.append(_sys.intern(s))
+        return i
+
+    def add_projects(self, projects) -> None:
+        """Append raw (or slim) projects. Same keep/skip rules as _slim_projects."""
+        intern = _sys.intern
+        for p in projects or []:
+            if not isinstance(p, dict):
+                continue
+            rows = [t for t in (p.get("transaction", []) or []) if isinstance(t, dict)]
+            if not rows:
+                continue
+            street, name = p.get("street", ""), p.get("project", "")
+            self.streets.append(intern(street) if isinstance(street, str) else street)
+            self.names.append(intern(name) if isinstance(name, str) else name)
+            for t in rows:
+                idx = len(self.price)
+                normal = all(isinstance(t.get(f), str) for f in _STR_FIELDS)
+                if normal:
+                    try:
+                        price, area = float(t["price"]), float(t["area"])
+                        normal = (isinstance(t["price"], (str, int, float)) and not isinstance(t["price"], bool)
+                                  and isinstance(t["area"], (str, int, float)) and not isinstance(t["area"], bool)
+                                  and _math.isfinite(price) and _math.isfinite(area))
+                    except (KeyError, TypeError, ValueError):
+                        normal = False
+                if normal:
+                    for f in _STR_FIELDS:
+                        self.cols[f].append(self._v(t[f]))
+                    self.price.append(price)
+                    self.area.append(area)
+                else:
+                    for f in _STR_FIELDS:
+                        self.cols[f].append(0)
+                    self.price.append(0.0)
+                    self.area.append(0.0)
+                    self.odd[idx] = {k: (intern(v) if isinstance(v, str) else v)
+                                     for k, v in t.items() if k in _TXN_KEEP}
+            self.starts.append(len(self.price))
+
+    def _finish_indexes(self) -> None:
+        by_street, by_name = {}, {}
+        for i, (s, n) in enumerate(zip(self.streets, self.names)):
+            by_street.setdefault(s, []).append(i)
+            by_name.setdefault(n, []).append(i)
+        self._by_street = by_street
+        self._by_name = {n: (_project_tokens(n), idx) for n, idx in by_name.items()}
+        self._gcb = [i for i, s in enumerate(self.streets) if _street_in_gcb_whitelist(s or "")]
+        self._street_hits = {}
+
+    def finish(self):
+        self._finish_indexes()
+        return self
+
+    # -- reading ----------------------------------------------------------------------
+    @property
+    def project_count(self) -> int:
+        return len(self.streets)
+
+    @property
+    def txn_count(self) -> int:
+        return len(self.price)
+
+    def __len__(self):
+        return len(self.streets)
+
+    def _project(self, i: int) -> dict:
+        txns = []
+        vocab, cols = self.vocab, self.cols
+        for j in range(self.starts[i], self.starts[i + 1]):
+            odd = self.odd.get(j)
+            if odd is not None:
+                txns.append(dict(odd))
+                continue
+            t = {f: vocab[cols[f][j]] for f in _STR_FIELDS}
+            t["price"] = self.price[j]
+            t["area"] = self.area[j]
+            txns.append(t)
+        return {"street": self.streets[i], "project": self.names[i], "transaction": txns}
+
+    def projects(self, indexes) -> list:
+        return [self._project(i) for i in sorted(set(indexes))]
+
+    def materialise_all(self) -> list:
+        return [self._project(i) for i in range(len(self.streets))]
+
+    def gcb_projects(self) -> list:
+        """Every project on a GCB-whitelisted street -- all Market Pulse stats read."""
+        return [self._project(i) for i in self._gcb]
+
+    def _street_indexes(self, street_keyword) -> list:
+        if not street_keyword:
+            return []
+        hit = self._street_hits.get(street_keyword)
+        if hit is None:
+            match = _street_matcher(street_keyword)
+            hit = []
+            for s, idx in self._by_street.items():
+                if match(s):
+                    hit.extend(idx)
+            if len(self._street_hits) > 512:
+                self._street_hits = {}
+            self._street_hits[street_keyword] = hit
+        return hit
+
+    def candidates(self, street_keyword: str, project_name: str = "") -> list:
+        """Projects (original order) on a street matching street_keyword, plus -- when a
+        project name is given -- every project whose name is an exact or close match to
+        it. A superset of everything extract_comparable_transactions and
+        _extract_strata_comparables_detailed can use, so their output is identical."""
+        idx = list(self._street_indexes(street_keyword))
+        wanted = _project_tokens(project_name) if project_name else ()
+        if wanted:
+            for tokens, ids in self._by_name.values():
+                if tokens == wanted or _is_close_project(wanted, tokens):
+                    idx.extend(ids)
+        return self.projects(idx)
+
+    # -- snapshot ---------------------------------------------------------------------
+    def to_state(self) -> dict:
+        return {"streets": self.streets, "names": self.names, "starts": self.starts.tobytes(),
+                "cols": {f: self.cols[f].tobytes() for f in _STR_FIELDS},
+                "price": self.price.tobytes(), "area": self.area.tobytes(),
+                "vocab": self.vocab, "odd": self.odd}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "CompactMarket":
+        m = cls.__new__(cls)
+        intern = _sys.intern
+        m.streets = [intern(s) if isinstance(s, str) else s for s in state["streets"]]
+        m.names = [intern(s) if isinstance(s, str) else s for s in state["names"]]
+        m.starts = _array.array("I")
+        m.starts.frombytes(state["starts"])
+        m.cols = {}
+        for f in _STR_FIELDS:
+            m.cols[f] = _array.array("I")
+            m.cols[f].frombytes(state["cols"][f])
+        m.price, m.area = _array.array("d"), _array.array("d")
+        m.price.frombytes(state["price"])
+        m.area.frombytes(state["area"])
+        m.vocab = [intern(s) for s in state["vocab"]]
+        m._vocab_index = {s: i for i, s in enumerate(m.vocab)}
+        m.odd = {int(k): v for k, v in state["odd"].items()}
+        n = len(m.price)
+        if (len(m.starts) != len(m.streets) + 1 or m.starts[-1] != n or len(m.area) != n
+                or any(len(c) != n for c in m.cols.values()) or len(m.names) != len(m.streets)):
+            raise ValueError("snapshot columns are inconsistent")
+        return m._finish_indexes() or m
+
+
+def _compact_from_projects(projects) -> CompactMarket:
+    m = CompactMarket()
+    m.add_projects(projects)
+    return m.finish()
+
+
+def _street_matcher(keyword):
+    """A one-keyword version of _matches_street_keyword(street, keyword), with the keyword
+    cleaned once instead of once per street. Same answer for every street (tested)."""
+    if not keyword:
+        return lambda street: False
+    cleaned = _strip_address_prefix(keyword).lower()
+    if not cleaned:
+        return lambda street: False
+    words = [w for w in re.findall(r"[a-z]+", cleaned) if w not in _GENERIC_STREET_SUFFIXES]
+
+    def match(street):
+        s = (street or "").lower()
+        if cleaned in s:
+            return True
+        return bool(words) and all(w in s for w in words)
+    return match
+
+
+# --- the shared on-disk snapshot ---------------------------------------------------------
+URA_SNAPSHOT_DIR = os.environ.get("URA_SNAPSHOT_DIR", "/tmp/nestlist_ura_snapshot")
+# A worker waits this long for a sibling's URA pull before pulling itself (cold start: the
+# sibling's pull IS this request's pull, exactly like the in-worker single-flight).
+CMA_CROSS_WORKER_WAIT_SECONDS = 4 * CMA_BATCH_BUDGET_SECONDS + 60
+
+
+def _snapshot_dir():
+    """The private snapshot directory, or None if it can't be used safely."""
+    try:
+        os.makedirs(URA_SNAPSHOT_DIR, mode=0o700, exist_ok=True)
+        st = os.stat(URA_SNAPSHOT_DIR)
+        if not os.path.isdir(URA_SNAPSHOT_DIR) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+            return None
+        return URA_SNAPSHOT_DIR
+    except OSError:
+        return None
+
+
+def _snapshot_path(kind: str):
+    d = _snapshot_dir()
+    return os.path.join(d, f"cma_{kind}.snapshot") if d else None
+
+
+def _write_snapshot(market: CompactMarket, fetched_at: float, as_of: str, kind: str = "complete") -> bool:
+    """Atomic: write a temp file in the same directory, fsync, rename over the old one.
+    Never raises (a failed write only means siblings pull for themselves)."""
+    path = _snapshot_path(kind)
+    if not path:
+        return False
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        blob = _marshal.dumps({"v": _SNAPSHOT_VERSION, "fetched_at": float(fetched_at), "as_of": as_of,
+                               "state": market.to_state()})
+        with open(tmp, "wb") as fh:
+            fh.write(blob)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        print(f"URA snapshot not written (harmless): {type(e).__name__}: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _snapshot_mtime(kind: str = "complete"):
+    path = _snapshot_path(kind)
+    try:
+        return os.stat(path).st_mtime if path else None
+    except OSError:
+        return None
+
+
+def _read_snapshot(kind: str = "complete"):
+    """-> (market, fetched_at, as_of) or None. Never raises."""
+    path = _snapshot_path(kind)
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            data = _marshal.loads(fh.read())
+        if not isinstance(data, dict) or data.get("v") != _SNAPSHOT_VERSION:
+            return None
+        return CompactMarket.from_state(data["state"]), float(data["fetched_at"]), data.get("as_of")
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"URA snapshot unreadable, ignored: {type(e).__name__}: {e}")
+        return None
+
+
+def _clear_shared_snapshot() -> None:
+    """Remove the on-disk snapshots (tests; also safe to call any time)."""
+    for kind in ("complete", "partial", "failed"):
+        path = _snapshot_path(kind)
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _mark_shared_failure() -> None:
+    path = _snapshot_path("failed")
+    if path:
+        try:
+            with open(path, "w") as fh:
+                fh.write("1")
+        except OSError:
+            pass
+
+
+class _CrossWorkerPullLock:
+    """async context manager: hold the container-wide URA pull lock (flock, non-blocking
+    polls so the event loop never blocks). .acquired is False if the wait ran out or the
+    lock file can't be used -- the caller then pulls anyway (the old behaviour)."""
+
+    def __init__(self, wait_seconds: float):
+        self.wait_seconds, self.acquired, self._fh = wait_seconds, False, None
+        self.waited = False
+
+    async def __aenter__(self):
+        import fcntl
+        import time
+        d = _snapshot_dir()
+        if not d:
+            return self
+        try:
+            self._fh = open(os.path.join(d, "pull.lock"), "a+")
+        except OSError:
+            return self
+        deadline = time.monotonic() + self.wait_seconds
+        while True:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                return self
+            except OSError:
+                self.waited = True
+                if time.monotonic() >= deadline:
+                    return self
+                await asyncio.sleep(0.25)
+
+    async def __aexit__(self, *exc):
+        if self._fh is not None:
+            try:
+                self._fh.close()      # releases the flock
+            except OSError:
+                pass
+        return False
+
+
+def _release_freed_memory() -> None:
+    """After a pull: collect, and on Linux ask glibc to hand freed heap back to the OS
+    (otherwise the worker keeps the parse's high-water mark). Best effort, never raises."""
+    try:
+        import gc
+        gc.collect()
+        if _sys.platform.startswith("linux"):
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def store_cma_projects(projects, already_slim: bool = False, fetched_at: float = None,
+                       as_of: str = None) -> None:
+    """Seed the CMA cache from a COMPLETE (all four batches) copy. `projects` is a
+    CompactMarket or a raw/slim project list (compacted here)."""
     import time
-    _cma_cache["projects"] = projects if already_slim else _slim_projects(projects)
-    _cma_cache["fetched_at"] = time.time()
-    _cma_cache["as_of"] = _sgt_today().isoformat()
+    _cma_cache["projects"] = (projects if isinstance(projects, CompactMarket)
+                              else _compact_from_projects(projects))
+    _cma_cache["fetched_at"] = time.time() if fetched_at is None else fetched_at
+    _cma_cache["as_of"] = as_of or _sgt_today().isoformat()
     _cma_cache["partial_projects"] = None
 
 
@@ -1023,49 +1411,115 @@ def _partial_meta():
                                             "stale": False, "partial": True}
 
 
+async def _pull_compact(access_key: str, token: str, batch_timeout):
+    """One URA pull, compacted batch by batch. -> (CompactMarket, batch_report)."""
+    market = CompactMarket()
+    projects, batch_report = await fetch_all_transactions(
+        access_key, token, batch_timeout=batch_timeout, on_batch=market.add_projects)
+    if projects:      # a fetcher that returned the projects instead of streaming them
+        await asyncio.to_thread(market.add_projects, projects)
+    del projects
+    await asyncio.to_thread(market.finish)
+    _release_freed_memory()
+    return market, batch_report
+
+
+async def _adopt_shared_snapshot(max_age: float) -> bool:
+    """Load a sibling worker's complete snapshot if it is younger than max_age and newer
+    than this worker's own copy. Never raises."""
+    import time
+    mtime = _snapshot_mtime("complete")
+    if mtime is None or time.time() - mtime >= max_age or mtime <= _cma_cache["fetched_at"] + 0.5:
+        return False
+    got = await asyncio.to_thread(_read_snapshot, "complete")
+    if not got:
+        return False
+    market, fetched_at, as_of = got
+    if time.time() - fetched_at >= max_age or fetched_at <= _cma_cache["fetched_at"]:
+        return False
+    store_cma_projects(market, fetched_at=fetched_at, as_of=as_of)
+    return True
+
+
+async def _adopt_shared_partial() -> bool:
+    """A sibling's partial pull from the last cool-down window, served flagged partial."""
+    import time
+    mtime = _snapshot_mtime("partial")
+    if mtime is None or time.time() - mtime >= CMA_FAILURE_COOLDOWN_SECONDS:
+        return False
+    got = await asyncio.to_thread(_read_snapshot, "partial")
+    if not got:
+        return False
+    market, fetched_at, as_of = got
+    _cma_cache["partial_projects"] = market
+    _cma_cache["partial_at"] = fetched_at
+    _cma_cache["partial_as_of"] = as_of
+    return True
+
+
 async def _fetch_into_cache() -> bool:
-    """ONE pull from URA into the cache. Never raises.
+    """ONE pull from URA into the cache -- or, when a sibling worker already pulled, its
+    snapshot. Never raises.
 
     Returns True when a complete copy was stored. On a partial pull (some batches failed
     or ran out of time) the batches that DID arrive are kept as a short-lived partial copy:
-    served, flagged partial, never promoted to the 12-hour copy. Caller holds _cma_lock."""
+    served, flagged partial, never promoted to the 12-hour copy. Caller holds _cma_lock.
+
+    Across workers: only the worker holding the container-wide pull lock talks to URA.
+    The others wait for it (as requests already wait for the in-worker pull), then load
+    its snapshot -- or, if it failed, take the same cool-down (and its partial copy)."""
     import time
     access_key = os.environ.get("URA_ACCESS_KEY", "")
     if not access_key:
         return False
-    try:
-        token = await get_token(access_key)
-        projects, batch_report = await fetch_all_transactions(
-            access_key, token, batch_timeout=CMA_BATCH_BUDGET_SECONDS)
-    except Exception as e:
-        _cma_cache["last_failure_at"] = time.time()
-        print(f"CMA URA fetch failed: {type(e).__name__}: {e}")
-        _alert_failure(f"URA comparables fetch failed ({type(e).__name__}). Pricing reports are "
-                       "serving the last saved copy if there is one; retrying in a few minutes.")
-        return False
-
-    ok = len(batch_report) == 4 and all(b.get("ok") for b in batch_report)
-    if ok:
-        # Slimming walks every transaction in the market -- off the event loop, so the
-        # worker's other requests aren't held up while it runs.
-        store_cma_projects(await asyncio.to_thread(_slim_projects, projects), already_slim=True)
+    if await _adopt_shared_snapshot(CMA_CACHE_TTL_SECONDS):
         return True
-
-    _cma_cache["last_failure_at"] = time.time()
-    failed = [b.get("batch") for b in batch_report if not b.get("ok")]
-    print(f"CMA URA fetch partial: batches {failed} failed")
-    _alert_failure(f"URA comparables fetch incomplete: batches {failed} failed. Pricing reports "
-                   "use the last complete copy if there is one, otherwise flag results as partial.")
-    if projects:
-        _cma_cache["partial_projects"] = await asyncio.to_thread(_slim_projects, projects)
-        _cma_cache["partial_at"] = time.time()
-        _cma_cache["partial_as_of"] = _sgt_today().isoformat()
-        # Free it when the cool-down ends rather than holding it until the next request.
+    started = time.time()
+    async with _CrossWorkerPullLock(CMA_CROSS_WORKER_WAIT_SECONDS) as pull_lock:
+        if pull_lock.waited:
+            # A sibling was pulling while we waited: use its result if it got one.
+            if await _adopt_shared_snapshot(CMA_CACHE_TTL_SECONDS):
+                return True
+            failed_at = _snapshot_mtime("failed")
+            if failed_at is not None and failed_at >= started - 1:
+                _cma_cache["last_failure_at"] = time.time()
+                await _adopt_shared_partial()
+                return False
         try:
-            asyncio.get_running_loop().call_later(CMA_FAILURE_COOLDOWN_SECONDS + 0.1, _drop_expired_partial)
-        except Exception:
-            pass
-    return False
+            token = await get_token(access_key)
+            market, batch_report = await _pull_compact(access_key, token, CMA_BATCH_BUDGET_SECONDS)
+        except Exception as e:
+            _cma_cache["last_failure_at"] = time.time()
+            _mark_shared_failure()
+            print(f"CMA URA fetch failed: {type(e).__name__}: {e}")
+            _alert_failure(f"URA comparables fetch failed ({type(e).__name__}). Pricing reports are "
+                           "serving the last saved copy if there is one; retrying in a few minutes.")
+            return False
+
+        now = time.time()
+        ok = len(batch_report) == 4 and all(b.get("ok") for b in batch_report)
+        if ok:
+            store_cma_projects(market, fetched_at=now)
+            await asyncio.to_thread(_write_snapshot, market, now, _cma_cache["as_of"], "complete")
+            return True
+
+        _cma_cache["last_failure_at"] = time.time()
+        _mark_shared_failure()
+        failed = [b.get("batch") for b in batch_report if not b.get("ok")]
+        print(f"CMA URA fetch partial: batches {failed} failed")
+        _alert_failure(f"URA comparables fetch incomplete: batches {failed} failed. Pricing reports "
+                       "use the last complete copy if there is one, otherwise flag results as partial.")
+        if market.project_count:
+            _cma_cache["partial_projects"] = market
+            _cma_cache["partial_at"] = now
+            _cma_cache["partial_as_of"] = _sgt_today().isoformat()
+            await asyncio.to_thread(_write_snapshot, market, now, _cma_cache["partial_as_of"], "partial")
+            # Free it when the cool-down ends rather than holding it until the next request.
+            try:
+                asyncio.get_running_loop().call_later(CMA_FAILURE_COOLDOWN_SECONDS + 0.1, _drop_expired_partial)
+            except Exception:
+                pass
+        return False
 
 
 def _ensure_background_refresh() -> None:
@@ -1144,6 +1598,10 @@ async def generate_cma(street_keyword: str, property_type: str = "", land_size_s
     (it is a strata unit), with a premium caveat in valuation_caveat."""
     projects, meta = await _get_cma_projects()
     ura_types = cma_strata_types(property_type)
+    if isinstance(projects, CompactMarket):
+        # Only the projects this report can use, as the same dicts as before (original
+        # order) -- indexed lookups instead of walking the whole market.
+        projects = projects.candidates(street_keyword, project_name if ura_types else "")
     if ura_types:
         # Extraction walks the whole market: off the event loop so 50 agents' reports
         # don't hold up each other's requests on this worker.
@@ -1225,6 +1683,9 @@ async def refresh_market_pulse(include_survey: bool = False) -> dict:
     reused = False
     async with _get_cma_lock():
         import time
+        # A sibling worker's pull from the last few minutes counts as "just downloaded".
+        if not include_survey:
+            await _adopt_shared_snapshot(PULSE_REUSE_CMA_COPY_SECONDS)
         age = time.time() - _cma_cache["fetched_at"]
         if (not include_survey and _cma_cache["projects"] is not None
                 and age < PULSE_REUSE_CMA_COPY_SECONDS):
@@ -1238,13 +1699,25 @@ async def refresh_market_pulse(include_survey: bool = False) -> dict:
                             for b in (1, 2, 3, 4)]
             reused = True
         else:
-            projects, batch_report = await fetch_all_transactions(access_key, token)
-            if len(batch_report) == 4 and all(b["ok"] for b in batch_report) and projects:
+            async with _CrossWorkerPullLock(CMA_CROSS_WORKER_WAIT_SECONDS) as pull_lock:
+                if (not include_survey and pull_lock.waited
+                        and await _adopt_shared_snapshot(PULSE_REUSE_CMA_COPY_SECONDS)):
+                    # A sibling finished a pull while we waited: use it.
+                    projects = _cma_cache["projects"]
+                    batch_report = [{"batch": b, "ok": True, "status": "Reused", "projects": 0,
+                                     "message": "reused a sibling worker's download"} for b in (1, 2, 3, 4)]
+                    reused = True
+                else:
+                    projects, batch_report = await _pull_compact(access_key, token, None)
+            if not reused and len(batch_report) == 4 and all(b["ok"] for b in batch_report) and projects.project_count:
                 # A complete pull is exactly what CMA needs too: hand it over -- still
                 # inside the lock, so a CMA refresh queued behind us finds it fresh and
-                # downloads nothing. Never allowed to break the refresh itself.
+                # downloads nothing -- and to the sibling workers via the snapshot.
+                # Never allowed to break the refresh itself.
                 try:
-                    store_cma_projects(await asyncio.to_thread(_slim_projects, projects), already_slim=True)
+                    now = time.time()
+                    store_cma_projects(projects, fetched_at=now)
+                    await asyncio.to_thread(_write_snapshot, projects, now, _cma_cache["as_of"], "complete")
                 except Exception as e:
                     print(f"CMA cache seed from Market Pulse refresh failed (harmless): {e}")
     batches_ok = sum(1 for b in batch_report if b["ok"])
@@ -1253,7 +1726,9 @@ async def refresh_market_pulse(include_survey: bool = False) -> dict:
     result["raw_projects"] = len(projects)
     result["partial"] = batches_ok < 4
 
-    stats = compute_market_pulse_stats(projects)
+    # Only GCB-whitelisted streets feed these stats, so only those projects are rebuilt.
+    stats = compute_market_pulse_stats(projects.gcb_projects() if isinstance(projects, CompactMarket)
+                                       else projects)
     result["stats"] = stats  # exposed for diagnostics even when incomplete
     result["ok"] = (batches_ok == 4 and stats is not None)
 
@@ -1261,6 +1736,7 @@ async def refresh_market_pulse(include_survey: bool = False) -> dict:
         # Admin diagnostics only: the matched GCB records (for spot-checking every
         # included street) plus the full detached-land street universe (for
         # deciding what to whitelist). Kept off the normal refresh path.
-        result["gcb_records"] = _extract_gcb_transactions(projects, window_months=12)
-        result["detached_land_streets"] = survey_detached_land_streets(projects, window_months=24)
+        everything = projects.materialise_all() if isinstance(projects, CompactMarket) else projects
+        result["gcb_records"] = _extract_gcb_transactions(everything, window_months=12)
+        result["detached_land_streets"] = survey_detached_land_streets(everything, window_months=24)
     return result
