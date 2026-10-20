@@ -2061,6 +2061,10 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
 
     insert_payload = {
         "agent_id": agent["id"],
+        # Explicit, not left to the column default: only "active" listings are public
+        # (_listing_is_public), so a new listing must never depend on what the DB default
+        # happens to be. Seller leads are created elsewhere with "lead".
+        "status": "active",
         "location": req.location,
         "price": req.price,
         "property_type": req.property_type,

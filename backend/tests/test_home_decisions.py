@@ -412,6 +412,16 @@ _use(db)
 out = asyncio.run(NS["generate_listing"](LR(property_type="Semi-Detached", location="9 X Road", bedrooms="4",
                                             features="", land_size=3000), agent=CEA_AGENT))
 ins = [e for e in db.log if e[1] == "insert"][0][2]
+check("new listing inserted with status 'active' explicitly (landed)", ins.get("status") == "active", ins.get("status"))
+NS["_attributes_column_supported"] = False
+db = _DB(CEA_AGENT)
+_use(db)
+asyncio.run(NS["generate_listing"](LR(property_type="Condominium", location="x", bedrooms="2", features="",
+                                      owner_consent_confirmed=True), agent=CEA_AGENT))
+ins_noattr = [e for e in db.log if e[1] == "insert"][0][2]
+check("new listing inserted 'active' also before the attributes column exists",
+      ins_noattr.get("status") == "active" and "attributes" not in ins_noattr)
+NS["_attributes_column_supported"] = True
 check("LANDED write-up: never the reg/licence numbers, no CEA warning, cea_missing []",
       "CEA" not in ins["content"] and "R123456A" not in ins["content"] and out["cea_missing"] == []
       and not any("CEA" in w for w in out["compliance"]["warnings"]))
@@ -464,6 +474,7 @@ NS["create_seller"](NS["SellerLeadRequest"](**{k: v for k, v in dict(
     seller_name="S", location="x", property_type="Condominium").items()}), agent=CEA_AGENT)
 ins = [e for e in db.log if e[1] == "insert"][0][2]
 check("new seller lead without consent: no key (no attributes written)", "attributes" not in ins)
+check("new seller lead still created as 'lead' (never public)", ins.get("status") == "lead")
 db = _DB(CEA_AGENT)
 _use(db)
 NS["create_seller"](NS["SellerLeadRequest"](seller_name="S", location="x", owner_consent_confirmed=False), agent=CEA_AGENT)
