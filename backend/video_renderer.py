@@ -475,8 +475,71 @@ def _clarity_filter():
 # moving photograph is.
 #
 # IF STORAGE EVER GETS TIGHT: 25 is the next step and costs about one VMAF point.
+#
+# A CORRECTION TO THE TABLE ABOVE, 2026-10-20. Those VMAF numbers were taken with
+# libvmaf comparing two separate ffmpeg inputs, and that harness turns out to MISALIGN
+# on these files: a video compared against ITSELF scored 97, not 100. These films are
+# assembled by stream-copy concatenation, so their timestamps are not a clean ladder
+# (ffmpeg reports non-monotonic DTS at the joins, at frames 94 and 1084), and the two
+# decode paths resample differently.
+#
+# Re-measured frame-accurately -- frames pulled BY INDEX and compared directly, with a
+# self-comparison as the control (SSIM 1.000000, PSNR inf, as it must be):
+#
+#     CRF 22   35.5MB   SSIM 0.9694   PSNR 39.6 dB
+#     CRF 24   26.2MB   SSIM 0.9644   PSNR 38.3 dB     <-- shipped
+#     CRF 25   22.7MB   SSIM 0.9618   PSNR 37.7 dB
+#     CRF 26   19.7MB   SSIM 0.9592   PSNR 37.1 dB
+#     CRF 28   15.0MB   SSIM 0.9541   PSNR 35.8 dB
+#
+# The ORDERING and the sizes are exactly as the VMAF table said, and the choice of 24
+# is unchanged -- but treat the absolute VMAF figures above as indicative only, and use
+# a frame-indexed comparison for anything new.
 # ---------------------------------------------------------------------------
 DELIVERY_CRF = "24"
+
+# ---------------------------------------------------------------------------
+# The hard ceiling on what we will hand the storage bucket.
+#
+# Supabase's limit is 50MB (confirmed by Jane, 2026-10-20). Going over it is an
+# EXPENSIVE failure, not a tidy one: _store_rendered_video uploads the whole file and
+# retries four times, re-uploading all of it each time, then fails the job -- at which
+# point video_jobs retries the job itself, so the agent waits through several complete
+# re-renders and ends up with an error they can do nothing about.
+#
+# 40MB is the ceiling we act on, leaving 20% of real headroom under the limit. It is
+# reachable: a real Prestige listing (the demo semi-D, pool, garden, mature planting)
+# came out at 23.7MB, but a deliberately texture-heavy source reached 43.91MB, and
+# landed property with mature planting is exactly the texture-heavy case.
+#
+# MEASURED COST OF THE SHRINK PASS, re-encoding a finished 26.2MB CRF 24 film (same
+# frame-indexed method as above; the fresh-encode table does NOT transfer, because
+# re-compressing an already-compressed file behaves quite differently -- CRF 25 takes
+# 34% off here against 13% there, so stepping from the fresh table would soften a
+# video far more than the overshoot needs):
+#
+#     CRF 25   -34%   SSIM 0.9546      CRF 28   -56%   SSIM 0.9494
+#     CRF 26   -42%   SSIM 0.9530      CRF 30   -66%   SSIM 0.9450
+#     CRF 27   -50%   SSIM 0.9513
+#
+# One step at 25 costs about what a fresh CRF 28 would (0.9546 vs 0.9541) and buys a
+# third of the file, so for any realistic overshoot one pass is enough.
+#
+# PROVED END TO END on a deliberately texture-heavy ten-photo render (the dense
+# fine detail that mature planting puts in a landed-property frame):
+#     without this pass   56.1MB   -- over Supabase's 50MB limit, upload would fail
+#     with it             30.7MB   -- CRF 26 chosen, SSIM 0.9683 against the 56MB
+#                                     original, frame count and duration identical
+#                                     (1087 frames, 45.29s), +4.5s of render time
+DELIVERY_MAX_BYTES = 40 * 1024 * 1024
+# (reduction, crf) measured above, mildest first. The pass picks the FIRST row that
+# clears the target with the margin below, so a file barely over the line is softened
+# as little as possible.
+_SHRINK_STEPS = ((0.34, "25"), (0.42, "26"), (0.50, "27"), (0.56, "28"), (0.66, "30"))
+# The table came from one film. Real footage varies, so aim this much under the ceiling
+# rather than exactly at it.
+_SHRINK_MARGIN = 0.90
+TIMEOUT_SHRINK = 180
 
 # Identical encoder settings on every clip, so the final concat can be a stream copy
 # (no re-encode) without mismatched stream parameters.
@@ -2300,6 +2363,74 @@ def _kenburns_clip(frame_img, out_path, workdir, index, caption=None, caption_si
             pass
 
 
+VIDEO_NOTE_SHRUNK = ("the video was larger than the storage limit allows, so it was "
+                     "compressed a little further and is very slightly softer")
+
+
+def _fit_delivery_size(path, workdir):
+    """Keep the finished film under DELIVERY_MAX_BYTES. Returns (path, note).
+
+    Engages ONLY on an oversize file. A normal render reaches the first `return` below
+    having done nothing at all -- no extra ffmpeg call, no change to the bytes -- which
+    is the point: this must be invisible to the 24MB film that is the ordinary case.
+
+    One pass, on the FINISHED file, so it is a straight re-compress rather than a
+    re-render; the clips, captions, card and soundtrack are all already baked in.
+
+    NEVER RAISES, AND NEVER LOSES THE VIDEO. If the re-encode fails, times out, or
+    somehow comes out larger, the original is returned and the upload is attempted with
+    it. A video that MIGHT be rejected is worth more than one we definitely threw away.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return path, None
+    if size <= DELIVERY_MAX_BYTES:
+        return path, None
+
+    target = DELIVERY_MAX_BYTES * _SHRINK_MARGIN
+    needed = 1.0 - (target / size)
+    crf = _SHRINK_STEPS[-1][1]
+    for reduction, step in _SHRINK_STEPS:
+        if reduction >= needed:
+            crf = step
+            break
+    logger.warning("video is %.1fMB, over the %.0fMB delivery ceiling; re-encoding "
+                   "once at CRF %s (needs %.0f%% off)",
+                   size / 1024 / 1024, DELIVERY_MAX_BYTES / 1024 / 1024, crf,
+                   needed * 100)
+
+    smaller = os.path.join(workdir, "delivery_shrunk.mp4")
+    try:
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-i", path,
+            "-c:v", "libx264", "-preset", "fast", "-crf", crf, "-pix_fmt", "yuv420p",
+            # -vsync 0: pass the frames through exactly as they are. This film is
+            # assembled by stream-copy concatenation and carries non-monotonic DTS at
+            # the joins, so letting ffmpeg retime it does real damage -- MEASURED, the
+            # same re-encode produced 1089 frames with "-r 24 -vsync cfr" and 1085 with
+            # the default, against the source's 1087. Dropping or duplicating frames to
+            # save bytes would be fixing the wrong problem.
+            "-vsync", "0",
+            # The soundtrack is already correct and is not what makes the file big.
+            "-c:a", "copy", "-movflags", "+faststart", smaller,
+        ], TIMEOUT_SHRINK)
+        new_size = os.path.getsize(smaller)
+    except Exception as e:
+        logger.error("could not shrink the oversize video (%s); uploading it as it is", e)
+        return path, None
+
+    if new_size >= size:
+        # Re-compressing made it bigger, which can happen on footage the first encode
+        # already handled well. Nothing gained, so keep the better picture.
+        logger.warning("the shrink pass did not help (%.1fMB -> %.1fMB); keeping the "
+                       "original", size / 1024 / 1024, new_size / 1024 / 1024)
+        return path, None
+    logger.info("shrank the delivery video %.1fMB -> %.1fMB at CRF %s",
+                size / 1024 / 1024, new_size / 1024 / 1024, crf)
+    return smaller, VIDEO_NOTE_SHRUNK
+
+
 def _concat(clip_paths, out_path, workdir, name, timeout):
     """Joins clips with a stream copy. Every clip comes out of the same encoder
     settings (_ENCODE_ARGS), so no re-encode is needed -- which is both far cheaper
@@ -2928,6 +3059,14 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             if not wrote_final:
                 _run_ffmpeg(["ffmpeg", "-y", "-i", silent_path, "-c", "copy",
                              "-movflags", "+faststart", final_path], TIMEOUT_MUSIC)
+
+            # Last thing before the bytes leave: never hand storage a file it will
+            # reject for size. Does nothing at all to a normal-sized film, and applies
+            # to a Signature exactly as to a Classic -- a Signature is one slide longer,
+            # so if anything it needs this more.
+            final_path, shrink_note = _fit_delivery_size(final_path, workdir)
+            if shrink_note:
+                degradations.append(shrink_note)
 
             with open(final_path, "rb") as f:
                 data = f.read()
