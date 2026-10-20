@@ -7681,6 +7681,25 @@ def _ilike_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+# Buyer-facing availability. Only an ACTIVE listing is public: one the agent moved to
+# Deleted Listings ("archived"), a seller lead ("lead", not yet a listing), or any other
+# status is treated as gone. Checked on every request from the row's status, so restoring
+# the listing brings its link straight back -- nothing is deleted or cached. 404 (not 410)
+# because the live buyer page already shows its "Listing Not Found / may have been removed"
+# screen for a 404, while any other error shows a "try again" screen.
+LISTING_UNAVAILABLE_DETAIL = "This listing is no longer available"
+
+
+def _listing_is_public(listing) -> bool:
+    src = listing if isinstance(listing, dict) else {}
+    return str(src.get("status") or "").strip().lower() == "active"
+
+
+def _require_public_listing(listing) -> None:
+    if not _listing_is_public(listing):
+        raise HTTPException(status_code=404, detail=LISTING_UNAVAILABLE_DETAIL)
+
+
 @app.get("/api/public/listings/{listing_id}")
 def get_public_listing(listing_id: str, request: Request):
     client_ip = _client_ip(request)
@@ -7713,6 +7732,7 @@ def get_public_listing(listing_id: str, request: Request):
         raise HTTPException(status_code=503, detail="Listing temporarily unavailable — please try again in a moment")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
+    _require_public_listing(result.data[0])
     try:
         return _public_listing_payload(result.data[0])
     except HTTPException:
@@ -7775,6 +7795,7 @@ def get_public_listing_by_codes(agent_code: str, listing_code: str, request: Req
         )
         if not listing_result.data:
             raise HTTPException(status_code=404, detail="Listing not found")
+        _require_public_listing(listing_result.data[0])
         return _public_listing_payload(listing_result.data[0])
     except HTTPException:
         raise
@@ -7794,10 +7815,13 @@ async def create_public_enquiry(req: PublicEnquiryRequest, request: Request):
     if not _is_valid_uuid(req.listing_id):
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    listing_result = await db_execute_async(lambda db: db.table("listings").select("id, agent_id, location, property_type, price").eq("id", req.listing_id), what="create_public_enquiry listings select")
+    listing_result = await db_execute_async(lambda db: db.table("listings").select("id, agent_id, location, property_type, price, status").eq("id", req.listing_id), what="create_public_enquiry listings select")
     if not listing_result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = listing_result.data[0]
+    # An enquiry on a listing that has since been archived (a buyer with the page still
+    # open) gets the same clear answer, and no lead or alert is created for it.
+    _require_public_listing(listing)
 
     message = req.message.strip()[:2000]
     lead_score, ai_summary = "Warm", ""
