@@ -107,7 +107,7 @@ NS["logger"].propagate = False
 _WANTED_FUNCS = (
     "password_too_long", "hash_password", "verify_password",
     "_client_ip", "_rate_limited",
-    "login", "confirm_password_reset", "register",
+    "_login_failure_key", "login", "confirm_password_reset", "register",
 )
 _WANTED_CONSTS = (
     "MAX_PASSWORD_BYTES", "PASSWORD_TOO_LONG_MESSAGE",
@@ -210,6 +210,9 @@ def run_reset(new_password, fail_on=None, used_at=None, expires_in=3600):
             return Result([row])
         return Result([])
 
+    # Scoped: this section's fake DB is installed only for this one call, so it can never
+    # leak into the login / register sections below.
+    previous = NS.get("db_execute")
     NS["db_execute"] = fake_db_execute
     token = "t" * 40
     row["token_hash"] = hashlib.sha256(token.encode()).hexdigest()
@@ -218,6 +221,11 @@ def run_reset(new_password, fail_on=None, used_at=None, expires_in=3600):
         return out, calls, None
     except HTTPException as e:
         return None, calls, e
+    finally:
+        if previous is None:
+            NS.pop("db_execute", None)
+        else:
+            NS["db_execute"] = previous
 
 
 def burned(calls):
@@ -338,7 +346,17 @@ class FakeQuery:
         return Result([r for r in self._rows if r["email"] == self._email])
 
 
-NS["get_db"] = lambda: FakeQuery([AGENT])
+# login() reads the agent through db_execute (since 90a7f03). The fake runs login's REAL
+# query-builder lambda against FakeQuery, so the shipped code path is what is exercised.
+LOGIN_DB_CALLS = []
+
+
+def login_db_execute(build, attempts=3, what="query", idempotent=True):
+    LOGIN_DB_CALLS.append(what)
+    return build(FakeQuery([AGENT])).execute()
+
+
+NS["db_execute"] = login_db_execute
 
 
 class LoginReq:
@@ -364,6 +382,8 @@ def reset_login_state():
 reset_login_state()
 out, err = attempt(AGENT["email"], GOOD_PW)
 check("a correct password still logs in", out is not None and out["token"] == "token-for-agent-1", repr(err))
+check("...through the shipped db_execute lookup (not a leftover stub)",
+      bool(LOGIN_DB_CALLS) and LOGIN_DB_CALLS[-1] == "login agents select", repr(LOGIN_DB_CALLS[-3:]))
 check("the password hash never leaves the building",
       out is not None and "password_hash" not in out["agent"])
 
@@ -407,13 +427,24 @@ check("an unknown email and a wrong password give the identical answer",
       unknown.status_code == wrong.status_code == 401 and unknown.detail == wrong.detail,
       "%s / %s" % (unknown.detail, wrong.detail))
 
+# Since 90a7f03 the failure budget is per (address, account), so each email runs out of
+# its OWN budget. Exhaust both, then compare: the throttled answer must not reveal which
+# email is a real account.
 reset_login_state()
 for i in range(11):
     attempt("nobody@example.com", "guess-%d" % i)
+    attempt(AGENT["email"], "guess-%d" % i)
 _, e = attempt("nobody@example.com", "guess")
 _, e2 = attempt(AGENT["email"], "guess")
 check("being rate-limited does not reveal whether an email exists",
-      e.status_code == e2.status_code == 429 and e.detail == e2.detail)
+      e.status_code == e2.status_code == 429 and e.detail == e2.detail,
+      "%s %s / %s %s" % (e.status_code, e.detail, e2.status_code, e2.detail))
+reset_login_state()
+for i in range(11):
+    attempt("nobody@example.com", "guess-%d" % i)
+out, err = attempt(AGENT["email"], GOOD_PW)
+check("one account's failures don't lock a colleague out at the same office address",
+      out is not None and err is None, repr(err))
 
 # Different offices must not share a budget.
 reset_login_state()
@@ -525,6 +556,7 @@ def reg_db_execute(build, attempts=3, what="query", idempotent=True):
     return Result([])
 
 
+_login_db = NS.get("db_execute")
 NS["db_execute"] = reg_db_execute
 try:
     NS["register"](RegisterReq("a" * 100))
@@ -533,6 +565,8 @@ except HTTPException as e:
     reg_err = e
 except Exception as e:  # any other raise means the guard did not fire first
     reg_err = e
+finally:
+    NS["db_execute"] = _login_db
 check("an over-long password at signup is a clean 400",
       isinstance(reg_err, HTTPException) and reg_err.status_code == 400, repr(reg_err))
 check("it is rejected before any database work",
