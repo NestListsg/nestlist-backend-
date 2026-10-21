@@ -1111,6 +1111,16 @@ LINKEDIN_API_VERSION = "202601"  # Linkedin-Version header, YYYYMM format -- bum
 def _can_use_linkedin_beta(agent) -> bool:
     return agent.get("email") in LINKEDIN_BETA_ALLOWLIST
 
+# ================================
+# ADMIN-ONLY ENDPOINTS (Jane's own accounts). Gated by email, reusing the existing
+# get_current_agent auth. Kept read-only and operational -- e.g. reading live
+# Cloudinary credit usage Jane would otherwise need a dashboard login to see.
+# ================================
+ADMIN_EMAILS = {"leesbjane@gmail.com", "janelaemilia@gmail.com"}
+
+def _is_admin(agent) -> bool:
+    return (agent.get("email") or "").lower() in ADMIN_EMAILS
+
 def _agent_response(agent) -> dict:
     out = _with_cea_fields({k: v for k, v in agent.items() if k != "password_hash"}, agent)
     out["can_use_instagram_beta"] = _can_use_instagram_beta(agent)
@@ -4712,6 +4722,27 @@ async def enhance_listing_image_by_url(listing_id: str, image_url: str, agent=De
     """Index-free form of the enhance above -- preferred for new frontend code."""
     new_url = await asyncio.to_thread(_enhance_listing_image, listing_id, agent["id"], None, image_url)
     return {"success": True, "image_url": new_url}
+
+
+@app.get("/api/admin/cloudinary-usage")
+async def admin_cloudinary_usage(agent=Depends(get_current_agent)):
+    """Read-only operational visibility for Jane: the live Cloudinary account usage
+    (credits used, credit limit, plan name, and the transformations/storage/
+    bandwidth/objects breakdown) so she can read the real number without the
+    Cloudinary dashboard login.
+
+    Admin-gated: 403 for any agent whose email is not one of Jane's admin accounts.
+    Runs the (synchronous) Cloudinary call off the event loop and never 500s -- a
+    Cloudinary failure comes back as a clean JSON error (HTTP 503)."""
+    if not _is_admin(agent):
+        raise HTTPException(status_code=403, detail="This endpoint is restricted to NestList admin accounts.")
+    result = await asyncio.to_thread(cloudinary_enhance.fetch_usage)
+    if not result.get("ok"):
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "error": result.get("error", "Cloudinary usage is unavailable right now.")},
+        )
+    return {"success": True, "usage": result["usage"]}
 
 
 def _restore_listing_image(listing_id: str, agent_id: str, enhanced_url: str, original_url: str = None) -> list:
