@@ -392,6 +392,14 @@ check("30 simultaneous renders all completed",
 check("30 renders, none duplicated", sorted(rendered) == sorted(set(rendered)))
 
 
+def _raises(fn):
+    try:
+        fn()
+    except Exception as e:
+        return type(e).__name__
+    return None
+
+
 # ===========================================================================
 print("\n[8] Per-type concurrency policy, and the account-wide cap mechanism")
 # ===========================================================================
@@ -399,47 +407,36 @@ db = FakeDB()
 workers = [load_worker(db, 800 + i) for i in range(4)]
 check("classic has no account-wide cap (CPU bound, per-process)",
       workers[0].JOB_TYPES["classic"].account_limit is None)
-# Signature carried account_limit=1 and default_seconds=360 while it was going to be a
-# Replicate avatar pipeline. It is now the Classic film with the agent's own clip as its
-# opening slide, so memory is bounded per PROCESS whatever the mix of tiers, and a
-# fleet-wide serialisation only made agents queue behind each other and inflated the
-# ETA four- to fivefold.
-check("signature has no account-wide cap either",
-      workers[0].JOB_TYPES["signature"].account_limit is None)
-check("the real ceiling is one render per worker process, across both types",
+check("the real ceiling is one render per worker process, whatever the type",
       workers[0].PER_PROCESS_RENDER_LIMIT == 1)
-# Expressed against the Classic rather than a literal, because both defaults were
-# re-scaled when the photo cap rose to 10 and the measured CPU cost went with it. The
-# point of this check is that a Signature is a Classic plus a slide, NOT the old 360s
-# inherited from the abandoned Replicate pipeline.
-_sig = workers[0].JOB_TYPES["signature"].default_seconds
-_cls = workers[0].JOB_TYPES["classic"].default_seconds
-check("the Signature ETA default is a Classic-shaped number now",
-      _cls <= _sig <= 2 * _cls, "signature=%s classic=%s" % (_sig, _cls))
+check("one render type is declared in JOB_TYPES, and it is the Classic",
+      list(workers[0].JOB_TYPES) == ["classic"], str(list(workers[0].JOB_TYPES)))
 
-# The account-wide cap MECHANISM stays live for any type that needs one later, so it is
-# exercised below against a type configured with one. Each worker is its own module
+# The account-wide cap MECHANISM is kept for any type that needs one later -- the right
+# lever when the constraint is an external service rather than this box's CPU. Nothing
+# ships with one set, so it is exercised here by setting one on the Classic for the
+# duration of this check and putting it back afterwards. Each worker is its own module
 # instance, so each needs its own override.
 for wk in workers:
-    wk.JOB_TYPES["signature"].account_limit = 1
+    wk.JOB_TYPES["classic"].account_limit = 1
 
 for n in range(4):
-    workers[0].enqueue(workers[0].JOB_TYPE_SIGNATURE, "sig-%d" % n, "agent-1", {})
+    workers[0].enqueue(workers[0].JOB_TYPE_CLASSIC, "cap-%d" % n, "agent-1", {})
 
 claims = []
 bar = threading.Barrier(4)
 
 
-def claim_signature(worker):
+def claim_capped(worker):
     bar.wait()
-    job = worker.claim_next(worker.JOB_TYPE_SIGNATURE)
+    job = worker.claim_next(worker.JOB_TYPE_CLASSIC)
     if job and worker.confirm_account_slot(job):
         claims.append(job["id"])
     elif job:
         worker.defer(job, "account slot taken", backoff_seconds=0)
 
 
-ts = [threading.Thread(target=claim_signature, args=(wk,)) for wk in workers]
+ts = [threading.Thread(target=claim_capped, args=(wk,)) for wk in workers]
 for t in ts:
     t.start()
 for t in ts:
@@ -450,12 +447,25 @@ check("the others were deferred, not failed",
       not any(r["status"] == "failed" for r in db.rows),
       str([r["status"] for r in db.rows]))
 for wk in workers:
-    wk.JOB_TYPES["signature"].account_limit = None      # back to the shipped policy
+    wk.JOB_TYPES["classic"].account_limit = None        # back to the shipped policy
 
-# Signature has no renderer registered, so no worker will ever pick one up in production.
+# A job row of a type with no registered renderer is never claimed. That is what makes
+# a leftover row from a withdrawn type (the Signature tier, removed 2026-10-21) inert
+# rather than a stuck job -- and what lets a future type be declared before its
+# renderer exists.
 fresh = load_worker(FakeDB(), 890)
-check("signature has no renderer registered -- defined but inert",
-      "signature" not in fresh._RENDERERS)
+check("nothing is claimable until a renderer is registered", fresh._RENDERERS == {})
+fresh.register_renderer(fresh.JOB_TYPE_CLASSIC, lambda job: ("u", []))
+check("...and registering the Classic makes it the only claimable type",
+      list(fresh._RENDERERS) == ["classic"], str(list(fresh._RENDERERS)))
+check("a withdrawn type cannot be registered either -- it is gone from JOB_TYPES",
+      _raises(lambda: fresh.register_renderer("signature", lambda job: None))
+      == "ValueError")
+check("an unknown job type cannot be enqueued at all",
+      _raises(lambda: fresh.enqueue("avatar", "x", "agent-1", {})) == "ValueError")
+check("...and describing a row of one does not raise (no KeyError at a reader)",
+      isinstance(fresh.describe({"id": "ghost", "job_type": "signature",
+                                 "status": "running"}), dict))
 
 
 # ===========================================================================

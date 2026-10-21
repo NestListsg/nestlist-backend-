@@ -9,7 +9,7 @@ checked between chunks cannot help: the check does not run while a read is block
 the chunk that is filling too slowly.
 
 Worse, the obvious ways to interrupt it do not work, and not merely by being slower.
-Measured against a deliberately dribbling server during the Signature work:
+Measured against a deliberately dribbling server:
 
   * response.close() hands the connection back tidily, which means waiting out the body
     that is still arriving in a trickle -- 80 seconds past the deadline.
@@ -20,16 +20,12 @@ Measured against a deliberately dribbling server during the Signature work:
 Shutting the SOCKET down is a syscall on the file descriptor. It takes no Python lock,
 returned in 0.000s, and the blocked read came back in the same instant.
 
-main.py worked this out first, for the presenting-clip download, and still carries its
-own copy as `_abandon_response`. This module is that lesson extracted so the video
-renderer's photo fetches get it too.
-
-NOT YET CONSOLIDATED: main.py's copy should become a one-line delegation to this
-module, and the two are byte-identical in behaviour today. That edit was prepared and
-then deliberately dropped from the commit that introduced this file, because main.py
-was being heavily edited at the same time by other work and a cross-cutting change to
-it was not worth the collision. Doing it is a two-line change plus adding `slow_read`
-to the namespace that tests/test_signature_wiring.py execs main.py spans into.
+main.py worked this out first, for a video download, and carried its own copy as
+`_abandon_response` for a while. This module is that lesson extracted so the video
+renderer's photo fetches get it too, and since 2026-10-21 (when the download main.py
+had it for was removed with the Signature tier) it is the ONLY copy. Anything in this
+codebase that streams a response on a deadline should come through here rather than
+grow a second one.
 """
 import logging
 import socket

@@ -147,20 +147,20 @@ finally:
 path, note = vr._fit_delivery_size(os.path.join(tempfile.mkdtemp(), "gone.mp4"), "/tmp")
 check("a missing file does not raise", note is None)
 
-print("\n[both tiers] the Signature goes through the same gate")
-# A Signature is the same film with one more slide, so it is MORE likely to hit the
-# ceiling, not less. Rather than assert on a second render path that does not exist,
-# this pins that the call sits on the shared path: one call site, before the bytes are
-# read, inside render_property_video.
+print("\n[one gate] every render goes through it, and nothing can bypass it")
+# The gate is only worth anything if it is unconditional: one call site, on the only
+# path out of the renderer, before the bytes are read for upload.
 src_text = open(os.path.join(BACKEND, "video_renderer.py"), encoding="utf-8").read()
 body = src_text[src_text.index("def render_property_video("):]
 check("there is exactly one place the delivery size is enforced",
       body.count("_fit_delivery_size(") == 1, str(body.count("_fit_delivery_size(")))
 check("...and it runs before the bytes are read for upload",
       body.index("_fit_delivery_size(") < body.index('with open(final_path, "rb")'))
-check("...on the shared path, so a Signature cannot bypass it",
-      "if presenter_path" not in
-      body[body.index("_fit_delivery_size(") - 400:body.index("_fit_delivery_size(")])
+check("...unconditionally: no branch stands between the soundtrack and the gate",
+      not any(line.strip().startswith(("if ", "elif ")) for line in
+              body[body.index("if not wrote_final:"):body.index("_fit_delivery_size(")]
+              .splitlines()[1:]),
+      body[body.index("if not wrote_final:"):body.index("_fit_delivery_size(")])
 check("the ceiling lives with the rest of the sizing reasoning",
       src_text.index("DELIVERY_MAX_BYTES =") - src_text.index("DELIVERY_CRF = ") < 3000)
 
@@ -232,7 +232,7 @@ check("a failed shrink still ships the video", data and len(data) == 56 * MB)
 check("...reporting no size note, since the video is unchanged",
       vr.VIDEO_NOTE_SHRUNK not in degs, str(degs))
 
-data, degs, seen = render(final_mb=56, shrunk_mb=31, presenter_path=None,
+data, degs, seen = render(final_mb=56, shrunk_mb=31,
                           caption_overrides={"https://e.test/a.jpg":
                                              "the living hall ... where mornings begin"})
 check("a render with agent captions shrinks the same way",

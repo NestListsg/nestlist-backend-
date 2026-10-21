@@ -68,13 +68,18 @@ wasted work is harmless, because the video upload targets a fixed path per listi
 both renders would write the same bytes to the same place.
 
 CONCURRENCY IS PER JOB TYPE, NOT ONE GLOBAL NUMBER
-Classic is CPU/memory bound: one render peaks around 1.6GB RSS counting the ffmpeg
-children (see the measured table at JOB_TYPES -- the long-quoted 800MB counted only
-the python process), so the limit is per-process and stays at 1 (4 across the fleet). Signature will be bound by something else entirely --
-Replicate allows ONE prediction at a time on the whole account, regardless of how many
-processes we run -- so it carries an ACCOUNT-WIDE limit of 1 that is checked against the
-database, not against a local counter. Both live in JOB_TYPES; adding a third type means
-adding a row there, not re-architecting.
+There is one type today, 'classic'. It is CPU/memory bound: one render peaks around
+1.6GB RSS counting the ffmpeg children (see the measured table at JOB_TYPES -- the
+long-quoted 800MB counted only the python process), so its limit is per-process and
+stays at 1 (4 across the fleet).
+
+The structure is kept per type rather than collapsed to one global number because the
+right lever depends on what the constraint IS. A CPU- or memory-bound render is capped
+per PROCESS. A type bound by an external service -- one that allows, say, a single
+prediction at a time across the whole account however many processes we run -- needs an
+ACCOUNT-WIDE cap checked against the database instead, and JobTypeConfig carries both.
+Adding a type is a row in JOB_TYPES plus one register_renderer call, not re-architecting;
+that is how the Signature tier was added, and how it was removed again on 2026-10-21.
 
 BUSYNESS IS NEVER A FAILURE
 A worker that claims a job and then finds it cannot run it (no local render slot, or the
@@ -111,7 +116,6 @@ logger = logging.getLogger(__name__)
 TABLE = "video_jobs"
 
 JOB_TYPE_CLASSIC = "classic"
-JOB_TYPE_SIGNATURE = "signature"
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -173,36 +177,25 @@ JOB_TYPES = {
     # the truth; scaled by that same ratio. It is ONLY the fallback until real
     # duration_seconds rows exist, after which the rolling mean takes over.
     JOB_TYPE_CLASSIC: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=100),
-    # Signature: the Classic film with the agent's own presenting clip as its opening
-    # slide -- the same CPU and memory shape as a Classic, plus one more slide and one
-    # audio pass.
-    #
-    # It used to carry account_limit=1 and default_seconds=360. Both were inherited from
-    # a Replicate avatar pipeline that was closed on evidence and never shipped, and the
-    # audit found they cost three things and bought nothing: memory is already bounded by
-    # MAX_CONCURRENT_RENDERS x PER_PROCESS_RENDER_LIMIT x the worker count (~6.4GB on
-    # the measured table above, not the ~3.3GB this line used to claim from the old
-    # python-only figure) whatever the mix of tiers, so serialising Signatures
-    # fleet-wide only made agents
-    # queue behind each other, turned any one stuck render into a platform-wide stall,
-    # and quoted an ETA four to five times the real one.
-    # default_seconds scaled by the same 1.6x as the Classic (90 -> 145): a Signature is
-    # a Classic plus one more slide and one audio pass.
-    JOB_TYPE_SIGNATURE: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=145),
 }
 
 # How many renders of ANY type one worker process may have in flight at once.
 #
-# The per-type limits above are not enough on their own: with two types registered at 1
-# each, a worker could claim a Classic and a Signature together, and both would then
-# contend for video_renderer's single render slot -- the second would sit inside a
-# claimed job for RENDER_SLOT_WAIT_SECONDS before deferring, heartbeating all the while
-# so nothing could reclaim it, while the agent's queue position quietly meant nothing.
-# One render per process is the memory ceiling measured in the table above; this makes
-# the queue honour it when CHOOSING work rather than discovering it while rendering.
+# WHY ONE IS THE CEILING, which is the part not to lose: a single render peaks at
+# 1.6-1.9GB RSS counting its ffmpeg children (the measured table above). Four worker
+# processes at one render each is already ~6.4-7.4GB, which is what the Railway instance
+# is sized for. Two renders in one process would double that process's footprint, and
+# video_renderer only hands out ONE render slot per process anyway -- so the second
+# would sit inside a claimed job for RENDER_SLOT_WAIT_SECONDS before deferring,
+# heartbeating all the while so nothing could reclaim it, while the agent's queue
+# position quietly meant nothing. This makes the queue honour the ceiling when CHOOSING
+# work rather than discovering it while rendering.
 #
-# With a single type registered this is exactly the old behaviour: the sum of what is
-# running is that one type's count, which per_process_limit already capped.
+# It is a SEPARATE limit from the per-type ones because it is a limit on the SUM. The
+# per-type limits cannot express it: two types registered at 1 each would let one worker
+# claim one of each. That combination was real while the Signature tier existed
+# (withdrawn 2026-10-21); with one type registered this line is inert, and it is kept
+# because it is the thing that makes a second type safe to add.
 PER_PROCESS_RENDER_LIMIT = 1
 
 # How often a running job proves it is still alive, and how long silence lasts before
@@ -263,8 +256,9 @@ class DeferJob(Exception):
     This is the replacement for the old "the video service is busy, try again in a few
     minutes" error. Raised when a job cannot run for a capacity reason: no local render
     slot, an external service reporting it is at its limit. It rewinds the attempt
-    counter, so no amount of waiting for capacity can ever push a job into 'failed'.
-    Signature will raise this on a Replicate 429 for exactly the same reason."""
+    counter, so no amount of waiting for capacity can ever push a job into 'failed'. A
+    type bound by an external service would raise it on that service's 429 for exactly
+    the same reason."""
 
 
 class SupersededError(Exception):
@@ -316,10 +310,10 @@ def register_renderer(job_type, run, on_final_failure=None):
     on_final_failure(job, error_text) is called once, only when the job has exhausted
     its attempts, so the owning module can mirror the failure onto the listing row.
 
-    A job type with no registered renderer is never claimed. That is how 'signature'
-    stayed defined-but-inert until its renderer existed, and wiring it up was indeed one
-    register_renderer() call rather than a change to this queue. Both types are
-    registered now (see main.py's startup).
+    A job type with no registered renderer is never claimed, which is what lets a type
+    be declared in JOB_TYPES before its renderer exists -- and what makes a leftover job
+    row of a withdrawn type harmless: no worker will ever pick it up. main.py's startup
+    registers 'classic'.
     """
     if job_type not in JOB_TYPES:
         raise ValueError("unknown job type %r" % job_type)
@@ -1055,7 +1049,12 @@ def _average_duration(job_type):
         cached = _duration_cache.get(job_type)
         if cached and time.monotonic() - cached[0] < _DURATION_CACHE_SECONDS:
             return cached[1]
-    fallback = JOB_TYPES[job_type].default_seconds
+    # .get(), not [], for the same reason describe() uses it: a row left over from a
+    # withdrawn job type must never be able to raise a KeyError at a reader. Describing
+    # such a row with the Classic's fallback is a slightly wrong ETA for a job nothing
+    # will ever run; indexing would be a 500 on an agent's status poll.
+    cfg = JOB_TYPES.get(job_type) or JOB_TYPES[JOB_TYPE_CLASSIC]
+    fallback = cfg.default_seconds
     try:
         res = _exec(
             lambda db: db.table(TABLE).select("duration_seconds")
@@ -1109,8 +1108,9 @@ def describe(job):
         # between that insert and this call. When that happens the job is already
         # RUNNING, so counting running jobs by type counts the job against itself: the
         # agent who is first in the queue is told "2nd in line" and quoted roughly
-        # double the real wait. Seen on the first two production Signatures, both of
-        # which said "2nd in line, about 3 minutes" with an empty queue behind them.
+        # double the real wait. Seen in production on the first two renders an agent
+        # ever generated, both of which said "2nd in line, about 3 minutes" with an
+        # empty queue behind them.
         #
         # Excluding by id rather than re-reading the status also covers the simpler
         # race where it is claimed a moment after we read it. Uncached deliberately:
@@ -1144,11 +1144,11 @@ def describe_active_for_agent(agent_id, job_type=None):
     Used to decorate the My Listings payload. An agent with nothing rendering costs one
     indexed select that returns nothing, which is the common case by a wide margin.
 
-    `job_type` narrows the result to one tier, and the caller should say which. The
-    result is keyed by LISTING, and one listing may legitimately have a Classic and a
-    Signature in flight at the same time (the unique index is over listing + type), so
-    without a tier the last row read would silently win -- and My Listings would show a
-    Classic the position of a Signature. Omitting it keeps the original behaviour."""
+    `job_type` narrows the result to one type, and the caller should say which. The
+    result is keyed by LISTING, and the unique index is over listing + type -- so if a
+    second render type is ever added, one listing could legitimately have two jobs in
+    flight and the last row read would silently win, showing one type's queue position
+    against the other. Omitting it keeps the original behaviour."""
     if not available():
         return {}
     try:
@@ -1309,18 +1309,23 @@ async def run_consumer():
                 last_prune = now
                 await asyncio.to_thread(prune_finished)
 
-            # TAKE TURNS. This loop used to run in alphabetical order, which with
-            # PER_PROCESS_RENDER_LIMIT = 1 is absolute priority and not a queue: it
-            # breaks as soon as it claims one job, "classic" sorts before "signature",
-            # so while any Classic work remained a Signature was never claimed at all.
-            # It then got worse than waiting -- the abandoned-queue sweep eventually
-            # failed the starved job and told the agent the rendering service was not
-            # picking up work, which was false.
+            # TAKE TURNS, so no type can starve another.
+            #
+            # WHY THIS EXISTS, because with one type registered it is inert and looks
+            # pointless: the loop used to run in alphabetical order, which with
+            # PER_PROCESS_RENDER_LIMIT = 1 is absolute priority and not a queue at all
+            # -- it breaks as soon as it claims one job, so the type that sorts first
+            # took every slot and the other was never claimed while any of the first
+            # remained. It then got worse than waiting: the abandoned-queue sweep
+            # eventually failed the starved job and told the agent the rendering service
+            # was not picking up work, which was false. (Measured on two real types; the
+            # second was the Signature tier, withdrawn 2026-10-21.)
             #
             # Round-robin instead: whichever type was served last goes to the back, and
             # rr_start only moves when something is actually claimed, so a type with an
-            # empty queue never costs the other its turn. With one type registered this
-            # is the same single-element loop it has always been.
+            # empty queue never costs another its turn. With one type registered this is
+            # a single-element loop and behaves exactly as it did before -- kept so that
+            # adding a second type does not reintroduce the starvation.
             types = sorted(_RENDERERS)
             rr_start %= max(1, len(types))
             order = types[rr_start:] + types[:rr_start]

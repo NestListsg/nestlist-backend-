@@ -22,17 +22,15 @@ Every optional stage degrades instead of failing. The ladder, worst-case last:
     captions fail    -> caption-free slideshow
     card fails       -> slideshow with no closing card
     a photo fails    -> that photo is skipped
-    HDR cannot be    -> the film is still published bt709 (so the closing card is
-    tonemapped          right); only the agent looks a little flat. See HDR_TRANSFERS
 Only "no usable photos at all" raises. Which degradations fired is returned to the
 caller (and logged) so a quietly-degraded render is visible in Railway's logs rather
 than looking like a normal success.
 
 Requires the `ffmpeg` binary on PATH -- see railpack.json. ffprobe is used where it
 helps but is NEVER required: it is a separate binary, a worker can have a working
-ffmpeg without it, and assuming otherwise has caused two bugs here already. Anything
-that must be read from a file is read from ffmpeg's own banner instead
-(_duration_via_ffmpeg, _source_colour).
+ffmpeg without it, and assuming otherwise has caused two bugs here already. The one
+place it is still read (_probe_duration) falls back to the arithmetic estimate, and
+anything that MUST be known is read from ffmpeg's own banner instead.
 """
 import base64
 import hashlib
@@ -547,54 +545,6 @@ _SHRINK_STEPS = ((0.34, "25"), (0.42, "26"), (0.50, "27"), (0.56, "28"), (0.66, 
 _SHRINK_MARGIN = 0.90
 TIMEOUT_SHRINK = 180
 
-# Say bt709 OUT LOUD, so the film's colour description is never INHERITED.
-#
-# This is the structural half of the HDR fix further down (see HDR_TRANSFERS). The
-# assembly is a stream-copy concat, and a stream copy takes its colour description from
-# the FIRST input -- so one clip carrying surprising colour tags relabels the ENTIRE
-# film. That is exactly how an HLG presenter clip published a 41s film tagged HDR and
-# turned the closing contact card teal.
-#
-# APPLIED ONLY TO THE PRESENTER OPENING CLIP, which is deliberate and was arrived at by
-# measurement, not taste. The presenter clip is the only EXTERNAL video that ever enters
-# the timeline -- every other clip is built here from a BMP or a JPEG we just wrote, so
-# it has no colour tags to smuggle in. Tagging slide zero is therefore enough to
-# guarantee the published film says bt709, and it has the large extra benefit that a
-# clip uploaded BEFORE this fix (Janel's is stored HLG right now) stops relabelling the
-# film as HDR too: her card comes out right on her next render, with only her own
-# colour still flat until she re-uploads.
-#
-# WHY NOT ON EVERY CLIP (_ENCODE_ARGS). Tried, measured, REVERTED. Today's clips are
-# encoded through swscale's bt601 matrix and shipped with NO tag, and the two things
-# that read them disagree: ffmpeg/VLC assume bt601 and show the designed colours, while
-# phones, browsers and social players assume bt709 and show them slightly
-# over-saturated (measured up to 21/255 on a saturated patch). Stating bt709 on every
-# clip forces everyone onto the bt709 reading -- which moved a real Classic render on
-# EVERY ONE of its 445 frames, worst channel 73/255. There is no spelling that is both
-# unambiguous and unchanged for every viewer, because the ambiguity IS the difference.
-# Resolving it is a grading decision about hundreds of films Jane has already approved,
-# so it is written up for her rather than bundled into a colour hotfix.
-#
-# WHY -x264-params AND NOT -colorspace. MEASURED, all four spellings, same source:
-#
-#   form                                            tags written          pixels
-#   -colorspace bt709                               matrix only           CHANGED
-#   -colorspace/-color_primaries/-color_trc         matrix only           CHANGED
-#   same, stream-suffixed (:v)                      matrix only           CHANGED
-#   -x264-params colorprim/transfer/colormatrix     all three             identical
-#
-# Two separate traps there. First, ffmpeg SILENTLY IGNORES -color_primaries and
-# -color_trc when the frames reaching the encoder do not already state them, so the
-# obvious spelling writes the matrix and drops the other two -- which are precisely the
-# two that carried the HLG curve. Second, -colorspace does not merely label: ffmpeg
-# hands it to swscale, which then really converts the matrix. -x264-params only labels.
-#
-# Not probed, unlike the `cas` filter: this is a libx264 private option, and libx264 is
-# already a hard dependency of every encode in this file, so there is no build where
-# this option is missing and the renderer otherwise works.
-COLOUR_TAG_ARGS = ["-x264-params",
-                   "colorprim=bt709:transfer=bt709:colormatrix=bt709"]
-
 # Identical encoder settings on every clip, so the final concat can be a stream copy
 # (no re-encode) without mismatched stream parameters.
 _ENCODE_ARGS = [
@@ -972,470 +922,6 @@ def _run_ffmpeg(cmd, timeout):
         raise RuntimeError(f"ffmpeg timed out after {timeout}s") from e
 
 
-# ---------------------------------------------------------------------------
-# The agent's presenting clip
-# ---------------------------------------------------------------------------
-# The Signature tier opens with the agent themselves, speaking to camera. That clip
-# is REAL FOOTAGE the agent uploads once -- not a generated avatar. Every attempt to
-# synthesise an agent into a property failed the same way: the likeness drifts within
-# two seconds, or the room has to be invented to keep the person convincing. Real
-# footage has neither problem, and it is unarguably them.
-PRESENTER_MAX_SECONDS = 12.0      # what we keep; the film uses ~5s of it
-PRESENTER_LONG_EDGE = 1280        # a phone's 4K is wasted here and costs upload time
-PRESENTER_MIN_SECONDS = 1.5       # shorter than this is a mis-tap, not a recording
-
-# WHERE the kept seconds start. People do not begin talking the instant they tap record:
-# measured on Janel's own recording, she is silent for the first 2 seconds and speaks
-# from about 2s to 9s. Taking the first SECONDS_PER_PHOTO from zero would therefore have
-# opened the film with two seconds of her standing there saying nothing and then cut her
-# off mid-sentence -- using the wrong five seconds of a perfectly good take.
-#
-# So the clip is trimmed to where the speech starts. This is deliberately automatic
-# rather than a "choose your start point" control: the agent has already done the work by
-# recording, and every manual step we add is one more thing for them to get wrong.
-# "Quiet" has to be measured against the clip's OWN loudness, not a fixed number. A
-# fixed -45dB threshold was tried first and never fired on Janel's recording: her room's
-# noise floor peaks at -42dB, so the opening silence was never quiet enough to count. A
-# fixed -40dB worked on that one clip and would simply have been tuned to that one room
-# -- a noisier street-side recording would fail it again, and a studio-quiet one would
-# have been trimmed too eagerly. So the threshold is set this far below the loudest
-# moment in the clip, which is their own voice.
-PRESENTER_SILENCE_BELOW_PEAK = 20.0
-# ...clamped, so a clip that is loud throughout (or almost silent throughout) cannot
-# produce an absurd threshold.
-PRESENTER_SILENCE_DB_RANGE = (-60.0, -25.0)
-PRESENTER_SILENCE_MIN = 0.4       # a gap has to last this long to count as a gap
-PRESENTER_LEAD_IN = 0.25          # kept in front of the first word, so it is not clipped
-
-# How loud the agent ends up is otherwise decided by how they filmed: phone at arm's
-# length in a quiet room is a FAR lower level than one held close. Measured on Janel's
-# own recording, her voice landed at -33.5dB in the finished film while the music -- even
-# ducked to PRESENTER_MUSIC_DUCK -- sat at -25.4dB, so the music was comfortably louder
-# than the person speaking. No fixed duck can fix that, because the problem is the source
-# level, not the balance.
-#
-# So the voice is normalised ONCE, on upload, to a speech loudness target -- the same
-# treatment the "raw" music tracks get, and for the same reason. Baking it into the
-# stored clip rather than doing it per render means the work happens once, and the render
-# path needs to know nothing about it.
-#
-# -18 rather than a broadcast -16: it is a little conservative on purpose. Normalisation
-# lifts the room tone along with the voice, and a quiet recording needs a lot of gain to
-# reach -16.
-PRESENTER_VOICE_LUFS = -18.0
-PRESENTER_VOICE_TRUE_PEAK_DB = -2.0
-PRESENTER_VOICE_LRA = 11
-
-# How the agent's voice sits against the music bed. Their clip is real footage of them
-# speaking, so the sound is the point of it -- a presenting clip with its audio stripped
-# is just a photo that moves. The music ducks under them and comes back up once the film
-# moves on to the rooms.
-PRESENTER_VOICE_VOLUME = 0.92     # leaves headroom so voice + ducked music cannot clip
-PRESENTER_MUSIC_DUCK = 0.30       # music multiplier while they are speaking
-PRESENTER_DUCK_RELEASE = 0.9      # seconds the music takes to come back to full
-PRESENTER_VOICE_FADE = 0.25       # so their last syllable is not cut off mid-word
-# Phones record mono or stereo depending on the handset, and that difference silently
-# changed how loud the agent was. MEASURED on a mono source (a 4.5s window, mean volume):
-#
-#     no conversion                                       -21.1 dB
-#     aformat=channel_layouts=stereo                      -24.1 dB   <- 3dB lost
-#     aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0 -21.1 dB
-#
-# The 3dB is the resampler's power-preserving rematrix: spreading one channel across two
-# halves the power in each. aformat does NOT avoid it -- it asks for stereo and gets the
-# same rematrix -- so pan is the fix, duplicating the channel verbatim instead. Forcing
-# mono FIRST makes the same string correct for a stereo recording (a downmix of
-# correlated channels keeps its level; measured at -21.1 dB too), which matters because
-# we cannot know what the agent filmed on.
-#
-# A single speaking voice has no stereo image worth preserving, so collapsing it costs
-# nothing. The music is NOT put through this -- it is a real stereo mix.
-PRESENTER_VOICE_TO_STEREO = "aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0"
-# Shared sample rate so the two layers meet amix already agreeing, rather than through
-# whichever conversion it would have inserted. Deliberately says nothing about channels.
-PRESENTER_MIX_FORMAT = "aformat=sample_fmts=fltp:sample_rates=44100"
-
-
-def _speech_start_seconds(path, duration, keep_at_least):
-    """How far into `path` the agent actually starts talking. 0.0 whenever unsure.
-
-    Every failure mode answers 0.0, which is exactly the behaviour this function
-    replaced -- so a clip that cannot be analysed is kept whole rather than refused or
-    trimmed on a guess.
-    """
-    if not duration or duration <= 0:
-        # Without a duration there is no way to guarantee the clamp below leaves enough
-        # material, and trimming past the end would turn a good recording into one the
-        # minimum-length check rejects. Not trimming is always safe.
-        return 0.0
-    try:
-        # -vn on both passes: these measure AUDIO, and without it ffmpeg decodes every
-        # video frame of the upload to throw it away. Measured on a 180MB phone clip:
-        # 0.60s with the video decode, 0.03s without, per pass, per upload.
-        peak = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-i", path, "-vn",
-             "-af", "volumedetect", "-f", "null", "-"],
-            capture_output=True, timeout=TIMEOUT_PROBE).stderr.decode("utf-8", "replace")
-        loudest = re.search(r"max_volume:\s*(-?[\d.]+) dB", peak)
-        if not loudest:
-            logger.warning("could not measure the presenter clip's level; keeping it "
-                           "from the beginning")
-            return 0.0
-        low, high = PRESENTER_SILENCE_DB_RANGE
-        threshold = min(high, max(low, float(loudest.group(1)) - PRESENTER_SILENCE_BELOW_PEAK))
-        err = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-i", path, "-vn", "-af",
-             f"silencedetect=noise={threshold:.1f}dB:d={PRESENTER_SILENCE_MIN}",
-             "-f", "null", "-"],
-            capture_output=True, timeout=TIMEOUT_PROBE).stderr.decode("utf-8", "replace")
-    except Exception as e:
-        logger.warning("could not look for the start of speech in %s (%s); "
-                       "keeping the clip from the beginning", path, e)
-        return 0.0
-
-    # Only a silence that the clip OPENS with is of any interest. A pause in the middle
-    # is part of how they speak, and skipping to it would drop their first sentence.
-    opening = re.search(r"silence_start:\s*(-?[\d.]+)", err)
-    if not opening or float(opening.group(1)) > PRESENTER_SILENCE_MIN:
-        return 0.0
-    ends = re.search(r"silence_end:\s*([\d.]+)", err)
-    if not ends:
-        # Silent from start to finish: either a muted recording or one filmed somewhere
-        # very quiet. Trimming would leave nothing, and the clip may still be usable
-        # (the film has music over it either way), so keep it whole.
-        logger.info("presenter clip has no detectable speech; keeping it from the beginning")
-        return 0.0
-
-    start = max(0.0, float(ends.group(1)) - PRESENTER_LEAD_IN)
-    # Never trim so far in that the film has less than a full slide to open with.
-    start = min(start, max(0.0, duration - keep_at_least))
-    if start < PRESENTER_SILENCE_MIN:
-        return 0.0            # nothing worth skipping
-    logger.info("presenter clip: speech starts at %.2fs; trimming the lead-in", start)
-    return start
-
-
-# ---------------------------------------------------------------------------
-# HDR (HLG/PQ) presenter clips -> true SDR bt709
-# ---------------------------------------------------------------------------
-# WHAT WENT WRONG, so nobody re-derives it from the symptom. Modern iPhones record HDR
-# by default: Janel's clip probes as yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67) --
-# arib-std-b67 is HLG. The old transcode here brought it down to 8-bit yuv420p but did
-# NOT tonemap and did NOT retag, so the stored clip kept HLG-curve samples AND the
-# bt2020/HLG labels. That clip becomes slide zero of a Signature, and because the
-# assembly is a stream-copy concat (which takes its stream parameters from the FIRST
-# input), the whole 41s film was published tagged as HDR. Players then applied an
-# HDR->SDR transform to footage that was mostly ordinary SDR, and the closing contact
-# card -- designed warm off-white -- came out teal on Jane's screen.
-#
-# MEASURED, so the blame is not guesswork: the card's PIXELS are correct and byte-for-
-# byte identical to the ones a Classic ships (same md5 on the raw YUV), and a Classic
-# carries no colour tags at all. Same pixels, different label, different picture. The
-# card renderer is not involved.
-#
-# Relabelling the finished film bt709 does fix the card, but it leaves the AGENT flat
-# and washed out, because her samples really are HLG-encoded: measured on the real HDR
-# sample, mean colourfulness 0.105 relabelled against 0.163 properly tonemapped. The
-# agent is the whole point of a Signature, so the conversion belongs HERE, once, at
-# upload -- after which the stored clip matches everything else and nothing downstream
-# has to know.
-#
-# The transfer characteristics that mean "this is HDR and needs converting". Anything
-# else -- bt709, smpte170m, an untagged recording -- is left COMPLETELY alone, argument
-# for argument, so an SDR upload comes through exactly as it did before this change.
-HDR_TRANSFERS = ("arib-std-b67", "smpte2084")   # HLG, PQ
-
-# Rung 1. zscale (libzimg) to linear light, tonemap, back out to bt709.
-#
-# The numbers are MEASURED on the real HLG sample (an iPhone 16 Pro Max HLG recording),
-# averaged over four frames, against the relabel-only result as the baseline. Do not
-# re-tune these from first principles; the alternatives were tested and rejected:
-#
-#   tonemap   npl   desat   mean luma   contrast   colourfulness   blown highlights
-#   (none)      -       -       180.4      203.5         0.105            0.0%   <- relabel only
-#   hable     100     0.0       182.4      208.5         0.163            0.1%   <- SHIPPED
-#   hable     203     0.0       155.1      188.9         0.163            0.0%   too dark
-#   hable     100     0.5       208.2      222.5         0.092           59.1%   blows out
-#   mobius    100     0.0       205.3      203.1         0.161           51.2%   blows out
-#   reinhard  100     0.0       200.8      200.3         0.162           24.5%   blows out
-#   clip      100       -       211.9      206.0         0.151           79.8%   blows out
-#
-# hable at npl=100 with desat=0 is the only row that holds the exposure Jane already
-# approved (182 against 180) while recovering the colour (0.163 against 0.105) and
-# blowing nothing. desat defaults to 2, which rolls highlights towards white to protect
-# hue -- on a face lit by a window that clipped 59% of the frame, so it is turned OFF
-# deliberately. npl is the nominal peak the source is read against: 1000 (HLG's nominal
-# peak) renders her two stops dark, because HLG is scene-referred and this footage is
-# graded for a normal room, not a 1000-nit highlight.
-#
-# zscale needs its INPUT colour fully specified or zimg answers "no path between
-# colorspaces" and the encode fails -- which is why _source_colour reads the real tags
-# off the source rather than letting the filter guess.
-TONEMAP_ALGO = "hable"
-TONEMAP_PEAK_NITS = 100
-# Rung 2. No zscale (libzimg is a build-time option and Railway installs Debian's
-# ffmpeg), so linear light is unreachable and so is tonemap, which only eats float.
-# `colorspace` is core libavfilter and can still fix the MATRIX and the GAMUT, which is
-# most of the cast; it cannot undo the HLG curve, so the agent stays slightly flat.
-# MEASURED on the same sample: colourfulness 0.131 against 0.105 relabelled and 0.163
-# properly tonemapped -- about 45% of the gap closed, exposure and contrast untouched,
-# nothing blown. HLG only: PQ read as a gamma curve comes out very dark, so a PQ clip
-# skips this rung.
-GAMUT_ONLY_FILTER = "colorspace=all=bt709:iall=bt2020:fast=0"
-# Rung 3 is no filter at all -- the clip is merely RELABELLED bt709. Strictly better
-# than today (the card and the photos come out right), but the agent is flat, so it is
-# logged and reported as a degradation rather than passing silently.
-VIDEO_NOTE_HDR_NOT_TONEMAPPED = (
-    "your clip was recorded in HDR and this server could not convert it fully, so you "
-    "may look a little flat in the video"
-)
-
-_hdr_rung_cache = None
-_hdr_rung_lock = threading.Lock()
-
-
-def _source_colour(path):
-    """The colour tags ffmpeg reports for `path`, read off its BANNER.
-
-    Returns {"range","matrix","primaries","transfer"} with None for anything the file
-    does not state, or None if the banner could not be read at all.
-
-    Banner, not ffprobe. ffprobe is a separate binary and this codebase has already
-    been bitten twice by assuming it is installed -- see _duration_via_ffmpeg. ffmpeg
-    prints the colour description inside the pixel-format parentheses, in one of two
-    shapes depending on whether the three values agree:
-
-        yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67)   <- matrix/primaries/transfer
-        yuv420p(tv, bt709, progressive)                 <- all three are bt709
-        yuvj420p(pc, bt470bg/unknown/unknown, progressive)
-        yuv420p(progressive)                            <- states nothing at all
-    """
-    try:
-        err = subprocess.run(["ffmpeg", "-hide_banner", "-i", path],
-                             capture_output=True, timeout=TIMEOUT_PROBE
-                             ).stderr.decode("utf-8", errors="replace")
-    except Exception as e:
-        logger.warning("could not read colour tags from ffmpeg for %s (%s)", path, e)
-        return None
-
-    line = next((l for l in err.splitlines() if "Video:" in l), None)
-    if not line:
-        return None
-    # The range flag is the anchor: ffmpeg only prints a colour description when it
-    # prints tv/pc in front of it, so finding one finds the other.
-    m = re.search(r"\b(tv|pc|limited|full)\s*,\s*([\w-]+)(?:/([\w-]+)/([\w-]+))?", line)
-    if not m:
-        return {"range": None, "matrix": None, "primaries": None, "transfer": None}
-
-    def clean(v):
-        return None if (not v or v == "unknown") else v
-
-    rng, first, second, third = m.group(1), m.group(2), m.group(3), m.group(4)
-    if second is None:
-        # The single-value shape: one name standing for matrix, primaries and transfer.
-        matrix = primaries = transfer = clean(first)
-    else:
-        matrix, primaries, transfer = clean(first), clean(second), clean(third)
-    return {"range": {"limited": "tv", "full": "pc"}.get(rng, rng),
-            "matrix": matrix, "primaries": primaries, "transfer": transfer}
-
-
-def _hdr_to_sdr_filter(colour):
-    """The best HDR->SDR chain this ffmpeg build can actually run for `colour`.
-
-    Returns (filter_string, note). An empty filter_string means rung 3 -- relabel only
-    -- and `note` is then the degradation to report. Worked out once per process and
-    cached, because it is two filter probes and it would otherwise run per upload.
-
-    Probing rather than assuming is the house rule here: an unknown filter name makes
-    ffmpeg exit non-zero, and this string goes into the ONE encode an agent is sitting
-    and waiting for. See _clarity_filter, which does the same thing for `cas` and for
-    the same reason.
-    """
-    global _hdr_rung_cache
-    with _hdr_rung_lock:
-        if _hdr_rung_cache is None:
-            if _has_ffmpeg_filter("zscale") and _has_ffmpeg_filter("tonemap"):
-                _hdr_rung_cache = "tonemap"
-            elif _has_ffmpeg_filter("colorspace"):
-                logger.warning("ffmpeg has no 'zscale'/'tonemap' filter; HDR clips will "
-                               "be gamut-corrected only and will look slightly flat")
-                _hdr_rung_cache = "gamut"
-            else:
-                logger.warning("ffmpeg can neither tonemap nor convert gamut; HDR clips "
-                               "will only be relabelled bt709")
-                _hdr_rung_cache = "relabel"
-        rung = _hdr_rung_cache
-
-    matrix = colour.get("matrix") or "bt2020nc"
-    primaries = colour.get("primaries") or "bt2020"
-    transfer = colour.get("transfer")
-    rng = colour.get("range") or "tv"
-
-    if rung == "tonemap":
-        logger.info("presenter clip is HDR (%s); tonemapping to bt709", transfer)
-        return (
-            # Into linear light, with the source's own tags spelled out -- zimg refuses
-            # to work from guesses.
-            f"zscale=min={matrix}:pin={primaries}:tin={transfer}:rin={rng}"
-            f":t=linear:npl={TONEMAP_PEAK_NITS}:p={primaries}:m={matrix},"
-            # tonemap only accepts floating-point linear light.
-            "format=gbrpf32le,"
-            f"tonemap=tonemap={TONEMAP_ALGO}:desat=0,"
-            # ...and back out to a plain SDR bt709 video range.
-            "zscale=p=bt709:t=bt709:m=bt709:r=tv"
-        ), None
-    if rung == "gamut" and transfer == "arib-std-b67":
-        logger.warning("presenter clip is HLG and this ffmpeg cannot tonemap; "
-                       "correcting the gamut only -- the agent will look a little flat")
-        return GAMUT_ONLY_FILTER, VIDEO_NOTE_HDR_NOT_TONEMAPPED
-    logger.warning("presenter clip is HDR (%s) and this ffmpeg cannot convert it; "
-                   "relabelling bt709 so the rest of the film is right, but the agent "
-                   "will look flat", transfer)
-    return "", VIDEO_NOTE_HDR_NOT_TONEMAPPED
-
-
-def prepare_presenter_clip(raw_bytes, workdir):
-    """Normalise an agent's uploaded clip into something the renderer can always read.
-
-    Phones produce HEVC in a .MOV at whatever resolution they feel like; some of that
-    will not decode on the render worker, and none of it should be trusted to be a
-    sensible length. So the upload is transcoded ONCE, here, rather than hoping at
-    render time: trimmed, scaled, re-encoded to H.264/AAC.
-
-    Doing it on upload rather than per render also means a bad file fails while the
-    agent is still looking at the screen, instead of silently breaking a video they
-    ordered three days later.
-
-    Returns (mp4_bytes, seconds, note). `note` is None on the normal path, and a
-    sentence for the agent when the clip was HDR and this ffmpeg could not convert it
-    all the way -- see HDR_TRANSFERS above for why that matters and what it costs.
-
-    Raises ValueError with a sentence the agent can act on -- this runs on a path where
-    a human is waiting.
-    """
-    src = os.path.join(workdir, "presenter_in")
-    out = os.path.join(workdir, "presenter_out.mp4")
-    with open(src, "wb") as f:
-        f.write(raw_bytes)
-
-    # Skip the dead air before they start talking, so the kept seconds are the ones the
-    # film actually opens on. Answers 0.0 on any doubt, which is what this did before.
-    # Read from ffmpeg's banner, not ffprobe -- ffprobe is a separate binary and may not
-    # be installed on the worker at all.
-    start_at = _speech_start_seconds(src, _duration_via_ffmpeg(src), SECONDS_PER_PHOTO)
-
-    # Is this an HDR recording? Modern iPhones say yes by default. Only an HDR clip gets
-    # converted; an SDR one takes the branch below with the argument list it has always
-    # had, untouched, so nothing about an ordinary upload changes.
-    colour = _source_colour(src) or {}
-    is_hdr = colour.get("transfer") in HDR_TRANSFERS
-    note = None
-    hdr_chain = ""
-    if is_hdr:
-        hdr_chain, note = _hdr_to_sdr_filter(colour)
-
-    # The scale is unchanged; the conversion (when there is one) goes AFTER it, so the
-    # expensive float tonemap runs on the 1280-long-edge frame rather than the phone's
-    # full 4K -- same result, a fraction of the work.
-    scale = ("scale='if(gt(iw,ih),min(%d,iw),-2)':'if(gt(iw,ih),-2,min(%d,ih))'"
-             % (PRESENTER_LONG_EDGE, PRESENTER_LONG_EDGE))
-
-    # ffmpeg IS the validator. An earlier version probed the input first and treated a
-    # failed probe as "not a video" -- which would have rejected every upload on a
-    # worker where ffprobe was missing, while ffmpeg itself was working fine. Let the
-    # transcode decide: if it cannot read the file, it is not a file we can use.
-    def transcode(chain):
-        _run_ffmpeg([
-            "ffmpeg", "-y", "-v", "error",
-            # Before -i: seek the INPUT, so -t below counts from the first word rather
-            # than from the start of the file.
-            ] + (["-ss", "%.3f" % start_at] if start_at else []) + [
-            "-i", src, "-t", "%.2f" % PRESENTER_MAX_SECONDS,
-            # Scale the LONG edge, whichever way up it was filmed, and keep both
-            # dimensions even -- H.264 refuses odd ones.
-            "-vf", ",".join([scale] + ([chain] if chain else []) + ["format=yuv420p"]),
-            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-            # Only on the HDR branch, so an SDR upload runs the argument list it always
-            # has. On an HDR one the tag is the whole point: even when the conversion
-            # falls through to the bottom rung, the film must stop claiming to be HDR.
-            ] + (COLOUR_TAG_ARGS if is_hdr else []) + [
-            # Even out how loud they recorded, so the film's balance does not depend on
-            # how they held the phone. Single-pass loudnorm: approximate, but the gap it
-            # is closing is tens of dB, not tenths.
-            "-af", (f"loudnorm=I={PRESENTER_VOICE_LUFS}:TP={PRESENTER_VOICE_TRUE_PEAK_DB}"
-                    f":LRA={PRESENTER_VOICE_LRA}"),
-            "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
-            "-movflags", "+faststart", out,
-        ], timeout=240)
-
-    try:
-        transcode(hdr_chain)
-    except RuntimeError as e:
-        if hdr_chain:
-            # The colour conversion is the ONLY thing that can have gone wrong that is
-            # not the agent's file -- zimg is fussy about unusual inputs, and a tonemap
-            # that will not run must never cost a good recording. Drop to the bottom
-            # rung (relabel bt709, no pixel change) and try once more; the agent still
-            # gets a usable clip, and the card still comes out right.
-            logger.warning("HDR conversion failed for this presenter clip (%s); "
-                           "falling back to relabelling it bt709", str(e)[:200])
-            note = VIDEO_NOTE_HDR_NOT_TONEMAPPED
-            try:
-                transcode("")
-            except RuntimeError as e2:
-                logger.warning("presenter clip rejected: %s", str(e2)[:300])
-                raise ValueError("That file does not look like a video we can read. "
-                                 "An MP4 or MOV straight from your phone works best.")
-        else:
-            logger.warning("presenter clip rejected: %s", str(e)[:300])
-            raise ValueError("That file does not look like a video we can read. "
-                             "An MP4 or MOV straight from your phone works best.")
-
-    if not os.path.exists(out) or os.path.getsize(out) < 1000:
-        raise ValueError("That file does not look like a video we can read. "
-                         "An MP4 or MOV straight from your phone works best.")
-
-    # Duration from the OUTPUT, which we know is readable. ffprobe first, then
-    # ffmpeg's own banner -- NOT a constant, because falling back to the cap would
-    # quietly disable the minimum-length check below on any worker without ffprobe.
-    seconds = _probe_duration(out, -1.0)
-    if seconds <= 0:
-        seconds = _duration_via_ffmpeg(out)
-    if not seconds or seconds <= 0:
-        # Both readers failed. Let it through at the cap rather than refuse a clip
-        # that transcoded perfectly well; the film trims to what it needs anyway.
-        logger.warning("could not determine presenter clip duration; assuming the cap")
-        seconds = PRESENTER_MAX_SECONDS
-    if seconds < PRESENTER_MIN_SECONDS:
-        raise ValueError("That clip is too short. Record about ten seconds of yourself "
-                         "speaking to the camera, and we will use the best few.")
-
-    with open(out, "rb") as f:
-        data = f.read()
-    return data, seconds, note
-
-
-def _duration_via_ffmpeg(path):
-    """Duration parsed out of ffmpeg's own banner. Returns None if it cannot tell.
-
-    Exists because _probe_duration needs ffprobe, and ffprobe is a SEPARATE binary --
-    a worker can have a perfectly good ffmpeg and no ffprobe. When that happened the
-    duration silently fell back to the cap, which quietly disabled the minimum-length
-    check and let a half-second mis-tap through as if it were a recording.
-    """
-    try:
-        err = subprocess.run(["ffmpeg", "-hide_banner", "-i", path],
-                             capture_output=True, timeout=TIMEOUT_PROBE).stderr
-        m = re.search(rb"Duration: (\d+):(\d\d):(\d\d(?:\.\d+)?)", err)
-        if m:
-            h, mi, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
-            return h * 3600 + mi * 60 + s
-    except Exception as e:
-        logger.warning("could not read duration from ffmpeg for %s (%s)", path, e)
-    return None
-
-
 def _probe_duration(path, fallback):
     """Real duration of a rendered file. Concat and xfade both shift duration slightly
     off the arithmetic estimate, and the music fade-out has to start 4.5s before the
@@ -1503,7 +989,7 @@ def _fetch_image(url, attempts=2, deadline=None):
         try:
             # NOT a `with` block. Letting requests close a streamed response tidily
             # means waiting out a body that is still arriving in a trickle -- measured
-            # at 80s past the deadline during the Signature work, which is exactly what
+            # at 80s past the deadline against a dribbling server, which is exactly what
             # this must not do. The `finally` abandons the connection instead.
             response = requests.get(url, timeout=(5, 25), stream=True)
             try:
@@ -2341,122 +1827,6 @@ def _caption_filters(caption, caption_size, workdir, index, alpha_expr=None,
     return out
 
 
-def _presenter_opening_clip(src_path, out_path, timeout=TIMEOUT_CLIP):
-    """The agent's own footage, as the opening slide of a Signature.
-
-    Exactly SECONDS_PER_PHOTO long and encoded with _ENCODE_ARGS, because that is what
-    makes it just another slide: _dissolve_segments cuts every clip at fixed offsets
-    derived from SECONDS_PER_PHOTO, so a clip of any other length would be silently
-    truncated or run short. Matching the encode also keeps the assembly a stream copy.
-
-    Given the same contain-over-blur treatment the photos get -- shown WHOLE over a
-    blurred copy of itself -- so the opening looks like the rest of the film rather than
-    a different video bolted on the front. Containing is also the only treatment that is
-    SAFE here: an earlier cut cover-cropped to fill the frame and took the top of Janel's
-    head off, because phone footage is portrait and the agent is close to the lens. A
-    contain can crop nothing, whichever way up the clip was filmed.
-
-    Silent (_ENCODE_ARGS carries -an). Their voice is mixed back over the finished film,
-    where it can duck the music rather than fight it.
-
-    Returns a note for the agent, or None. A clip stored BEFORE the HDR fix is still
-    HLG on disk, and it is repaired HERE rather than left for the agent to re-upload --
-    MEASURED, the repair of the stored 8-bit clip is as good as converting the 10-bit
-    original again (colourfulness 0.166 against 0.165, contrast 208.0 against 207.1,
-    248 against 249 distinct luma levels, so the 8-bit round trip costs nothing
-    visible). That matters because the alternative was asking every agent who uploaded
-    before today to go and do it again. A clip stored since the fix already reads
-    bt709, so this costs a healthy render nothing but one header read.
-    """
-    colour = _source_colour(src_path) or {}
-    note = None
-    repair = ""
-    if colour.get("transfer") in HDR_TRANSFERS:
-        logger.warning("stored presenter clip is still HDR (%s) -- it predates the "
-                       "colour fix; converting it on the way into the film",
-                       colour.get("transfer"))
-        repair, note = _hdr_to_sdr_filter(colour)
-    # Backdrop: cover-scale, then crop. force_original_aspect_ratio=increase guarantees
-    # the scaled frame is at least as large as the crop in BOTH dimensions -- the first
-    # cut used `scale=1080:-1,crop=1080:1920`, which on any clip squarer than 9:16
-    # (a 3:4 portrait, a landscape held sideways) produced a frame shorter than 1920 and
-    # ffmpeg refused the crop outright, failing the whole render.
-    #
-    # Blurred small and scaled back up, as the photo path does: a wide-radius blur over
-    # a full-resolution frame is enormously expensive and, since blurring is destroying
-    # detail, indistinguishable from blurring a thumbnail. Per FRAME of video that
-    # saving is 120x what it is for a still.
-    bg = (f"scale=w={VW // 4}:h={VH // 4}:force_original_aspect_ratio=increase,"
-          f"crop={VW // 4}:{VH // 4},"
-          f"boxblur={CONTAIN_BLUR_RADIUS - 2}:2,"
-          f"scale={VW}:{VH},"
-          f"eq=brightness=-{CONTAIN_BG_DARKEN / 2:.3f}")
-    # Foreground: contain. decrease fits the clip INSIDE 1080x1920 whole, so a portrait
-    # clip fills the frame, a squarer one gets blurred bands, and nothing is ever cut.
-    fg = f"scale=w={VW}:h={VH}:force_original_aspect_ratio=decrease:flags=lanczos"
-    def build(with_repair, with_tags):
-        return [
-            "ffmpeg", "-y", "-v", "error",
-            # -stream_loop so a clip shorter than a slide still fills one rather than
-            # freezing on a black tail.
-            "-stream_loop", "-1", "-i", src_path, "-t", "%.3f" % SECONDS_PER_PHOTO,
-            "-filter_complex",
-            # The repair, when there is one, goes in BEFORE the split, so it is done
-            # once and both the sharp foreground and the blurred backdrop come from
-            # converted frames. Empty for every healthy clip, which leaves this graph
-            # exactly as it was.
-            (f"[0:v]{repair + ',' if (with_repair and repair) else ''}fps={FPS},"
-             f"split=2[bgin][fgin];"
-             f"[bgin]{bg}[b];"
-             f"[fgin]{fg}[f];"
-             f"[b][f]overlay=(W-w)/2:(H-h)/2:shortest=0,setsar=1,format=yuv420p[v]"),
-            "-map", "[v]",
-            # Slide zero states bt709 explicitly, so the stream-copy concat can never
-            # publish the film under whatever colour description the agent's phone
-            # chose. See COLOUR_TAG_ARGS for why it is here and not in _ENCODE_ARGS.
-        ] + _ENCODE_ARGS + (COLOUR_TAG_ARGS if with_tags else []) + [out_path]
-
-    # COLOUR MUST NEVER COST THE VIDEO.
-    #
-    # This is the one stage of a Signature that cannot degrade -- a film without the
-    # agent in it is a Classic -- so anything that CAN fail here fails the whole render
-    # and the agent is told their clip could not be read. That is exactly what happened
-    # on the first production Signature after the colour fix shipped: the repair chain
-    # was refused by Railway's ffmpeg build, and an agent with a perfectly good
-    # recording was told to go and record another one.
-    #
-    # The repair and the colour tags are both COSMETIC. They are worth having, they are
-    # never worth a failed render, and a probe that says a filter exists is not a
-    # promise that this particular graph will run. So they are attempted in descending
-    # order of niceness and the last rung is byte-for-byte the command that shipped
-    # before any of this existed.
-    attempts = [
-        (True, True),    # converted and tagged -- the right answer
-        (False, True),   # tagged only: the card and photos are right, the agent flat
-        (False, False),  # exactly the pre-colour-fix command; wrong colours, but a film
-    ]
-    if not repair:
-        attempts = [(False, True), (False, False)]
-    last_error = None
-    for i, (with_repair, with_tags) in enumerate(attempts):
-        try:
-            _run_ffmpeg(build(with_repair, with_tags), timeout)
-        except Exception as e:
-            last_error = e
-            logger.warning("presenter opening clip failed (repair=%s tags=%s): %s",
-                           with_repair, with_tags, str(e)[:300])
-            continue
-        if with_repair:
-            return note
-        if with_tags:
-            return VIDEO_NOTE_HDR_NOT_TONEMAPPED if repair else note
-        logger.error("presenter opening clip fell all the way back to the untagged "
-                     "command; this film will carry the clip's own colour description")
-        return VIDEO_NOTE_HDR_NOT_TONEMAPPED if repair else note
-    # Every rung failed, so the clip really is unreadable and raising is correct.
-    raise last_error
-
-
 def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=None,
                   zoom_in=True, drift_right=True, first=True, last=True):
     """STYLE B: one photo -> one 5s contain-over-blur clip that pushes in (or pulls
@@ -2912,7 +2282,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                           stats=None, agent_name="", agent_contact_line="",
                           style="classic", photo_index=0, agent_photo_url=None,
                           copy_guard=None, music_seed=None, caption_overrides=None,
-                          music_track=None, video_photos=None, presenter_path=None):
+                          music_track=None, video_photos=None):
     """Renders the Classic-tier listing video and returns (mp4_bytes, degradations, captions).
 
     `caption_overrides` maps a photo's URL to a caption the AGENT wrote. Keyed on the
@@ -2962,7 +2332,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
 
     property_type / district / price_text / stats are not drawn: the Classic tier's
     on-screen text is the room captions, and a stats block in the same lower third
-    would collide with them. district / price_text / stats are kept for signature
+    would collide with them. district / price_text / stats are kept for call-signature
     compatibility only -- but property_type is no longer inert, because it now picks
     the music's mood register (see _music_tier). Blank is fine and common; it reads
     as the warmer of the two registers.
@@ -3110,35 +2480,11 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
         caption_size = _caption_font_size(captions)
 
         with tempfile.TemporaryDirectory() as workdir:
+            # EVERY clip in the timeline is built here, into this render's own workdir.
+            # Nothing caller-owned may go straight into clip_paths: the single-clip
+            # shortcut below is an os.replace, which would MOVE the caller's file out
+            # from under them rather than copy it.
             clip_paths = []
-            # --- the Signature tier's opening slide: the agent themselves ---
-            # Built here, into this render's workdir, so the file the timeline consumes
-            # is OURS. An earlier cut took a caller-owned path straight into clip_paths,
-            # where the single-clip shortcut below (os.replace) would have MOVED the
-            # agent's stored clip out from under them.
-            #
-            # This is the one stage of a Signature that does not degrade. A Signature
-            # without the agent in it is a Classic, and quietly shipping one as the other
-            # means an agent posts a film believing they are in it. Better to fail and
-            # say why.
-            opening_clip = None
-            if presenter_path:
-                opening_clip = os.path.join(workdir, "clip_presenter.mp4")
-                try:
-                    # Answers a note only when the stored clip was HDR AND this ffmpeg
-                    # could not convert it properly. A clip stored before the HDR fix is
-                    # repaired in there rather than reported, so the agent does not have
-                    # to re-upload anything.
-                    hdr_note = _presenter_opening_clip(presenter_path, opening_clip)
-                    if hdr_note:
-                        degradations.append(hdr_note)
-                except Exception as e:
-                    logger.error("presenter opening clip failed (%s)", e)
-                    raise RuntimeError(
-                        "Your presenting clip could not be read. Try uploading it again "
-                        "in My Profile, or record a new one."
-                    ) from e
-                clip_paths.append(opening_clip)
             # Which photos actually reached a clip. `photo_urls` is the PLAN; this is
             # the film. They diverge when the budget runs out or a clip fails to
             # encode, and the captions we return and store have to describe the film
@@ -3183,11 +2529,10 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                             zoom_in=(i % 2 == 0),
                             drift_right=(i // 2 % 2 == 0),
                             # `first` means "this clip is not dissolved INTO", which
-                            # decides when the caption may appear. On a Signature the
-                            # first PHOTO is the second CLIP, so its caption has to wait
-                            # out the dissolve from the presenter or it double-strikes
-                            # through it.
-                            first=(i == 0 and opening_clip is None),
+                            # decides when the caption may appear: the opening clip
+                            # fades up from black rather than out of another shot, so
+                            # its caption does not have to wait for a dissolve.
+                            first=(i == 0),
                             last=is_last,
                         )
                     else:
@@ -3222,10 +2567,8 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             by_url = {u: captions[i] for i, u in enumerate(photo_urls) if captions[i]}
             captions_used = {u: by_url[u] for u in rendered_urls if u in by_url}
 
-            photo_clips = len(clip_paths) - (1 if opening_clip else 0)
+            photo_clips = len(clip_paths)
             if not photo_clips:
-                # Also the guard that keeps the os.replace shortcut below from being
-                # handed the presenter clip as the entire film.
                 raise RuntimeError("No photo could be rendered into the video")
 
             body_path = os.path.join(workdir, "body.mp4")
@@ -3256,10 +2599,9 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                 logger.warning("contact card failed (%s); shipping the slideshow without it", e)
                 degradations.append("the closing contact card could not be built")
 
-            # --- soundtrack: music bed, plus the agent's voice on a Signature ---
-            # Everything here degrades. The ladder, best first: voice over ducked music
-            # -> music alone -> silence. A problem with one layer never costs the other
-            # and never costs the video.
+            # --- soundtrack: the music bed ---
+            # Everything here degrades. The ladder, best first: music -> silence. A
+            # problem with the soundtrack never costs the video.
             final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
             wrote_final = False
             track_path = None
@@ -3274,14 +2616,7 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             if track_path is None:
                 track_path, music_tier = _select_music_track(music_seed, property_type)
 
-            # The voice comes from the agent's stored clip, not from the opening slide --
-            # the slide is silent by construction (_ENCODE_ARGS carries -an). Only offered
-            # when that slide actually made it into the film, so the voice can never play
-            # over a video the agent is not in.
-            voice_path = presenter_path if opening_clip else None
             fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
-            voice_end = min(SECONDS_PER_PHOTO, silent_duration)
-            duck_release = max(0.1, PRESENTER_DUCK_RELEASE)
 
             def _music_chain(normalize):
                 """[1:a] -> [music]. `normalize` is True ONLY for tracks flagged "raw" in
@@ -3299,81 +2634,33 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                     f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_OUT_SECONDS}"
                 )
 
-            def _duck():
-                """A second volume stage that holds the music down while the agent speaks
-                and eases it back up over PRESENTER_DUCK_RELEASE once the film reaches the
-                rooms. Multiplies the stage before it, so AUDIO_VOLUME still sets the
-                ceiling and nothing about the music's own level changes."""
-                return (
-                    f",volume='min(1,max({PRESENTER_MUSIC_DUCK},"
-                    f"{PRESENTER_MUSIC_DUCK}+(1-{PRESENTER_MUSIC_DUCK})"
-                    f"*(t-{voice_end:.3f})/{duck_release:.3f}))':eval=frame"
-                )
-
-            def _voice_chain(index):
-                """[index:a] -> [voice]: the opening slide's worth of the agent speaking,
-                padded with silence to the full length of the film.
-
-                Padded rather than mixed short because amix's own normalisation is what
-                the volume=2 below undoes, and a stream that drops out mid-mix makes that
-                correction wrong for the rest of the film."""
-                fade = min(PRESENTER_VOICE_FADE, voice_end / 2)
-                return (
-                    f"[{index}:a]atrim=0:{voice_end:.3f},asetpts=PTS-STARTPTS,"
-                    f"volume={PRESENTER_VOICE_VOLUME},"
-                    f"afade=t=out:st={voice_end - fade:.3f}:d={fade:.3f},"
-                    f"apad,atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS"
-                )
-
-            def _soundtrack(normalize, with_voice):
+            def _soundtrack(normalize):
                 """(extra ffmpeg inputs, filter_complex) for one attempt."""
                 inputs, filters = [], []
-                both = bool(track_path) and with_voice
                 if track_path:
                     # -stream_loop so a track shorter than the video still covers it.
                     inputs += ["-stream_loop", "-1", "-i", track_path]
-                    filters.append(_music_chain(normalize)
-                                   + (_duck() if with_voice else "")
-                                   + (f",{PRESENTER_MIX_FORMAT}[music]" if both else "[aout]"))
-                if with_voice:
-                    inputs += ["-i", voice_path]
-                    filters.append(_voice_chain(2 if track_path else 1)
-                                   + (f",{PRESENTER_VOICE_TO_STEREO}"
-                                      f",{PRESENTER_MIX_FORMAT}[voice]"
-                                      if both else "[aout]"))
-                if both:
-                    # amix scales by 1/inputs, so volume=2 puts both layers back at the
-                    # level their own chains set. Worst case is the ducked music under
-                    # the voice, which lands just under full scale -- see
-                    # PRESENTER_VOICE_VOLUME.
-                    filters.append("[music][voice]amix=inputs=2:duration=first,volume=2[aout]")
-                # A music-only soundtrack is therefore the exact filter string, and the
-                # exact command, that shipped before Signature existed.
+                    filters.append(_music_chain(normalize) + "[aout]")
                 return inputs, ";".join(filters)
 
-            # Attempts, best first, deduplicated. A raw track tries normalization first,
-            # so a normalization problem costs loudness consistency rather than the music.
-            # A normal Classic has exactly one attempt, identical to before this change.
+            # Attempts, best first. A raw track tries normalization first, so a
+            # normalization problem costs loudness consistency rather than the music.
+            # An ordinary track has exactly one attempt.
+            #
+            # With no track at all there is NO attempt, deliberately: that command would
+            # be an empty -filter_complex with -map "[aout]", which cannot succeed and
+            # only spends an ffmpeg call on the way to the silent fallback below.
+            # Reached when the music files are missing from the deploy.
             is_raw = _is_raw_track(track_path) if track_path else False
             attempts = []
-            for with_voice in ([True, False] if voice_path else [False]):
-                for normalize in ([True, False] if is_raw else [False]):
-                    if not track_path and not with_voice:
-                        # Nothing left to put in the soundtrack: that attempt would be an
-                        # empty -filter_complex with -map "[aout]", which cannot succeed
-                        # and only spends an ffmpeg call on the way to the silent
-                        # fallback below. Reached when the music file is missing from the
-                        # deploy and the voice layer has already failed.
-                        continue
-                    attempts.append((normalize, with_voice))
-            if not track_path and not voice_path:
-                attempts = []
+            if track_path:
+                attempts = [True, False] if is_raw else [False]
+            else:
                 logger.warning("no usable music track found in %s", AUDIO_DIR)
                 degradations.append("the background music file is missing from the deploy")
 
-            used_voice = False
-            for attempt_no, (normalize, with_voice) in enumerate(attempts):
-                extra_inputs, filter_complex = _soundtrack(normalize, with_voice)
+            for attempt_no, normalize in enumerate(attempts):
+                extra_inputs, filter_complex = _soundtrack(normalize)
                 try:
                     _run_ffmpeg([
                         "ffmpeg", "-y", "-i", silent_path,
@@ -3384,22 +2671,16 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                         "-movflags", "+faststart", final_path,
                     ], TIMEOUT_MUSIC)
                     wrote_final = True
-                    used_voice = with_voice
                     # Logged on every render so "why does my video sound different from my
                     # colleague's?" is answerable from Railway's logs alone.
-                    logger.info("soundtrack: %s (%s tier, property_type %r, seed %r)%s%s",
+                    logger.info("soundtrack: %s (%s tier, property_type %r, seed %r)%s",
                                 os.path.basename(track_path) if track_path else "no music",
                                 music_tier if track_path else "n/a",
                                 str(property_type or ""), str(music_seed or ""),
-                                ", raw track loudness-normalized" if normalize else "",
-                                ", agent's voice over ducked music" if with_voice else "")
+                                ", raw track loudness-normalized" if normalize else "")
                     break
                 except Exception as e:
                     last = attempt_no == len(attempts) - 1
-                    if with_voice and not last:
-                        logger.warning("could not mix the agent's voice in (%s); "
-                                       "trying the next soundtrack option", e)
-                        continue
                     if normalize and not last:
                         logger.warning("loudness normalization of raw track %s failed "
                                        "(%s); retrying with the track as-is",
@@ -3410,19 +2691,12 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                     logger.warning("soundtrack failed (%s); shipping a silent video", e)
                     degradations.append("the background music could not be added")
 
-            # Said once, from what actually shipped, rather than once per failed attempt.
-            if voice_path and wrote_final and not used_voice:
-                degradations.append(
-                    "your voice could not be added, so the video has music only")
-
             if not wrote_final:
                 _run_ffmpeg(["ffmpeg", "-y", "-i", silent_path, "-c", "copy",
                              "-movflags", "+faststart", final_path], TIMEOUT_MUSIC)
 
             # Last thing before the bytes leave: never hand storage a file it will
-            # reject for size. Does nothing at all to a normal-sized film, and applies
-            # to a Signature exactly as to a Classic -- a Signature is one slide longer,
-            # so if anything it needs this more.
+            # reject for size. Does nothing at all to a normal-sized film.
             final_path, shrink_note = _fit_delivery_size(final_path, workdir)
             if shrink_note:
                 degradations.append(shrink_note)
@@ -3433,8 +2707,8 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
         if degradations:
             logger.warning("video rendered with degradations: %s", "; ".join(degradations))
         logger.info(
-            "video rendered: %d photo(s)%s, %.1fs, %.1fMB, %.0fs wall clock",
-            photo_clips, " + the agent's own clip" if opening_clip else "",
+            "video rendered: %d photo(s), %.1fs, %.1fMB, %.0fs wall clock",
+            photo_clips,
             silent_duration, len(data) / 1024 / 1024,
             time.monotonic() - started,
         )

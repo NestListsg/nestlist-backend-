@@ -1,6 +1,6 @@
 """A job must never count itself as being ahead of itself.
 
-Seen in production on the first two Signatures an agent ever generated: both said
+Seen in production on the first two renders an agent ever generated: both said
 "2nd in line, about 3 minutes" with an empty queue behind them. `describe()` is handed
 the job row as it was at enqueue, and a worker can claim it between that insert and the
 call -- so counting RUNNING jobs by type counted the job against itself, putting the
@@ -54,7 +54,7 @@ def describe(queued_ahead, running, self_is_running):
     vj._average_duration = lambda t: 100.0
     vj._worker_count = lambda: 4
     try:
-        return vj.describe({"id": "me", "job_type": vj.JOB_TYPE_SIGNATURE,
+        return vj.describe({"id": "me", "job_type": vj.JOB_TYPE_CLASSIC,
                             "status": vj.STATUS_QUEUED, "created_at": "2026-10-20T00:00:00Z"})
     finally:
         vj._exec, vj._average_duration, vj._worker_count = saved

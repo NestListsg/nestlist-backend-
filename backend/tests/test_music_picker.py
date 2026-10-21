@@ -85,7 +85,7 @@ check("real manifest: Upbeat never in the automatic pick",
 # refactored for Signature, while the behaviour it cared about was entirely intact --
 # and a string match could never have told the difference. The stronger guarantee that
 # a Classic render issues the IDENTICAL ffmpeg commands it issued before the refactor
-# now lives in tests/test_signature_render.py, which diffs them against git HEAD.
+# now lives in tests/test_classic_render.py, which diffs them against a committed golden.
 def soundtrack_graphs(track_id):
     """The audio filter strings a render would hand ffmpeg, in attempt order."""
     from PIL import Image

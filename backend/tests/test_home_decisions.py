@@ -91,7 +91,7 @@ run_nodes("_basic_listing_fallback", "_normalize_district", "_extract_district_t
           "_strip_land_fields_for_strata", "ListingRequest", "WriteupRequest", "ProfileUpdate", "ProfileCEAUpdate",
           "_cea_profile_updates", "_agent_response", "_public_agent_block", "OWNER_CONSENT_REQUIRED_DETAIL")
 NS.update({"_can_use_instagram_beta": lambda a: True, "_can_use_facebook_beta": lambda a: True,
-           "_can_use_linkedin_beta": lambda a: True, "_signature_columns_available": lambda: False})
+           "_can_use_linkedin_beta": lambda a: True})
 
 CEA_AGENT = {"id": "a1", "name": "Janel Chee", "agency": "NL Realty", "specialty": "homes", "contact": "9123 4567",
              "cea_reg_no": "R123456A", "agency_name": "NL Realty Pte Ltd", "agency_licence_no": "L3008899K"}

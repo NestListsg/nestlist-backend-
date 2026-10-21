@@ -33,9 +33,14 @@
 create table if not exists public.video_jobs (
     id                uuid primary key default gen_random_uuid(),
 
-    -- Which kind of video. 'classic' is what every agent generates today.
-    -- 'signature' is defined now so the avatar pipeline can be plugged in later
-    -- without another migration; nothing creates one yet.
+    -- Which kind of video. 'classic' is what every agent generates.
+    --
+    -- 'signature' is allowed by the check constraint below and is NOT removed from it:
+    -- that tier was withdrawn on 2026-10-21, nothing creates such a row any more, and
+    -- tightening a live constraint would buy nothing while risking failure on any
+    -- leftover row. A job type with no registered renderer is never claimed, so a
+    -- leftover row is inert. Leave the constraint as it is; it is the slot a future
+    -- second type would use.
     job_type          text        not null default 'classic',
 
     -- Stored as text rather than uuid, and with no foreign key, on purpose: it keeps

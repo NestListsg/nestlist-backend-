@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -16,15 +16,11 @@ import zipfile
 import json
 import asyncio
 import httpx
-import tempfile
 import uuid
 import re
 import secrets
 import hashlib
 import threading
-# For _abandon_response: shutting a socket down is the only thing that reliably
-# interrupts a stalled streaming read (see that function).
-import socket
 import fcntl
 import time
 import random
@@ -374,23 +370,12 @@ async def startup_event():
     # db_execute (so it inherits the retry and poisoned-pool discipline), then the
     # renderers, and only then does it probe and start consuming.
     #
-    # Both tiers are registered now. 'signature' is the same film with the agent's own
-    # presenting clip as its opening slide: it renders through the same core, stores to
-    # its own object path and records itself in its own signature_video_* columns, so a
-    # Signature can never overwrite a Classic the agent may already have posted. Its
-    # account-wide limit of 1 is enforced by video_jobs.JOB_TYPES, unchanged.
-    #
-    # Enqueuing is gated on those columns existing (see _note_signature_columns), so
-    # before the migration no Signature job is ever created and this registration
-    # changes nothing an agent can see.
+    # One render type, 'classic'. The queue is built to take more (video_jobs.JOB_TYPES
+    # plus one register_renderer call each) -- the Signature tier was the second and was
+    # withdrawn on 2026-10-21.
     video_jobs.configure(db_execute)
     video_jobs.register_renderer(video_jobs.JOB_TYPE_CLASSIC,
                                  _classic_job_run, _classic_job_failed)
-    video_jobs.register_renderer(video_jobs.JOB_TYPE_SIGNATURE,
-                                 _signature_job_run, _signature_job_failed)
-    # Detect whether the signature_video_* columns exist, so the first login already
-    # knows whether to offer the button. Backgrounded like every other probe.
-    asyncio.create_task(asyncio.to_thread(_probe_signature_columns))
     # Backgrounded for the same reason as the probes above: a slow database must not
     # hold up the port binding.
     asyncio.create_task(_start_video_queue())
@@ -1126,11 +1111,6 @@ def _agent_response(agent) -> dict:
     out["can_use_instagram_beta"] = _can_use_instagram_beta(agent)
     out["can_use_facebook_beta"] = _can_use_facebook_beta(agent)
     out["can_use_linkedin_beta"] = _can_use_linkedin_beta(agent)
-    # Can this agent be offered the Signature button at all? True only when the columns
-    # exist AND they have recorded their presenting clip, so the frontend never has to
-    # guess: no clip, no Signature, and before the migration nobody sees the button.
-    out["signature_available"] = bool(
-        _signature_columns_available() and agent.get("presenter_video_url"))
     return out
 
 # ================================
@@ -1834,11 +1814,6 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
         query = query.neq("status", "lead")
     result = query.order("created_at", desc=True).execute()
     rows = result.data or []
-    # Free side-effect of a select("*"): these rows settle whether the signature_video_*
-    # columns exist, which is what gates the Signature button. Costs a dict lookup, and
-    # means the day Jane runs the migration the feature comes on by itself.
-    if rows:
-        _note_signature_columns(rows[0])
     # Additive field -- `location` stays exactly as the agent typed it (their own
     # record), `display_location` is the house/unit-number-free version every
     # copy surface (captions, poster text, public page) should render instead.
@@ -1851,11 +1826,10 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
     # spinner. One indexed select that returns nothing at all in the common case of an
     # agent with no render in flight, and it degrades to None rather than failing the
     # whole listings page if the queue table is unreadable.
-    # CLASSIC only, explicitly. video_queue_position / video_eta_seconds below have
-    # always meant "my video", and one listing can now have a Classic and a Signature
-    # rendering at the same time -- without naming the tier, a Signature queued behind
-    # nine others would show up as the Classic's position. The Signature's own progress
-    # has its own endpoint (/signature-status), which is what the app polls for it.
+    # CLASSIC only, explicitly. video_queue_position / video_eta_seconds mean "my
+    # video", and the queue is keyed on (listing, job type) -- so if a second render
+    # type is ever added, a job of that type queued behind nine others must not show up
+    # here as this listing's Classic position. Naming the tier is what prevents that.
     active_video_jobs = video_jobs.describe_active_for_agent(
         agent["id"], video_jobs.JOB_TYPE_CLASSIC)
     for row in rows:
@@ -5366,319 +5340,13 @@ def _store_rendered_video(filename: str, video_bytes: bytes) -> str:
             delay *= 2
 
 
-# ---------------------------------------------------------------------------
-# What differs between a Classic and a Signature, and nothing else.
-#
-# Both tiers are the SAME film: video_renderer.render_property_video builds the
-# dissolve, the captions and the closing card, and a Signature is that film with the
-# agent's own clip as slide zero. So the only things that differ at this level are
-# WHERE the finished mp4 is stored and WHICH listing columns record it -- and they must
-# differ, because a Signature that overwrote the Classic would take away a video the
-# agent may already have posted. One object path and one column set each; the shared
-# `video_captions` column is deliberately NOT duplicated (same photos, same captions).
-# ---------------------------------------------------------------------------
-class _VideoVariant:
-    def __init__(self, job_type, label, path_prefix, url_column, status_column,
-                 error_column, started_column, degradations_column):
-        self.job_type = job_type
-        self.label = label                      # for log lines only
-        self.path_prefix = path_prefix
-        self.url_column = url_column
-        self.status_column = status_column
-        self.error_column = error_column
-        self.started_column = started_column
-        self.degradations_column = degradations_column
-
-    def object_path(self, listing_id):
-        return f"{self.path_prefix}/{listing_id}.mp4"
-
-
-_CLASSIC_VARIANT = _VideoVariant(
-    video_jobs.JOB_TYPE_CLASSIC, "Classic", "videos",
-    "video_url", "video_status", "video_error",
-    "video_render_started_at", "video_degradations")
-
-_SIGNATURE_VARIANT = _VideoVariant(
-    video_jobs.JOB_TYPE_SIGNATURE, "Signature", "videos/signature",
-    "signature_video_url", "signature_video_status", "signature_video_error",
-    "signature_video_render_started_at", "signature_video_degradations")
-
-
-# Whether the listings table has the signature_video_* columns yet.
-#
-# Learned from a FULL listing row's keys -- exactly how the degradations column is
-# detected below -- and then cached, so no request pays for a probe. It is learned
-# again from every full row we read, which means the day Jane runs the migration the
-# feature switches itself on without waiting for a redeploy. It only ever moves from
-# "missing" to "present": a migration is not un-run.
-#
-# DETECTED ON signature_video_status, NOT signature_video_url. The url column already
-# exists in production and is already populated -- it holds the hand-made Signature
-# that the demo buyer page serves today, and it predates this tier entirely. Detecting
-# on it would declare the feature ready on a database where the four columns the
-# migration actually adds are still missing, which is precisely the state this
-# detection exists to refuse: the button would be offered, the job accepted, and every
-# status write would then fail. The status column is one the migration adds.
-SIGNATURE_DETECT_COLUMN = "signature_video_status"
-_signature_columns_supported = None      # None = not learned yet
-
-
-def _note_signature_columns(listing_row) -> bool:
-    """Learn, from one row of a select("*"), whether the signature columns exist."""
-    global _signature_columns_supported
-    if isinstance(listing_row, dict) and listing_row:
-        if SIGNATURE_DETECT_COLUMN in listing_row:
-            if _signature_columns_supported is not True:
-                logger.info("listings.%s present -- Signature videos enabled",
-                            SIGNATURE_DETECT_COLUMN)
-            _signature_columns_supported = True
-        elif _signature_columns_supported is None:
-            _signature_columns_supported = False
-            logger.warning(
-                "listings.%s NOT present -- Signature videos are off until the migration "
-                "in backend/migrations/ is run. The Classic tier is unaffected.",
-                SIGNATURE_DETECT_COLUMN)
-    # Learn either way, but ANSWER through the one gate. generate_signature asks this
-    # function rather than _signature_columns_available, so returning the raw learned
-    # value here would leave the endpoint reachable with the tier switched off -- and a
-    # stale browser tab is enough to hit it.
-    return _signature_columns_available()
-
-
-# THE SIGNATURE TIER IS OFF.
-#
-# Jane's call, 2026-10-21, after watching the first automated films end to end:
-# "the signature video is not up to standard yet so please do not let it go live. real
-# janel against a bad wall background followed by the property is not good at all."
-#
-# The machinery works -- render, queue, colour, captions are all correct and tested.
-# What is not right is the FILM: an agent talking to camera against whatever wall they
-# happened to stand in front of, cut to a property they are visibly not standing in.
-# That is a product problem, not a defect, and the fix under discussion is filming the
-# clip inside the listing itself.
-#
-# So this is a switch, not a removal. Nothing is deleted, every test still runs, and the
-# day the opener is right this becomes SIGNATURE_ENABLED=1 in Railway with no deploy.
-#
-# With it off: `signature_available` is false so My Listings never offers the button,
-# POST /generate-signature answers the 503 the frontend already understands as "not
-# switched on yet" and hides the panel for, and GET /signature-status answers "none".
-# An agent who already has a Signature keeps the file; it simply is not offered again.
-SIGNATURE_ENABLED = os.environ.get("SIGNATURE_ENABLED", "").strip() in ("1", "true", "yes")
-
-
-def _signature_columns_available() -> bool:
-    return SIGNATURE_ENABLED and _signature_columns_supported is True
-
-
-def _probe_signature_columns():
-    """Learn the answer once at startup, from one listing row, so the very first
-    /api/login already knows whether to offer the button. A table with no listings at
-    all teaches nothing and leaves the answer unknown (treated as 'off'); the first
-    listing anyone reads settles it."""
-    try:
-        res = get_db().table("listings").select("*").limit(1).execute()
-        rows = res.data or []
-        if rows:
-            _note_signature_columns(rows[0])
-        else:
-            logger.info("signature column probe: no listings to read yet -- Signature "
-                        "stays off until the first listing is read")
-    except Exception as e:
-        logger.warning("signature column probe failed (%s) -- Signature stays off for "
-                       "now; the next listing read will settle it", e)
-
-
-SIGNATURE_UNAVAILABLE_DETAIL = "Signature videos are not switched on yet."
-SIGNATURE_NO_PRESENTER_DETAIL = (
-    "Record your presenting clip in My Profile first, then generate your Signature.")
-
-# Downloading the agent's stored presenting clip at render time.
-#
-# The stored object is already normalised (<=12s, long edge 1280, H.264/AAC), so a few
-# megabytes is the honest expectation and 64MB is a generous ceiling rather than a
-# working limit. Bounded on BOTH sides -- bytes and seconds -- because this runs inside
-# a render slot: an unbounded read of a hung CDN connection would hold the only render
-# slot this process has and stall every other agent's video behind it.
-PRESENTER_FETCH_MAX_BYTES = 64 * 1024 * 1024
-PRESENTER_FETCH_TIMEOUT = (5, 30)        # (connect, read-between-chunks)
-PRESENTER_FETCH_ATTEMPTS = 2             # one retry for a flaky read, then stop
-
-# TOTAL WALL CLOCK, which is the bound that actually matters here.
-#
-# The timeout above limits the gap BETWEEN chunks, not the length of the download. A
-# server dribbling a kilobyte every two seconds never trips it, and never sends enough
-# to trip the byte cap either, so the fetch would run for hours -- holding this worker's
-# only render claim while the heartbeat kept proving the job was alive, so nothing could
-# reclaim it either. The audit measured a projected 36 hours per attempt.
-#
-# A deadline is the only thing that bounds a trickle, and it takes BOTH halves below to
-# enforce one. Measured against the audit's dribbling server: a check inside the chunk
-# loop alone never ran, because requests does not yield a chunk until the whole chunk
-# has been collected (and chunk_size=None is worse, not better -- urllib3 then reads to
-# end of body), so the loop sat inside one blocked read with the deadline long past.
-# Closing the response from a watchdog thread is what makes that read return.
-#
-# A normalised clip is a few megabytes, so 45 seconds is already far longer than a
-# healthy fetch needs, and the total bounds the retry as well.
-PRESENTER_FETCH_DEADLINE_SECONDS = 45
-PRESENTER_FETCH_TOTAL_SECONDS = 100
-PRESENTER_FETCH_CHUNK = 64 * 1024
-_PRESENTER_TOO_SLOW = ("your presenting clip was downloading too slowly (%%d bytes in "
-                       "%ds)" % PRESENTER_FETCH_DEADLINE_SECONDS)
-
-
-def _abandon_response(response, warn=False):
-    """Make a read that is blocked on this response return, now.
-
-    Measured against the audit's dribbling server, the obvious ways do not work, and
-    not merely by being slower:
-      * response.close() hands the connection back tidily, which means waiting out the
-        body that is still arriving in a trickle -- 80 seconds past the deadline.
-      * closing the buffered reader underneath it BLOCKS, because the stalled read holds
-        that object's own lock. The watchdog thread ends up waiting for exactly the read
-        it was supposed to interrupt (measured: 81.3 seconds inside close()).
-    Shutting the SOCKET down is a syscall on the file descriptor: it takes no Python
-    lock, returned in 0.000s, and the blocked read came back in the same instant.
-
-    This reaches into urllib3's internals, so every step is best-effort and the caller's
-    deadline stands behind it. The interrupted read may look like a clean end of body
-    rather than an error, which is why the caller checks the deadline AFTER the loop as
-    well -- a cut-short download must never be mistaken for a complete one.
-    """
-    sock = None
-    for path in (lambda: response.raw._fp.fp.raw._sock,
-                 lambda: response.raw._original_response.fp.raw._sock,
-                 lambda: response.raw._connection.sock):
-        try:
-            found = path()
-        except Exception:
-            continue
-        if isinstance(found, socket.socket):
-            sock = found
-            break
-    if sock is None:
-        # A shape of urllib3 we do not know, or -- the common case -- a finished
-        # download whose connection has already been released. Only the watchdog cares,
-        # and only then is it worth a line in the log. Do NOT fall back to
-        # response.close() here: from the watchdog thread that is the call that blocks.
-        # The caller's deadline still ends the attempt.
-        if warn:
-            logger.warning("could not reach the socket to abandon a slow download")
-        return
-    for action in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
-        try:
-            action()
-        except Exception:
-            pass
-
-
-def _download_presenter_clip(url: str, dest_path: str):
-    """Fetch the agent's stored presenting clip to a local file.
-
-    Raises video_jobs.PermanentJobError when retrying cannot help (the clip is gone, or
-    it is not what we stored), and an ordinary exception for a transport failure, which
-    the queue retries. Deliberately NOT a degradation: a Signature without the agent in
-    it is a Classic, and must never be delivered as one.
-    """
-    last_error = None
-    overall_deadline = time.monotonic() + PRESENTER_FETCH_TOTAL_SECONDS
-    for attempt in range(1, PRESENTER_FETCH_ATTEMPTS + 1):
-        written = 0
-        if time.monotonic() >= overall_deadline:
-            break
-        deadline = min(time.monotonic() + PRESENTER_FETCH_DEADLINE_SECONDS,
-                       overall_deadline)
-        try:
-            # NOT a `with` block. Leaving a streamed response through its context
-            # manager lets requests close it tidily, and closing a response whose body
-            # is still arriving in a trickle blocks until that body is done with --
-            # measured at 80 seconds past the deadline, which is exactly the thing this
-            # function must not do. The `finally` below abandons the connection instead.
-            r = requests.get(url, timeout=PRESENTER_FETCH_TIMEOUT, stream=True)
-            try:
-                if r.status_code in (401, 403, 404, 410):
-                    # The agent replaced or deleted the clip, or the bucket moved. Three
-                    # more attempts would all read the same missing object.
-                    raise video_jobs.PermanentJobError(
-                        "Your presenting clip could not be found. Please upload it again "
-                        "in My Profile, then generate your Signature.")
-                r.raise_for_status()
-                declared = r.headers.get("content-length")
-                if declared and int(declared) > PRESENTER_FETCH_MAX_BYTES:
-                    raise video_jobs.PermanentJobError(
-                        "Your presenting clip is too large to use. Please record a "
-                        "shorter one in My Profile.")
-                # THE WATCHDOG. Interrupting the connection from another thread is what
-                # unblocks a read waiting on a chunk that is filling too slowly; the
-                # check inside the loop below cannot fire while that read is blocked.
-                # Cancelled below, so a healthy download never notices it.
-                watchdog = threading.Timer(
-                    max(0.1, deadline - time.monotonic()),
-                    _abandon_response, args=(r, True))
-                watchdog.daemon = True
-                watchdog.start()
-                try:
-                    with open(dest_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=PRESENTER_FETCH_CHUNK):
-                            if time.monotonic() > deadline:
-                                raise TimeoutError("deadline reached between chunks")
-                            if not chunk:
-                                continue
-                            written += len(chunk)
-                            if written > PRESENTER_FETCH_MAX_BYTES:
-                                raise video_jobs.PermanentJobError(
-                                    "Your presenting clip is too large to use. Please "
-                                    "record a shorter one in My Profile.")
-                            f.write(chunk)
-                except video_jobs.PermanentJobError:
-                    raise
-                except Exception:
-                    # A read the watchdog interrupted arrives here as a transport error.
-                    # Past the deadline it is one, and saying so is more use in the logs
-                    # than "connection closed".
-                    if time.monotonic() > deadline:
-                        raise TimeoutError(_PRESENTER_TOO_SLOW % written)
-                    raise
-                finally:
-                    watchdog.cancel()
-            finally:
-                # Always, on every path: this connection is never reused, and a tidy
-                # close is the slow one.
-                _abandon_response(r)
-            if time.monotonic() > deadline:
-                # Either the watchdog cut the read, or the body ended as the deadline
-                # passed -- and a download that ran past its deadline cannot be trusted
-                # to be complete. Retryable; the total deadline bounds the retry.
-                raise TimeoutError(_PRESENTER_TOO_SLOW % written)
-            if declared and written != int(declared):
-                # Truncated: the connection ended early. Worth one retry, and far better
-                # than handing ffmpeg half a file and calling the clip unreadable.
-                raise RuntimeError(
-                    "your presenting clip arrived incomplete (%d of %s bytes)"
-                    % (written, declared))
-            if written == 0:
-                raise RuntimeError("the presenting clip downloaded as an empty file")
-            return dest_path
-        except video_jobs.PermanentJobError:
-            raise
-        except Exception as e:
-            last_error = e
-            logger.warning("presenter clip download failed (attempt %d/%d): %s: %s",
-                           attempt, PRESENTER_FETCH_ATTEMPTS, type(e).__name__, e)
-            if attempt < PRESENTER_FETCH_ATTEMPTS and time.monotonic() + 2.0 < overall_deadline:
-                time.sleep(2.0)
-    raise RuntimeError("could not download your presenting clip: %s" % last_error)
-
-
-def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int, ownership_check=None, music_track: str = None, video_photos: list = None, record_degradations=None, variant=None, presenter_path=None):
+def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video_template_id: str, persist_video_template_id: bool, photo_index: int, ownership_check=None, music_track: str = None, video_photos: list = None, record_degradations=None):
     """Render one video, store it, and write the finished URL onto the listing.
 
-    `variant` says which tier is being made -- which object path the mp4 goes to and
-    which listing columns record it. It defaults to the Classic, so every existing
-    caller renders exactly what it rendered before. `presenter_path` is a local copy of
-    the agent's presenting clip and is what makes the result a Signature; None renders
-    the Classic film, which is what the renderer has always done.
+    The mp4 goes to videos/{listing_id}.mp4 and is recorded in the listing's video_*
+    columns. Those used to be carried in a `variant` object so a second tier could
+    share this function; the Signature tier was withdrawn on 2026-10-21 and they are
+    written out here directly again.
 
     Returns (video_url, degradations). Raises on failure -- deliberately, because the
     two callers want to handle failure differently: the legacy in-process path marks the
@@ -5688,7 +5356,6 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
     and video_renderer's degradation ladder is untouched by the split -- degradations
     still travel back with the video and are still logged, on either path.
     """
-    variant = variant or _CLASSIC_VARIANT
     # Re-read the listing at job start rather than trusting the snapshot the
     # endpoint captured. A render takes a minute or more, and in that window the
     # agent may well delete or reorder a photo from the same My Listings screen --
@@ -5771,18 +5438,13 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
         # must NOT be replayed, or a wrong caption becomes permanent and no improvement
         # to the prompt can ever reach a listing that has been rendered once.
         caption_overrides=_agent_caption_overrides(listing.get("video_captions")),
-        # A local copy of the agent's own presenting clip, which becomes slide zero --
-        # that, and nothing else, is what makes this film a Signature. None for a
-        # Classic, which is the renderer's own default, so the Classic render is
-        # byte-for-byte the call it has always been.
-        presenter_path=presenter_path,
     )
     if degradations:
         # The agent still gets a video, so this is not a failure -- but a quietly
         # degraded render should be visible in Railway's logs, not indistinguishable
         # from a clean one.
-        logger.warning("%s video %s rendered with degradations: %s",
-                       variant.label, listing_id, "; ".join(degradations))
+        logger.warning("video %s rendered with degradations: %s",
+                       listing_id, "; ".join(degradations))
 
     # LAST OWNERSHIP CHECK BEFORE ANYTHING THE AGENT CAN SEE.
     #
@@ -5803,12 +5465,9 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
         raise video_jobs.SupersededError(
             "this render was reclaimed by another worker before its video was stored")
 
-    # Each tier has its OWN fixed path (videos/{id}.mp4 for the Classic,
-    # videos/signature/{id}.mp4 for the Signature), so a Signature render can never
-    # replace the bytes of a Classic the agent has already posted -- and regenerating
-    # either tier still overwrites only itself, which is what makes the upload retry
-    # above safe to repeat.
-    filename = variant.object_path(listing_id)
+    # One fixed path per listing, so regenerating a video overwrites only itself --
+    # which is what makes the upload retry above safe to repeat.
+    filename = f"videos/{listing_id}.mp4"
     video_url = _store_rendered_video(filename, video_bytes)
 
     if ownership_check is not None and not ownership_check():
@@ -5824,8 +5483,7 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
     # video is the deliverable; a missing note must never cost the agent their video):
     #   1. on the job row (queued path) -- /video-status reads it while the job is still
     #      active and, after it finishes, from the latest completed job;
-    #   2. on the listing row as video_degradations (signature_video_degradations for a
-    #      Signature -- see _VideoVariant) -- the only copy the legacy
+    #   2. on the listing row as video_degradations -- the only copy the legacy
     #      in-process path can have, and a durable one. Written only when the column
     #      exists (the fresh row has the key), so there is no failing write before the
     #      migration, and it is rewritten on EVERY render so a clean render clears an
@@ -5835,16 +5493,16 @@ def _render_video_core(listing_id: str, agent: dict, listing: dict, chosen_video
             record_degradations(list(degradations))
         except Exception as e:
             logger.warning("video %s: could not record degradations on the job (%s)", listing_id, e)
-    if variant.degradations_column in listing:
+    if "video_degradations" in listing:
         try:
             db_execute(
-                lambda db: db.table("listings").update({variant.degradations_column: list(degradations)}).eq("id", listing_id).eq("agent_id", agent["id"]),
+                lambda db: db.table("listings").update({"video_degradations": list(degradations)}).eq("id", listing_id).eq("agent_id", agent["id"]),
                 what="_render_video_job degradations update")
         except Exception as e:
             logger.warning("video %s: could not store degradations on the listing (%s)", listing_id, e)
 
-    update_payload = {variant.url_column: video_url, variant.status_column: "done",
-                      variant.error_column: None}
+    update_payload = {"video_url": video_url, "video_status": "done",
+                      "video_error": None}
     if persist_video_template_id:
         update_payload["video_template_id"] = chosen_video_template_id
     db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="_render_video_job listings update")
@@ -5904,8 +5562,8 @@ def _render_video_job(listing_id: str, agent: dict, listing: dict, chosen_video_
 #
 # video_jobs owns "which job runs where, and what happens when it doesn't"; this file
 # owns "what a Classic video IS and what it means for the listing row". These two
-# functions are the whole seam between them, and they are the reason adding Signature
-# later is wiring rather than surgery: it needs its own pair of these and nothing else.
+# functions are the whole seam between them, and they are why another render type would
+# be wiring rather than surgery: it needs its own pair of these and nothing else.
 # ---------------------------------------------------------------------------
 def _classic_job_run(job: dict):
     """Run one queued Classic render. Returns (video_url, degradations).
@@ -5996,112 +5654,6 @@ def _classic_job_failed(job: dict, error_text: str):
             what="_classic_job_failed listings update")
     except Exception as e:
         logger.warning("video job %s: could not mark the listing failed (%s)", job["id"], e)
-
-
-# ---------------------------------------------------------------------------
-# The queue's view of a Signature render.
-#
-# The same seam as the Classic pair above, and deliberately nothing more: one run
-# function, one final-failure function, registered at startup. Everything a Signature
-# shares with a Classic (the renderer, the upload retry, the ownership fencing, the
-# captions write) it shares by going through the same _render_video_core; everything it
-# does differently it does by carrying _SIGNATURE_VARIANT and a presenter clip.
-# ---------------------------------------------------------------------------
-def _signature_job_run(job: dict):
-    """Run one queued Signature render. Returns (video_url, degradations)."""
-    listing_id = str(job["listing_id"])
-    agent_id = str(job["agent_id"])
-    payload = job.get("payload") or {}
-
-    # Re-read for the same two reasons as the Classic path: page tokens must never be
-    # written into the queue table, and a job that waited should use the agent's details
-    # as they are now. For a Signature it matters twice over -- the presenting clip is
-    # read from here, so an agent who re-recorded it while queued gets the new one.
-    agent_res = db_execute(
-        lambda db: db.table("agents").select("*").eq("id", agent_id),
-        what="_signature_job_run agents select")
-    if not agent_res.data:
-        raise video_jobs.PermanentJobError("This agent account no longer exists.")
-    agent = agent_res.data[0]
-
-    listing_res = db_execute(
-        lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent_id),
-        what="_signature_job_run listings select")
-    if not listing_res.data:
-        raise video_jobs.PermanentJobError(
-            "This listing was deleted before its video could be generated.")
-    listing = listing_res.data[0]
-
-    # Everything agent-fixable fails fast and permanently rather than burning three
-    # attempts on something that cannot improve by being retried.
-    if not _note_signature_columns(listing):
-        # Unreachable through the endpoint (it 503s before enqueuing), so this is the
-        # belt to that braces: a job row from a rollback must not write columns that do
-        # not exist and leave the agent staring at 'rendering' for ever.
-        raise video_jobs.PermanentJobError(SIGNATURE_UNAVAILABLE_DETAIL)
-    if not (listing.get("images") or []):
-        raise video_jobs.PermanentJobError(
-            "This listing has no photos any more -- add a photo and generate the video again.")
-    presenter_url = agent.get("presenter_video_url")
-    if not presenter_url:
-        raise video_jobs.PermanentJobError(SIGNATURE_NO_PRESENTER_DETAIL)
-
-    try:
-        db_execute(
-            lambda db: db.table("listings").update({
-                _SIGNATURE_VARIANT.status_column: "rendering",
-                _SIGNATURE_VARIANT.started_column: datetime.now(timezone.utc).isoformat(),
-            }).eq("id", listing_id).eq("agent_id", agent_id),
-            what="_signature_job_run mark rendering")
-    except Exception as e:
-        # Cosmetic only, exactly as on the Classic path.
-        logger.warning("signature job %s: could not mirror 'rendering' onto the listing (%s)",
-                       job["id"], e)
-
-    # The clip lives only for this render. A TemporaryDirectory rather than the render's
-    # own workdir because the renderer must be handed a path it does not own: it writes
-    # its cut of the clip beside its other slides, and must never be able to move or
-    # overwrite the agent's stored upload.
-    with tempfile.TemporaryDirectory() as workdir:
-        presenter_path = _download_presenter_clip(
-            presenter_url, os.path.join(workdir, "presenter.mp4"))
-        try:
-            return _render_video_core(
-                listing_id, agent, listing,
-                payload.get("video_template_id") or DEFAULT_VIDEO_TEMPLATE_ID,
-                # A Signature never writes the listing's remembered template: the agent
-                # did not choose one here (the endpoint takes no template), so it must
-                # not overwrite what their Classic is set to.
-                False,
-                int(payload.get("photo_index") or 0),
-                ownership_check=lambda: video_jobs.heartbeat(job),
-                record_degradations=lambda degs: video_jobs.record_degradations(job, degs),
-                music_track=payload.get("music_track"),
-                video_photos=payload.get("video_photos"),
-                variant=_SIGNATURE_VARIANT,
-                presenter_path=presenter_path,
-            )
-        except video_renderer.RenderSlotBusy as e:
-            # Capacity, not failure -- back in the queue, the agent is never told no.
-            raise video_jobs.DeferJob(str(e))
-
-
-def _signature_job_failed(job: dict, error_text: str):
-    """Called once, only when a Signature job has genuinely run out of attempts.
-
-    Writes ONLY the signature columns. A failed Signature must leave the Classic video
-    exactly as it was: the agent may have posted it already, and 'my Signature failed'
-    must never read as 'my video is broken'."""
-    try:
-        db_execute(
-            lambda db: db.table("listings").update({
-                _SIGNATURE_VARIANT.status_column: "failed",
-                _SIGNATURE_VARIANT.error_column: str(error_text)[:500],
-            }).eq("id", str(job["listing_id"])).eq("agent_id", str(job["agent_id"])),
-            what="_signature_job_failed listings update")
-    except Exception as e:
-        logger.warning("signature job %s: could not mark the listing failed (%s)",
-                       job["id"], e)
 
 
 @app.post("/api/listings/{listing_id}/generate-video")
@@ -6409,241 +5961,6 @@ async def _stored_video_degradations(listing_id: str, agent_id: str, video_url):
     return []
 
 
-@app.post("/api/listings/{listing_id}/generate-signature")
-async def generate_signature(listing_id: str, music_track: str = None, photo_index: int = 0, video_photos: Optional[List[str]] = Query(None), agent=Depends(get_current_agent)):
-    """Generate the Signature: the Classic film with the agent's own clip opening it.
-
-    Queue-only, deliberately. The Classic endpoint keeps an in-process fallback for the
-    window before the video_jobs migration, and that fallback is the behaviour the queue
-    exists to replace (renders die on a redeploy, and nothing caps how many run at once).
-    A Signature is the longer, heavier render of the two and is capped at one across the
-    whole account, so starting one outside the queue is exactly the thing that must not
-    happen on a fifty-agent day. Without the queue the agent is told the tier is not on
-    yet, which is true from where they are standing, instead of being handed a render
-    that may not survive the next deploy.
-
-    The validation below is a deliberate copy of generate-video's, not a shared helper:
-    the Classic endpoint is frozen for this change (its exact source is executed by
-    tests/test_video_photo_choice.py), and an identical contract is worth more here than
-    one less duplicated block.
-    """
-    result = await db_execute_async(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_signature listings select")
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Listing not found")
-    listing = result.data[0]
-
-    # The fresh row settles whether the migration has been run -- same detection as the
-    # degradations column, cached from here on. Checked FIRST: if the tier is not on,
-    # "record your clip" would be advice that does not help.
-    if not _note_signature_columns(listing):
-        raise HTTPException(status_code=503, detail=SIGNATURE_UNAVAILABLE_DETAIL)
-    if not video_jobs.available():
-        raise HTTPException(status_code=503, detail=SIGNATURE_UNAVAILABLE_DETAIL)
-    if not agent.get("presenter_video_url"):
-        raise HTTPException(status_code=400, detail=SIGNATURE_NO_PRESENTER_DETAIL)
-
-    images = listing.get("images") or []
-    if not images:
-        raise HTTPException(status_code=400, detail="Upload at least one photo before generating a video")
-    if photo_index < 0 or photo_index >= len(images):
-        photo_index = 0
-
-    # The Signature draws the same film as the Classic, so it renders whatever style
-    # this listing is already set to -- and never writes that choice back, because the
-    # agent did not make a style choice here.
-    stored_video_template_id = listing.get("video_template_id")
-    chosen_video_template_id = (
-        _resolve_video_template_id(stored_video_template_id) if stored_video_template_id else None
-    ) or DEFAULT_VIDEO_TEMPLATE_ID
-
-    # Music and photos: identical semantics and identical validation to generate-video.
-    chosen_music_track = None
-    if not video_renderer.is_auto_music_choice(music_track):
-        if video_renderer.resolve_pickable_track(music_track) is None:
-            raise HTTPException(status_code=400, detail="Unknown music track")
-        chosen_music_track = str(music_track).strip()
-
-    chosen_video_photos = []
-    ignored_video_photos = []
-    if not video_renderer.is_auto_photo_choice(video_photos):
-        chosen_video_photos, ignored_video_photos = video_renderer.resolve_photo_choice(video_photos, images)
-        if not chosen_video_photos:
-            raise HTTPException(status_code=400, detail="Unknown photo -- none of the chosen photos belong to this listing")
-        if len(chosen_video_photos) > video_renderer.MAX_VIDEO_PHOTOS:
-            raise HTTPException(status_code=400, detail=f"Choose at most {video_renderer.MAX_VIDEO_PHOTOS} photos for the video")
-
-    try:
-        job, created = await asyncio.to_thread(
-            video_jobs.enqueue,
-            # The listing row's OWN id, for the same reason as the Classic path: a
-            # mixed-case path would slip past the partial unique index that is the only
-            # thing standing between a double-click and a double render.
-            video_jobs.JOB_TYPE_SIGNATURE, listing.get("id") or listing_id, agent["id"],
-            {
-                "video_template_id": chosen_video_template_id,
-                "photo_index": photo_index,
-                **({"music_track": chosen_music_track} if chosen_music_track else {}),
-                **({"video_photos": chosen_video_photos} if chosen_video_photos else {}),
-            },
-        )
-    except Exception as e:
-        # No in-process fallback to drop to (see the docstring), so this is where the
-        # agent is told -- clearly, and without a half-made Signature anywhere.
-        logger.warning("generate_signature: could not enqueue (%s: %s)", type(e).__name__, e)
-        await send_telegram_alert_throttled(
-            "signature_enqueue_failed",
-            "⚠️ <b>NestList Warning</b>\n\nA Signature video could not be added to the "
-            f"render queue (<code>{type(e).__name__}</code>), so the agent was told to "
-            "try again. Classic videos are unaffected. Check the <code>video_jobs</code> "
-            "table.",
-            cooldown_seconds=3600,
-        )
-        raise HTTPException(
-            status_code=503,
-            detail="We could not start your Signature just now -- please try again in a minute.")
-
-    # The Signature's own status columns, never the Classic's: the agent's existing
-    # Classic video stays exactly where it is while this renders.
-    try:
-        await db_execute_async(
-            lambda db: db.table("listings").update({
-                _SIGNATURE_VARIANT.status_column: "rendering",
-                _SIGNATURE_VARIANT.error_column: None,
-                _SIGNATURE_VARIANT.started_column: datetime.now(timezone.utc).isoformat(),
-            }).eq("id", listing_id).eq("agent_id", agent["id"]),
-            what="generate_signature mirror queued status",
-        )
-    except Exception as e:
-        # The job row is committed, so the render WILL happen; failing now would invite
-        # the agent to press Generate again.
-        logger.warning("generate_signature: job %s queued but the listing mirror write "
-                       "failed (%s)", job.get("id"), e)
-    try:
-        progress = await asyncio.to_thread(video_jobs.describe, job)
-    except Exception as e:
-        logger.warning("generate_signature: could not describe job %s (%s)", job.get("id"), e)
-        progress = {}
-
-    # Same honesty rule as generate-video: report what the render IN FLIGHT will use,
-    # not what this press asked for, so a second press with different music is never
-    # answered with music the agent is not going to get.
-    in_flight_music_track = (job.get("payload") or {}).get("music_track") or "auto"
-    in_flight_video_photos = list((job.get("payload") or {}).get("video_photos") or [])
-    if not created:
-        logger.info("generate_signature: listing %s already had a Signature job in "
-                    "flight; returning its position", listing_id)
-    return dict({
-        "status": "rendering",
-        "queued": True,
-        "already_in_flight": not created,
-        # Always present, even if describe() could not be computed, so the frontend
-        # never has to guess whether a missing key means "position unknown".
-        "queue_position": None,
-        "eta_seconds": None,
-        "music_track": in_flight_music_track,
-        "video_photos": in_flight_video_photos,
-        "video_photos_mode": "custom" if in_flight_video_photos else "auto",
-        "requested_video_photos": chosen_video_photos,
-        "video_photos_ignored": ignored_video_photos,
-        "max_video_photos": video_renderer.MAX_VIDEO_PHOTOS,
-    }, **progress)
-
-
-@app.get("/api/listings/{listing_id}/signature-status")
-async def get_signature_status(listing_id: str, agent=Depends(get_current_agent)):
-    """Where is my Signature? Same questions /video-status answers, same wire shape,
-    about the signature_* columns instead -- and never touching the Classic's, so a
-    screen polling one tier can say nothing at all about the other.
-
-    Deliberately NOT a parameterised version of get_video_status: the Classic poll is
-    the most-called endpoint in the app and is frozen for this change.
-    """
-    columns = "id"
-    if _signature_columns_available():
-        columns = "id,%s,%s,%s" % (_SIGNATURE_VARIANT.status_column,
-                                   _SIGNATURE_VARIANT.url_column,
-                                   _SIGNATURE_VARIANT.error_column)
-    result = await db_execute_async(
-        lambda db: db.table("listings").select(columns)
-        .eq("id", listing_id).eq("agent_id", agent["id"]),
-        what="get_signature_status listings select")
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Listing not found")
-    listing = result.data[0]
-
-    out = {
-        # 'none' means no Signature has ever been made for this listing -- which is also
-        # the honest answer before the migration, so a frontend polling this endpoint on
-        # a pre-migration backend gets a quiet "nothing here" rather than an error.
-        "status": listing.get(_SIGNATURE_VARIANT.status_column) or "none",
-        "signature_video_url": listing.get(_SIGNATURE_VARIANT.url_column),
-        "error": listing.get(_SIGNATURE_VARIANT.error_column),
-        "job_status": None,
-        "queue_position": None,
-        "eta_seconds": None,
-        "degradations": [],
-        "photo_choice_note": None,
-    }
-    if video_jobs.available():
-        try:
-            job = await asyncio.to_thread(
-                video_jobs.find_active, video_jobs.JOB_TYPE_SIGNATURE, listing_id)
-            if job:
-                out.update(await asyncio.to_thread(video_jobs.describe, job))
-                # AN ACTIVE JOB OUTRANKS THE COLUMN, and it has to.
-                #
-                # The column is a best-effort mirror written AFTER the job row was
-                # committed, so a failed mirror write (logged, never fatal -- the render
-                # is already guaranteed) leaves the row reading 'done' from the PREVIOUS
-                # render. A screen that stops polling on 'done' would then stop on the
-                # first poll and show the agent the film they just asked to replace, as
-                # though it were the new one. The job row is the one that cannot lie
-                # about whether a render is in flight.
-                #
-                # The url goes with it: while a render is in flight there is no finished
-                # Signature to offer, and offering the last one is exactly the mistake
-                # above. A caller that wants to keep showing the old film meanwhile
-                # already has it from the poll before this one.
-                out["status"] = "rendering"
-                out["signature_video_url"] = None
-                out["error"] = None
-        except Exception as e:
-            # Queue metadata is a nicety; the status itself already came from the row.
-            logger.warning("get_signature_status: queue lookup failed (%s)", e)
-    if out["status"] == "done" and not out.get("degradations"):
-        try:
-            out["degradations"] = await _stored_signature_degradations(
-                listing_id, agent["id"], out["signature_video_url"])
-        except Exception as e:
-            logger.warning("get_signature_status: could not read degradations (%s)", e)
-    out["degradations"] = list(out.get("degradations") or [])
-    out["photo_choice_note"] = video_renderer.photo_choice_note(out["degradations"])
-    return out
-
-
-async def _stored_signature_degradations(listing_id: str, agent_id: str, video_url):
-    """Notes from the render that produced this listing's current Signature, or [].
-
-    Same order and same reasoning as _stored_video_degradations: the listing's own
-    column first, then the latest completed Signature job -- and only if that job
-    produced THIS video, so a stale job can never lend its notes to another render."""
-    try:
-        res = await db_execute_async(
-            lambda db: db.table("listings").select(_SIGNATURE_VARIANT.degradations_column)
-            .eq("id", listing_id).eq("agent_id", agent_id),
-            what="get_signature_status degradations select")
-        stored = (res.data or [{}])[0].get(_SIGNATURE_VARIANT.degradations_column)
-        if isinstance(stored, list):
-            return [str(x) for x in stored]
-    except Exception:
-        pass        # column not there yet (or a blip): fall through to the job row
-    if video_jobs.available() and video_url:
-        job = await asyncio.to_thread(
-            video_jobs.find_latest_done, video_jobs.JOB_TYPE_SIGNATURE, listing_id)
-        if job and job.get("result_url") == video_url:
-            return [str(x) for x in (job.get("degradations") or [])]
-    return []
-
 def _wait_for_ig_container_ready(container_id: str, page_token: str, max_attempts: int = 10, delay_seconds: float = 1.5) -> bool:
     # Instagram fetches/processes the image asynchronously after the container is
     # created — publishing before that finishes fails with "Media ID is not
@@ -6858,87 +6175,6 @@ def upload_profile_photo(req: ProfilePhotoRequest, agent=Depends(get_current_age
         logger.exception("Profile photo upload failed for agent %s", agent["id"])
         raise HTTPException(status_code=500, detail="Something went wrong uploading that photo -- please try again")
 
-PRESENTER_MAX_UPLOAD_MB = 200     # a 15s phone clip is ~30-60MB; 200 leaves room for 4K
-
-
-@app.post("/api/profile/presenter-video")
-async def upload_presenter_video(file: UploadFile = File(...), agent=Depends(get_current_agent)):
-    """The agent's own clip of themselves speaking -- the opening of a Signature video.
-
-    REAL FOOTAGE, uploaded once, reused for every Signature they order. Not a generated
-    avatar: every attempt at synthesising an agent either lost their likeness within two
-    seconds or required inventing the room to keep them convincing, and inventing a room
-    is not something a property video may do.
-
-    Multipart rather than the base64 JSON the photo endpoints use, because base64
-    inflates by a third and a phone clip is tens of megabytes -- that request would be
-    refused or time out.
-    """
-    raw = await file.read()
-    size_mb = len(raw) / (1024 * 1024)
-    if not raw:
-        raise HTTPException(status_code=400, detail="That upload arrived empty -- please try again.")
-    if size_mb > PRESENTER_MAX_UPLOAD_MB:
-        raise HTTPException(
-            status_code=413,
-            detail=("That file is %.0fMB, over the %dMB limit. A fifteen-second clip is "
-                    "usually well under that -- check you have not sent a long recording."
-                    % (size_mb, PRESENTER_MAX_UPLOAD_MB)),
-        )
-
-    try:
-        with tempfile.TemporaryDirectory() as workdir:
-            clip, seconds, note = await asyncio.to_thread(
-                video_renderer.prepare_presenter_clip, raw, workdir)
-    except ValueError as e:
-        # Raised deliberately with wording meant for the agent, not a stack trace.
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("presenter clip transcode failed for agent %s (%.1fMB)", agent["id"], size_mb)
-        raise HTTPException(
-            status_code=500,
-            detail="We could not read that video. An MP4 or MOV straight from your phone works best.",
-        )
-
-    try:
-        supabase = get_db()
-        filename = f"agents/{agent['id']}/presenter/{uuid.uuid4().hex[:12]}.mp4"
-        supabase.storage.from_("listings-images").upload(
-            filename, clip, {"content-type": "video/mp4", "upsert": "true"})
-        url = supabase.storage.from_("listings-images").get_public_url(filename)
-    except Exception:
-        logger.exception("presenter clip upload failed for agent %s", agent["id"])
-        raise HTTPException(status_code=502, detail="We could not save that video -- please try again.")
-
-    db_execute(
-        lambda db: db.table("agents").update({
-            "presenter_video_url": url,
-            "presenter_video_seconds": round(seconds, 2),
-        }).eq("id", agent["id"]),
-        what="upload_presenter_video agents update",
-    )
-    # `note` is ADDITIVE and only present when there is something to say (an HDR clip
-    # this server could not convert all the way). Existing frontend code ignores it, so
-    # nothing breaks by it appearing; new code can show it next to the upload.
-    result = {"presenter_video_url": url, "seconds": round(seconds, 2)}
-    if note:
-        result["note"] = note
-    return result
-
-
-@app.delete("/api/profile/presenter-video")
-def delete_presenter_video(agent=Depends(get_current_agent)):
-    """Forget the clip. The file is left in storage: a Signature already rendered from
-    it is still correct, and deleting the bytes buys nothing."""
-    db_execute(
-        lambda db: db.table("agents").update({
-            "presenter_video_url": None, "presenter_video_seconds": None,
-        }).eq("id", agent["id"]),
-        what="delete_presenter_video agents update",
-    )
-    return {"presenter_video_url": None}
-
-
 AVATAR_PHOTO_MAX = 8
 AVATAR_PHOTO_LONG_EDGE = 1600
 
@@ -6947,11 +6183,14 @@ AVATAR_PHOTO_LONG_EDGE = 1600
 def upload_avatar_photos(req: AvatarPhotosRequest, agent=Depends(get_current_agent)):
     """The one-time set of photos an agent gives us of themselves.
 
-    This is the thing that makes a Signature possible for an agent at all: their
-    likeness, captured once, reused for every Signature they ever order. It is NOT the
-    profile photo -- that is a single headshot for the contact card, cropped to a
-    circle. These are reference material for building the agent's avatar, so they want
-    several angles and rather more resolution than a card needs.
+    KEPT DELIBERATELY WITH NOTHING CURRENTLY READING IT. This is the agent's likeness,
+    captured once: reference material for any future avatar video. Jane has not given up
+    on avatar videos (the Signature tier that was withdrawn on 2026-10-21 used real
+    footage, not an avatar, so it was never the consumer of this set), and asking agents
+    to photograph themselves again is a cost this saves. It is NOT the profile photo --
+    that is a single headshot for the contact card, cropped to a circle. These are
+    reference material for building a likeness, so they want several angles and rather
+    more resolution than a card needs.
 
     Kept as a LIST rather than one file because likeness from a single frontal photo is
     unreliable -- the model has nothing to go on for the side of a face it has never
@@ -7772,10 +7011,16 @@ def _public_listing_payload(listing) -> dict:
     # The listing's own videos, so the buyer's page can actually play the tour the
     # "Reply with Listing" copy promises. Both are optional and both default to null:
     # most listings have neither, and a listing with no video must render a normal
-    # page, never an error. Which one plays is the FRONTEND's call (Signature when
-    # present, Classic otherwise) -- both are returned rather than resolved here
-    # because the player has to know which tier it got to pick the aspect ratio
-    # (Classic 9:16, Signature 4:3), exactly as My Listings already does.
+    # page, never an error. Which one plays is the FRONTEND's call -- both are returned
+    # rather than resolved here because the player has to know which it got to pick the
+    # aspect ratio (a Classic render is 9:16; the hand-made film is 4:3).
+    #
+    # `signature_video_url` IS STILL SERVED, deliberately, and it is now the ONLY thing
+    # that ever appears there. The Signature tier was withdrawn on 2026-10-21 and
+    # nothing renders into this column any more -- but the column predates that tier and
+    # on the demo listing it holds the HAND-MADE film, which buyers see today. Dropping
+    # the serving code would silently take that film off the buyer's page, so it stays.
+    # Treat this as "the hand-placed film, if there is one", not as a tier.
     #
     # PRIVACY (hide-the-road) -- this is safe, and deliberately so:
     #  * The file is at videos/{listing_id}.mp4 in the PUBLIC listings-images bucket,
@@ -7787,16 +7032,9 @@ def _public_listing_payload(listing) -> dict:
     #    DISTRICT label only, and room captions are written from the photos alone --
     #    the model is never given the address -- then copy-guarded and rejected
     #    outright if they contain any digit.
-    #  * Signature films are no longer only hand-made: the Signature tier now renders
-    #    through this backend as the Classic film with the AGENT'S OWN uploaded clip of
-    #    themselves as its opening slide. Everything the backend draws is still
-    #    district-only; the clip, however, is footage this code never inspects, and an
-    #    agent could have filmed it standing in front of the house. The
-    #    no-identifying-frontage rule therefore still lands on a person, not on code --
-    #    it has just moved from a hand editor to the agent recording the clip, which is
-    #    worth saying in the guidance they are given. (The hand-made film that is live
-    #    on the demo page is still at its own object path and is not touched by a
-    #    render; see backend/migrations/001_signature_video_columns.sql.)
+    #  * The hand-made film is footage this code never inspects, so for that one the
+    #    no-identifying-frontage rule lands on the person who cut it, not on code. It
+    #    was reviewed by hand before it went up; nothing here can re-check it.
     # str() so a column that is missing, null, blank or (somehow) not text can never
     # turn a buyer's page into a 503 -- it just means "no video".
     public_video_url = str(listing.get("video_url") or "").strip() or None

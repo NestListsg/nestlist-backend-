@@ -1,5 +1,25 @@
 -- Signature video tier: its own columns on `listings`, mirroring the Classic's.
 --
+-- ===========================================================================
+-- THE FEATURE THIS WAS FOR WAS WITHDRAWN ON 2026-10-21. Jane's call: the machinery
+-- was right but the film was not (an agent against whatever wall they stood in front
+-- of, cut to a property they are visibly not in). The Signature tier's code has been
+-- removed from the backend. Nothing now writes any of these columns.
+--
+-- THE COLUMNS ARE KEPT ON PURPOSE. Do NOT write a migration to drop them:
+--   * `signature_video_url` PREDATES this tier, exists in production, and is
+--     POPULATED -- it holds the hand-made film the demo buyer page still serves.
+--     The public listing endpoint still reads it, and that is the only thing in the
+--     backend that touches any of these columns now.
+--   * The other four are empty and harmless. Dropping a column is destructive and
+--     irreversible; leaving it costs nothing.
+--
+-- Nothing below needs to be run again. It is kept as the record of what was added,
+-- and because the columns it adds are still in the table.
+-- ===========================================================================
+--
+-- ORIGINAL NOTES FOLLOW, as written when the tier was being built.
+--
 -- Run this in the Supabase SQL editor. Safe in either order with the deploy, safe to
 -- run twice, and it touches NO existing rows -- it only adds columns.
 --
