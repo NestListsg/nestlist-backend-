@@ -46,8 +46,10 @@ import time
 import uuid
 
 import requests
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import (Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps)
 
+import fal_images
+import old_to_new
 import photo_upscale
 import slow_read
 
@@ -2583,126 +2585,9 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                 _concat(clip_paths, body_path, workdir, "body_list", TIMEOUT_CONCAT)
             body_duration = _probe_duration(body_path, estimated)
 
-            # --- closing contact card (degrades to no card) ---
-            silent_path = body_path
-            silent_duration = body_duration
-            try:
-                card_img = _render_contact_card(agent_name, agent_contact_line, agent_photo)
-                card_clip = os.path.join(workdir, "card.mp4")
-                _build_card_clip(body_path, card_img, card_clip, workdir)
-                with_card = os.path.join(workdir, "with_card.mp4")
-                _concat([body_path, card_clip], with_card, workdir, "card_list", TIMEOUT_CONCAT)
-                silent_path = with_card
-                silent_duration = _probe_duration(
-                    with_card, body_duration + CARD_HOLD_SECONDS + CARD_SECONDS)
-            except Exception as e:
-                logger.warning("contact card failed (%s); shipping the slideshow without it", e)
-                degradations.append("the closing contact card could not be built")
-
-            # --- soundtrack: the music bed ---
-            # Everything here degrades. The ladder, best first: music -> silence. A
-            # problem with the soundtrack never costs the video.
-            final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
-            wrote_final = False
-            track_path = None
-            if not is_auto_music_choice(music_track):
-                track_path = resolve_pickable_track(music_track)
-                music_tier = "chosen by agent"
-                if track_path is None:
-                    logger.warning("chosen music %r is not available; using the automatic pick",
-                                   music_track)
-                    degradations.append(
-                        "the music you picked was not available, so a matching track was used")
-            if track_path is None:
-                track_path, music_tier = _select_music_track(music_seed, property_type)
-
-            fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
-
-            def _music_chain(normalize):
-                """[1:a] -> [music]. `normalize` is True ONLY for tracks flagged "raw" in
-                tracks.json; without it this is byte-for-byte the filter every existing
-                track has always used."""
-                norm = (
-                    f"loudnorm=I={RAW_TRACK_TARGET_LUFS}:TP={RAW_TRACK_TRUE_PEAK_DB}"
-                    f":LRA={RAW_TRACK_LRA},aresample=44100,"
-                ) if normalize else ""
-                return (
-                    f"[1:a]atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS,"
-                    f"{norm}"
-                    f"volume={AUDIO_VOLUME},"
-                    f"afade=t=in:st=0:d={AUDIO_FADE_IN_SECONDS},"
-                    f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_OUT_SECONDS}"
-                )
-
-            def _soundtrack(normalize):
-                """(extra ffmpeg inputs, filter_complex) for one attempt."""
-                inputs, filters = [], []
-                if track_path:
-                    # -stream_loop so a track shorter than the video still covers it.
-                    inputs += ["-stream_loop", "-1", "-i", track_path]
-                    filters.append(_music_chain(normalize) + "[aout]")
-                return inputs, ";".join(filters)
-
-            # Attempts, best first. A raw track tries normalization first, so a
-            # normalization problem costs loudness consistency rather than the music.
-            # An ordinary track has exactly one attempt.
-            #
-            # With no track at all there is NO attempt, deliberately: that command would
-            # be an empty -filter_complex with -map "[aout]", which cannot succeed and
-            # only spends an ffmpeg call on the way to the silent fallback below.
-            # Reached when the music files are missing from the deploy.
-            is_raw = _is_raw_track(track_path) if track_path else False
-            attempts = []
-            if track_path:
-                attempts = [True, False] if is_raw else [False]
-            else:
-                logger.warning("no usable music track found in %s", AUDIO_DIR)
-                degradations.append("the background music file is missing from the deploy")
-
-            for attempt_no, normalize in enumerate(attempts):
-                extra_inputs, filter_complex = _soundtrack(normalize)
-                try:
-                    _run_ffmpeg([
-                        "ffmpeg", "-y", "-i", silent_path,
-                    ] + extra_inputs + [
-                        "-filter_complex", filter_complex,
-                        "-map", "0:v", "-map", "[aout]",
-                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                        "-movflags", "+faststart", final_path,
-                    ], TIMEOUT_MUSIC)
-                    wrote_final = True
-                    # Logged on every render so "why does my video sound different from my
-                    # colleague's?" is answerable from Railway's logs alone.
-                    logger.info("soundtrack: %s (%s tier, property_type %r, seed %r)%s",
-                                os.path.basename(track_path) if track_path else "no music",
-                                music_tier if track_path else "n/a",
-                                str(property_type or ""), str(music_seed or ""),
-                                ", raw track loudness-normalized" if normalize else "")
-                    break
-                except Exception as e:
-                    last = attempt_no == len(attempts) - 1
-                    if normalize and not last:
-                        logger.warning("loudness normalization of raw track %s failed "
-                                       "(%s); retrying with the track as-is",
-                                       os.path.basename(track_path), e)
-                        continue
-                    # Covers an unreadable or corrupt track as well as a mux failure:
-                    # either way the video ships, silent.
-                    logger.warning("soundtrack failed (%s); shipping a silent video", e)
-                    degradations.append("the background music could not be added")
-
-            if not wrote_final:
-                _run_ffmpeg(["ffmpeg", "-y", "-i", silent_path, "-c", "copy",
-                             "-movflags", "+faststart", final_path], TIMEOUT_MUSIC)
-
-            # Last thing before the bytes leave: never hand storage a file it will
-            # reject for size. Does nothing at all to a normal-sized film.
-            final_path, shrink_note = _fit_delivery_size(final_path, workdir)
-            if shrink_note:
-                degradations.append(shrink_note)
-
-            with open(final_path, "rb") as f:
-                data = f.read()
+            data, silent_duration = _finish_film(
+                body_path, body_duration, workdir, agent_name, agent_contact_line,
+                agent_photo, property_type, music_seed, music_track, degradations)
 
         if degradations:
             logger.warning("video rendered with degradations: %s", "; ".join(degradations))
@@ -2715,3 +2600,1111 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
         return data, degradations, captions_used
     finally:
         _RENDER_SLOTS.release()
+
+
+def _finish_film(body_path, body_duration, workdir, agent_name, agent_contact_line,
+                 agent_photo, property_type, music_seed, music_track, degradations):
+    """Body of cut photos -> the finished mp4's bytes. Returns (bytes, duration).
+
+    The closing contact card, the soundtrack ladder and the delivery-size pass -- the
+    three steps that are the same film-making whatever the body is made of, and all
+    three of which degrade rather than fail. Extracted from render_property_video when
+    the Dramatic template arrived (2026-10-22) so there is one copy rather than two that
+    drift. `degradations` is appended to in place, as it was.
+
+    THE EXTRACTION ISSUES THE IDENTICAL FFMPEG COMMANDS the Classic issued before, which
+    is what tests/golden/classic_commands.txt exists to prove -- the golden was NOT
+    regenerated for this change.
+    """
+    # --- closing contact card (degrades to no card) ---
+    silent_path = body_path
+    silent_duration = body_duration
+    try:
+        card_img = _render_contact_card(agent_name, agent_contact_line, agent_photo)
+        card_clip = os.path.join(workdir, "card.mp4")
+        _build_card_clip(body_path, card_img, card_clip, workdir)
+        with_card = os.path.join(workdir, "with_card.mp4")
+        _concat([body_path, card_clip], with_card, workdir, "card_list", TIMEOUT_CONCAT)
+        silent_path = with_card
+        silent_duration = _probe_duration(
+            with_card, body_duration + CARD_HOLD_SECONDS + CARD_SECONDS)
+    except Exception as e:
+        logger.warning("contact card failed (%s); shipping the slideshow without it", e)
+        degradations.append("the closing contact card could not be built")
+
+    # --- soundtrack: the music bed ---
+    # Everything here degrades. The ladder, best first: music -> silence. A
+    # problem with the soundtrack never costs the video.
+    final_path = os.path.join(workdir, f"final_{uuid.uuid4().hex[:8]}.mp4")
+    wrote_final = False
+    track_path = None
+    if not is_auto_music_choice(music_track):
+        track_path = resolve_pickable_track(music_track)
+        music_tier = "chosen by agent"
+        if track_path is None:
+            logger.warning("chosen music %r is not available; using the automatic pick",
+                           music_track)
+            degradations.append(
+                "the music you picked was not available, so a matching track was used")
+    if track_path is None:
+        track_path, music_tier = _select_music_track(music_seed, property_type)
+
+    fade_out_start = max(0.0, silent_duration - AUDIO_FADE_OUT_SECONDS)
+
+    def _music_chain(normalize):
+        """[1:a] -> [music]. `normalize` is True ONLY for tracks flagged "raw" in
+        tracks.json; without it this is byte-for-byte the filter every existing
+        track has always used."""
+        norm = (
+            f"loudnorm=I={RAW_TRACK_TARGET_LUFS}:TP={RAW_TRACK_TRUE_PEAK_DB}"
+            f":LRA={RAW_TRACK_LRA},aresample=44100,"
+        ) if normalize else ""
+        return (
+            f"[1:a]atrim=0:{silent_duration:.3f},asetpts=PTS-STARTPTS,"
+            f"{norm}"
+            f"volume={AUDIO_VOLUME},"
+            f"afade=t=in:st=0:d={AUDIO_FADE_IN_SECONDS},"
+            f"afade=t=out:st={fade_out_start:.3f}:d={AUDIO_FADE_OUT_SECONDS}"
+        )
+
+    def _soundtrack(normalize):
+        """(extra ffmpeg inputs, filter_complex) for one attempt."""
+        inputs, filters = [], []
+        if track_path:
+            # -stream_loop so a track shorter than the video still covers it.
+            inputs += ["-stream_loop", "-1", "-i", track_path]
+            filters.append(_music_chain(normalize) + "[aout]")
+        return inputs, ";".join(filters)
+
+    # Attempts, best first. A raw track tries normalization first, so a
+    # normalization problem costs loudness consistency rather than the music.
+    # An ordinary track has exactly one attempt.
+    #
+    # With no track at all there is NO attempt, deliberately: that command would
+    # be an empty -filter_complex with -map "[aout]", which cannot succeed and
+    # only spends an ffmpeg call on the way to the silent fallback below.
+    # Reached when the music files are missing from the deploy.
+    is_raw = _is_raw_track(track_path) if track_path else False
+    attempts = []
+    if track_path:
+        attempts = [True, False] if is_raw else [False]
+    else:
+        logger.warning("no usable music track found in %s", AUDIO_DIR)
+        degradations.append("the background music file is missing from the deploy")
+
+    for attempt_no, normalize in enumerate(attempts):
+        extra_inputs, filter_complex = _soundtrack(normalize)
+        try:
+            _run_ffmpeg([
+                "ffmpeg", "-y", "-i", silent_path,
+            ] + extra_inputs + [
+                "-filter_complex", filter_complex,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", final_path,
+            ], TIMEOUT_MUSIC)
+            wrote_final = True
+            # Logged on every render so "why does my video sound different from my
+            # colleague's?" is answerable from Railway's logs alone.
+            logger.info("soundtrack: %s (%s tier, property_type %r, seed %r)%s",
+                        os.path.basename(track_path) if track_path else "no music",
+                        music_tier if track_path else "n/a",
+                        str(property_type or ""), str(music_seed or ""),
+                        ", raw track loudness-normalized" if normalize else "")
+            break
+        except Exception as e:
+            last = attempt_no == len(attempts) - 1
+            if normalize and not last:
+                logger.warning("loudness normalization of raw track %s failed "
+                               "(%s); retrying with the track as-is",
+                               os.path.basename(track_path), e)
+                continue
+            # Covers an unreadable or corrupt track as well as a mux failure:
+            # either way the video ships, silent.
+            logger.warning("soundtrack failed (%s); shipping a silent video", e)
+            degradations.append("the background music could not be added")
+
+    if not wrote_final:
+        _run_ffmpeg(["ffmpeg", "-y", "-i", silent_path, "-c", "copy",
+                     "-movflags", "+faststart", final_path], TIMEOUT_MUSIC)
+
+    # Last thing before the bytes leave: never hand storage a file it will
+    # reject for size. Does nothing at all to a normal-sized film.
+    final_path, shrink_note = _fit_delivery_size(final_path, workdir)
+    if shrink_note:
+        degradations.append(shrink_note)
+
+    with open(final_path, "rb") as f:
+        data = f.read()
+
+    return data, silent_duration
+
+
+# ===========================================================================
+# "From Old to New" -- the Dramatic template
+#
+# Read docs/old-to-new-video-spec.md before changing anything below it. The short
+# version: the agent's real photo of a room and a generated redesign of the SAME room
+# from the SAME camera position differ almost exactly in the furniture, so the pixels
+# that differ ARE the furniture. That difference is a mask. The old frame is lifted
+# through it, cut into groups, and each group is rushed at the camera on its own path
+# while the new room sits underneath the whole time. Nothing is generated here, erased
+# here, or inpainted here -- the only generated thing is the "after" photograph, and
+# old_to_new.py made that before this code runs.
+#
+# TWO GEOMETRY MISTAKES, each of which cost a round of rework. Both are pinned by tests.
+#
+#  1. EVERY FRAME IS COMPOSED IN THE ORIGINAL PHOTOGRAPH'S SPACE -- that is, at the size
+#     the photo gets contained to, in the photo's own aspect ratio -- then put through
+#     the same contain-over-blur as the rest of the film, then zoomed. Composing at
+#     output size, or cropping the upscaled composite without scaling it down first,
+#     makes the flight sit at a different scale from the shots either side and the cut
+#     reads as a jump. So: the base layers, the flight layer and the overlay offsets are
+#     all in _dramatic_backdrop's foreground box, and the zoom happens afterwards, in
+#     ffmpeg, exactly as _contain_clip does it.
+#
+#     (The flight LAYER is drawn at half that box and scaled back up by ffmpeg before
+#     the overlay. That is a resolution economy on a layer that is motion-blurred
+#     anyway, NOT a change of space: the geometry is still computed in the photograph's
+#     own coordinates and the layer is exactly the box's size by the time it composites.
+#     tests pin the scale-back-up.)
+#
+#  2. ON THE "ARRIVES" TREATMENT THE ROOM UNDERNEATH MUST CROSS-DISSOLVE FROM OLD TO NEW
+#     AND FINISH SLIGHTLY EARLY. Otherwise the new furniture lands on the old room's
+#     walls and the next shot cuts to the new walls. The dissolve therefore ends
+#     BASE_DISSOLVE_EARLY_SECONDS before the flight does -- and because the flying layer
+#     IS the new furniture, by those last frames the layer and the base are the same
+#     pixels, so the layer fading out over them is invisible.
+#
+# THE WALK-THROUGH. Jane asked for the feeling of one house rather than a set of shots:
+# a hard push into the front door of the exterior and a matched pull-out inside the
+# living room, then a forward push from each room into the next. Done locally, for
+# nothing, as a piecewise zoom ramp -- a shot's opening zoom is literally the closing
+# zoom of the shot before it (see _walkthrough_knots), so a hard cut reads as passing
+# through a doorway rather than as an edit.
+#
+# THE SEAM FOR "ELEGANT" (phase two, the Kling makeover) is marked at
+# ELEGANT_STYLE_ID below and in render_dramatic_video's shot table: an Elegant room is
+# one generated clip in place of one locally-built room clip, so it joins the timeline
+# as another entry in that table and needs nothing else here.
+# ===========================================================================
+DRAMATIC_STYLE_ID = "dramatic"
+# PHASE TWO. Declared here so the id exists in one place and the two renderers cannot
+# disagree about its spelling. There is deliberately no renderer for it yet: main.py
+# does not list it in VIDEO_TEMPLATES, so nothing can request it.
+ELEGANT_STYLE_ID = "elegant"
+
+# Shot lengths. The opening is shorter than a Classic photo beat because it is one
+# static real photograph and the film wants to get to the transformation.
+OPENING_SECONDS = 4.0
+EXTERIOR_SECONDS = 5.0
+ROOM_SECONDS = 5.0
+
+# The flight: how long the furniture is in the air. Deliberately less than the shot, so
+# the new room is on screen and settled before the cut -- a shot that ends mid-flight
+# gives the eye nothing to land on.
+FLIGHT_SECONDS = 2.2
+FLIGHT_FRAMES = int(FLIGHT_SECONDS * FPS)           # 52
+# See geometry mistake 2. Six frames is a quarter of a second: long enough that the
+# walls have genuinely settled before the furniture does, short enough not to read as
+# two separate events.
+BASE_DISSOLVE_EARLY_SECONDS = 6.0 / FPS
+# The "builds up" treatment's wipe, and the plain-dissolve fallback's dissolve.
+BUILD_SECONDS = 2.4
+BUILD_SOFT_EDGE = 0.10                              # of the frame height
+FALLBACK_DISSOLVE_SECONDS = 1.6
+# The white flash the "quick zoom" treatment punches through.
+FLASH_SECONDS = 0.12
+
+# The walk-through. DOOR_PUSH_ZOOM is how hard the exterior drives at the front door;
+# the first interior starts at exactly this zoom and eases out of it, which is what
+# makes the cut read as passing through the doorway. ROOM_PUSH_ZOOM is the gentler
+# forward push from one room into the next.
+PUSH_TAIL_SECONDS = 0.8
+PULL_HEAD_SECONDS = 0.9
+DOOR_PUSH_ZOOM = 1.55
+ROOM_PUSH_ZOOM = 1.22
+# Where the exterior pushes TO, as a fraction of the frame. A front door sits centrally
+# and below the middle of a street-level shot of a house. A FIXED HEURISTIC, not a
+# measurement -- see the follow-up note in the report. Being a little off costs the push
+# some accuracy; it cannot break the shot, because the zoom window can never leave the
+# composite (the same x/y form _contain_clip uses).
+DOOR_CENTRE = (0.5, 0.62)
+FRAME_CENTRE = (0.5, 0.5)
+
+# --- the flight mask ------------------------------------------------------------------
+# Per-channel difference that counts as "this pixel changed". Low enough to catch a dark
+# sofa against a dark floor, high enough that JPEG noise and a one-stop exposure
+# difference between the two frames are not mistaken for furniture.
+DIFF_THRESHOLD = 26
+# The mask is computed at a quarter of the foreground box and scaled back up, for the
+# same reason _contain_over_blur blurs at thumbnail size: we are grouping furniture, not
+# cutting hair, and the scale-up gives the soft cutout edge for free.
+MASK_SCALE = 4
+# Columns x rows the changed region is cut into. Six groups is enough that the flight
+# reads as several objects on separate paths rather than one sheet of pixels, and few
+# enough that each group is a recognisable piece of furniture.
+FLIGHT_GRID = (3, 2)
+# A grid cell with less than this fraction of itself changed is not a piece -- it is
+# noise, and flying it would send a scrap of wall at the camera.
+PIECE_MIN_FILL = 0.04
+# SANITY BOUNDS ON THE MASK. We generate the after FROM the before, so the two share a
+# camera position by construction and these should never fire. They are cheap insurance
+# against the one thing that would make the flight nonsense rather than merely ugly: an
+# editor that redrew the room from a new angle. Under 2% changed means nothing was
+# redesigned; over 70% means the whole picture moved. Either way the room falls back to
+# a plain dissolve, which is the spec's own instruction.
+MASK_MIN_COVERAGE = 0.02
+MASK_MAX_COVERAGE = 0.70
+# How big a piece gets as it reaches the lens, and how far out it travels (as a fraction
+# of the half-diagonal of the frame).
+FLIGHT_MAX_SCALE = 3.4
+FLIGHT_TRAVEL = 0.95
+# Motion blur. Each frame composites this many samples of the piece along its own path,
+# at a share of the alpha each -- real blur from real sub-positions rather than a
+# directional filter, so a spinning piece smears along its spin as well as its path.
+FLIGHT_BLUR_SAMPLES = 3
+FLIGHT_BLUR_SPREAD = 0.035      # of the flight, between samples
+# Pieces fade out over the last of the flight, as they blur past the lens.
+FLIGHT_FADE_FROM = 0.65
+# The layer is drawn at this fraction of the foreground box. See geometry mistake 1.
+FLIGHT_LAYER_SCALE = 0.5
+
+TIMEOUT_DRAMATIC_CLIP = 240      # longer than TIMEOUT_CLIP: more inputs, a blend pass
+
+# --- the disclaimers ------------------------------------------------------------------
+# NOT OPTIONAL, and not interchangeable.
+#
+#   * AI_NOTICE_TEXT goes on every frame that contains generated pixels, and never on a
+#     real photograph. The rebuilt exterior and every transformed room carry it -- a
+#     transformed room from its very first frame, because the new room is underneath the
+#     flight from frame zero.
+#   * PRIVACY_NOTICE_TEXT is the opening's own, separate line. The house in that shot is
+#     a REAL PHOTOGRAPH and calling it a visualisation would be wrong; the surroundings
+#     have been changed and that should be said. So the opening carries this line and
+#     NOT the AI notice.
+#   * A room shown as a plain real photograph (because its redesign was refused or could
+#     not be paid for) carries NEITHER. It is a photograph.
+#
+# Top-left, boxed. Boxed rather than shadowed because this is a legal notice over
+# unpredictable content -- white type with a shadow is legible over a room and marginal
+# over a bright sky, and "marginal" is not good enough for a disclosure. Top-left
+# because Reels and TikTok put their own furniture along the bottom and right.
+AI_NOTICE_TEXT = "AI visualisation"
+PRIVACY_NOTICE_TEXT = "Neighbouring homes altered for privacy"
+NOTICE_FONT_SIZE = 34
+NOTICE_MARGIN = 44
+NOTICE_BOX_ALPHA = 0.42
+NOTICE_BOX_PAD = 14
+
+# Room treatments, rotated so the film has rhythm rather than four copies of one effect.
+TREATMENT_SCATTER = "scatter"     # old furniture scatters out, each group on its own path
+TREATMENT_ARRIVES = "arrives"     # new furniture arrives -- the same flight, backwards
+TREATMENT_BUILDS = "builds"       # the new room builds up from the floor
+TREATMENT_PUNCH = "punch"         # a quick zoom through a white flash
+DRAMATIC_TREATMENTS = (TREATMENT_SCATTER, TREATMENT_ARRIVES,
+                       TREATMENT_BUILDS, TREATMENT_PUNCH)
+# The fallback when a room has an after image but the mask is unusable. The spec's own
+# instruction: "fall back to a plain dissolve when it fails."
+TREATMENT_DISSOLVE = "plain_dissolve"
+# Only these two lift pixels through the mask, so only these two can be defeated by a
+# bad mask. "builds" and "punch" work off the two whole frames and always render.
+TREATMENTS_NEEDING_PIECES = (TREATMENT_SCATTER, TREATMENT_ARRIVES)
+
+DRAMATIC_NOTE_NO_EXTERIOR = ("the opening exterior shot could not be prepared, so the "
+                             "video starts inside the property")
+DRAMATIC_NOTE_ANGLE = ("a room's before and after did not line up, so it is shown as a "
+                       "simple dissolve instead of a transformation")
+
+
+# ---------------------------------------------------------------------------
+# Geometry: the contain-over-blur box, and the camera ramp
+# ---------------------------------------------------------------------------
+def _dramatic_backdrop(img):
+    """(blurred backdrop, (fg_w, fg_h), (offset_x, offset_y)) for one photograph.
+
+    THE SAME COMPUTATION _contain_over_blur DOES, split so the Dramatic template can
+    paste a MOVING foreground into the box rather than a single still. A deliberate
+    second copy, because the Classic's composite is pinned command-for-command by
+    tests/golden/classic_commands.txt and must not be refactored underneath it --
+    test_dramatic_render.py asserts the two produce byte-identical composites, so the
+    copies cannot drift in silence.
+    """
+    img = img.convert("RGB")
+    w, h = VW * UPSCALE, VH * UPSCALE
+
+    small = ImageOps.fit(img, (VW // 4, VH // 4), method=Image.LANCZOS,
+                         centering=(0.5, 0.5))
+    small = small.filter(ImageFilter.GaussianBlur(CONTAIN_BLUR_RADIUS))
+    background = small.resize((w, h), Image.LANCZOS)
+    background = Image.blend(background, Image.new("RGB", (w, h), (0, 0, 0)),
+                             CONTAIN_BG_DARKEN)
+
+    src_w, src_h = img.size
+    fg_w = w
+    fg_h = max(1, round(w * src_h / src_w))
+    if fg_h > h:
+        fg_h = h
+        fg_w = max(1, round(h * src_w / src_h))
+    return background, (fg_w, fg_h), ((w - fg_w) // 2, (h - fg_h) // 2)
+
+
+def _dramatic_composite(img):
+    """The still composite, built out of _dramatic_backdrop's parts.
+
+    Exists so the drift guard above has something to compare: this must equal
+    _contain_over_blur(img)[0] exactly.
+    """
+    backdrop, (fg_w, fg_h), offset = _dramatic_backdrop(img)
+    backdrop.paste(img.convert("RGB").resize((fg_w, fg_h), Image.LANCZOS), offset)
+    return backdrop
+
+
+def _zoom_at(knots, frame):
+    """The zoom this ramp reaches at `frame`. The Python twin of _zoom_ramp, so a test
+    can check the camera actually matches across a cut rather than checking that two
+    strings of ffmpeg arithmetic look similar."""
+    if frame <= knots[0][0]:
+        return float(knots[0][1])
+    for (f0, z0), (f1, z1) in zip(knots, knots[1:]):
+        if frame < f1:
+            return z0 + (z1 - z0) * (frame - f0) / float(max(1, f1 - f0))
+    return float(knots[-1][1])
+
+
+def _zoom_ramp(knots):
+    """[(frame, zoom), ...] -> a zoompan `z` expression, piecewise linear in `on`.
+
+    WRITTEN AS A FUNCTION OF THE FRAME NUMBER, never as a feedback loop on zoompan's own
+    `zoom` variable. The Classic's docstring has the measurement: with d=1 there is no
+    previous output frame to read, `zoom` resets to 1.0 every frame, and the shot never
+    moves. `on` is the output frame index and counts correctly.
+    """
+    segments = []
+    for (f0, z0), (f1, z1) in zip(knots, knots[1:]):
+        span = max(1, f1 - f0)
+        segments.append((f1, f"{z0:.6f}+{z1 - z0:.6f}*(on-{f0})/{span}"))
+    expr = f"{knots[-1][1]:.6f}"
+    for f1, segment in reversed(segments):
+        expr = f"if(lt(on,{f1}),{segment},{expr})"
+    return expr
+
+
+def _walkthrough_knots(seconds, pull_from=None, push_to=None, continuous=False):
+    """The camera ramp for one shot of the walk-through.
+
+    The body of every shot is the Classic's own ramp -- a climb of CONTAIN_ZOOM_MAX - 1
+    across the shot -- so the Dramatic reads as the same camera as the Classic, not a
+    different film. `pull_from` is the zoom the PREVIOUS shot ended on (so this one opens
+    there), and `push_to` is the zoom this shot drives to (so the next one can open
+    there). That is the whole walk-through: matched ends, hard cuts.
+
+    `continuous` is the difference between TWO KINDS OF MATCHED CUT, and it matters:
+
+      * Not continuous -- the default. The shot opens at the previous shot's zoom and
+        EASES back out of it over PULL_HEAD_SECONDS. That is arriving somewhere new: we
+        came through a doorway and the room opens up around us.
+      * Continuous. The shot opens at the previous zoom and carries the SAME MOVE ON,
+        with no easing. That is one shot of the same thing: the anonymised exterior
+        cutting to the rebuilt house is the same camera on the same plot, so the move
+        has to run straight through the cut. Ease it and the house appears to leap
+        backwards at the moment it changes, which turns the reveal into a glitch. A
+        continuous cut also needs the same ANCHOR on both shots, which dramatic_shots
+        sets.
+    """
+    span = max(1, int(round(seconds * FPS)) - 1)
+    start = float(pull_from) if pull_from else 1.0
+    climb = CONTAIN_ZOOM_MAX - 1.0
+    top = (start + climb) if (continuous and pull_from) else CONTAIN_ZOOM_MAX
+
+    def base(frame):
+        return start + (top - start) * frame / float(span) if continuous and pull_from \
+            else 1.0 + climb * frame / float(span)
+
+    head = 0 if (continuous or not pull_from) else int(round(PULL_HEAD_SECONDS * FPS))
+    tail = int(round(PUSH_TAIL_SECONDS * FPS)) if push_to else 0
+    if head + tail >= span:
+        # Too short to hold both moves. Keep the matched ENDS, which are what the cut
+        # depends on, and drop the easing in between.
+        return [(0, start), (span, float(push_to) if push_to else top)]
+
+    knots = [(0, start)]
+    if head:
+        knots.append((head, base(head)))
+    if tail:
+        knots.append((span - tail, base(span - tail)))
+        knots.append((span, float(push_to)))
+    else:
+        knots.append((span, top))
+    return knots
+
+
+def _zoom_filter(knots, anchor):
+    """The zoompan filter for one Dramatic shot.
+
+    x and y are the same form _contain_clip uses -- a fraction of whatever spare the
+    CURRENT zoom leaves -- so nothing can leave the composite at any zoom, there is no
+    clamp to get wrong and no black edge to guard against. At zoom 1.0 the spare is zero
+    and the anchor stops mattering, which is why the opening needs no special case.
+    """
+    ax, ay = anchor
+    return (f"zoompan=z='{_zoom_ramp(knots)}':d=1:s={VW}x{VH}:fps={FPS}"
+            f":x='{ax}*(iw-iw/zoom)':y='{ay}*(ih-ih/zoom)'")
+
+
+def _notice_filters(text, workdir, name):
+    """The disclosure line for one clip, or [] when the clip is a real photograph.
+
+    Read from a file with expansion=none, exactly as the captions are: the text is ours
+    rather than model-written, but there is no reason for a second escaping story in one
+    module.
+    """
+    if not text:
+        return []
+    path = os.path.join(workdir, f"notice_{name}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return [
+        f"drawtext=fontfile={_escape_filter_path(SERIF_REGULAR)}"
+        f":textfile={_escape_filter_path(path)}:expansion=none"
+        f":fontcolor=white:fontsize={NOTICE_FONT_SIZE}"
+        f":x={NOTICE_MARGIN}:y={NOTICE_MARGIN}"
+        f":box=1:boxcolor=black@{NOTICE_BOX_ALPHA}:boxborderw={NOTICE_BOX_PAD}"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The flight: cutting the furniture out, and flying it
+# ---------------------------------------------------------------------------
+def _difference_mask(before_fg, after_fg):
+    """(mask at the foreground box, coverage 0-1) for two aligned frames.
+
+    The mask is the furniture. Computed at a quarter scale and scaled back up, which
+    costs nothing visible -- we are grouping furniture, not cutting hair -- and the
+    bilinear scale-up is what gives a flying piece a soft edge instead of a jagged
+    cutout line.
+    """
+    fg_w, fg_h = before_fg.size
+    small = (max(8, fg_w // MASK_SCALE), max(8, fg_h // MASK_SCALE))
+    a = before_fg.convert("RGB").resize(small, Image.LANCZOS)
+    b = after_fg.convert("RGB").resize(small, Image.LANCZOS)
+    diff = ImageChops.difference(a, b).convert("L")
+    mask = diff.point(lambda v: 255 if v >= DIFF_THRESHOLD else 0)
+    # Erode then dilate: drops speckle (a pixel of JPEG noise is not a sofa) and then
+    # closes the holes erosion leaves inside a genuine object.
+    mask = mask.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(5))
+    histogram = mask.histogram()
+    coverage = histogram[255] / float(max(1, small[0] * small[1]))
+    return mask, coverage
+
+
+def _flight_pieces(source_fg, mask_small, size):
+    """The furniture, cut into groups that can fly independently. [] if there is none.
+
+    `source_fg` is the frame the pixels come FROM -- the old frame for furniture that
+    leaves, the new frame for furniture that arrives. `mask_small` is _difference_mask's
+    quarter-scale mask. Everything returned is in the LAYER's coordinates (the
+    foreground box at FLIGHT_LAYER_SCALE), because that is where the flight is drawn.
+    """
+    layer_w, layer_h = size
+    mask = mask_small.resize((layer_w, layer_h), Image.BILINEAR)
+    frame = source_fg.convert("RGBA").resize((layer_w, layer_h), Image.LANCZOS)
+
+    columns, rows = FLIGHT_GRID
+    cell_w, cell_h = layer_w / float(columns), layer_h / float(rows)
+    pieces = []
+    for index in range(columns * rows):
+        col, row = index % columns, index // columns
+        cell = (int(col * cell_w), int(row * cell_h),
+                int((col + 1) * cell_w), int((row + 1) * cell_h))
+        cell_mask = mask.crop(cell)
+        fill = sum(v * n for v, n in enumerate(cell_mask.histogram())) / (
+            255.0 * max(1, cell_mask.width * cell_mask.height))
+        if fill < PIECE_MIN_FILL:
+            continue
+        bbox = cell_mask.getbbox()
+        if not bbox:
+            continue
+        # Back into layer coordinates, then cut the piece out of the source frame.
+        box = (cell[0] + bbox[0], cell[1] + bbox[1],
+               cell[0] + bbox[2], cell[1] + bbox[3])
+        cutout = frame.crop(box)
+        cutout.putalpha(cell_mask.crop(bbox))
+        centre = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+        # The path: outward from the middle of the frame, through the piece's own
+        # centre, so a piece on the left leaves to the left. A piece sitting dead centre
+        # would have no direction at all, so it is nudged along the diagonal its grid
+        # cell sits on -- deterministic, never random, so two renders of one listing are
+        # the same film.
+        dx = centre[0] - layer_w / 2.0
+        dy = centre[1] - layer_h / 2.0
+        length = (dx * dx + dy * dy) ** 0.5
+        if length < 1.0:
+            dx, dy = (1.0 if col >= columns / 2.0 else -1.0), 1.0
+            length = (dx * dx + dy * dy) ** 0.5
+        travel = FLIGHT_TRAVEL * ((layer_w ** 2 + layer_h ** 2) ** 0.5) / 2.0
+        pieces.append({
+            "image": cutout,
+            "centre": centre,
+            "vector": (dx / length * travel, dy / length * travel),
+            # Alternating spin, growing a little along the grid, so no two pieces turn
+            # together. Deterministic in the piece's index and nothing else.
+            "spin": (-1 if index % 2 else 1) * (14 + 6 * index),
+        })
+    return pieces
+
+
+def _flight_layer(pieces, size, progress):
+    """One RGBA frame of furniture in flight, at `progress` through the flight (0-1).
+
+    The piece accelerates (progress squared), grows towards the lens, spins, and fades
+    out over the last third as it blurs past. Motion blur is FLIGHT_BLUR_SAMPLES samples
+    of the piece at successive points along its OWN path, composited at a share of the
+    alpha each -- so a spinning piece smears along its spin as well as its travel, which
+    a directional blur filter cannot do.
+    """
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    for piece in pieces:
+        for sample in range(FLIGHT_BLUR_SAMPLES):
+            p = progress - sample * FLIGHT_BLUR_SPREAD
+            if p <= 0.0:
+                continue
+            eased = p * p
+            scale = 1.0 + (FLIGHT_MAX_SCALE - 1.0) * eased
+            fade = 1.0
+            if p > FLIGHT_FADE_FROM:
+                fade = max(0.0, 1.0 - (p - FLIGHT_FADE_FROM) / (1.0 - FLIGHT_FADE_FROM))
+            alpha = fade / FLIGHT_BLUR_SAMPLES
+            if alpha <= 0.002:
+                continue
+            src = piece["image"]
+            width = max(1, int(round(src.width * scale)))
+            height = max(1, int(round(src.height * scale)))
+            moved = src.resize((width, height), Image.BILINEAR)
+            moved = moved.rotate(piece["spin"] * eased, resample=Image.BILINEAR,
+                                 expand=True)
+            if alpha < 0.999:
+                channels = moved.split()
+                moved.putalpha(channels[3].point(lambda v: int(v * alpha)))
+            cx = piece["centre"][0] + piece["vector"][0] * eased
+            cy = piece["centre"][1] + piece["vector"][1] * eased
+            layer.alpha_composite(
+                moved, (int(round(cx - moved.width / 2.0)),
+                        int(round(cy - moved.height / 2.0))))
+    return layer
+
+
+def _write_flight_sequence(pieces, size, workdir, name, reverse=False):
+    """The flight, as a numbered PNG sequence ffmpeg can read. Returns the pattern.
+
+    `reverse` runs the same flight backwards, which is the "arrives" treatment: the new
+    furniture flies in from off-frame and settles. One flight computed one way and read
+    either way is the spec's own observation and it is why the two treatments cannot
+    look like different effects.
+
+    compress_level=1: these are deleted seconds later, and PNG's default compression
+    spends real time on a file nobody keeps. RGBA, so the room underneath shows through.
+    """
+    folder = os.path.join(workdir, f"flight_{name}")
+    os.makedirs(folder, exist_ok=True)
+    for frame in range(FLIGHT_FRAMES):
+        progress = frame / float(max(1, FLIGHT_FRAMES - 1))
+        if reverse:
+            progress = 1.0 - progress
+        layer = _flight_layer(pieces, size, progress)
+        layer.save(os.path.join(folder, "f_%04d.png" % frame), format="PNG",
+                   compress_level=1)
+    return os.path.join(folder, "f_%04d.png")
+
+
+# ---------------------------------------------------------------------------
+# The clips
+# ---------------------------------------------------------------------------
+# How hard the "quick zoom" treatment punches in before the white flash.
+PUNCH_ZOOM = 1.75
+
+
+def _base_blend_expr(treatment, seconds):
+    """The blend expression for the room UNDERNEATH the flight, or None for "just the
+    new room". A is the old frame, B is the new one.
+
+    `arrives` is geometry mistake 2 made explicit: the dissolve finishes
+    BASE_DISSOLVE_EARLY_SECONDS before the flight does, so the walls have settled before
+    the furniture lands on them.
+    """
+    if treatment == TREATMENT_SCATTER:
+        # The new room is there from frame zero, under the old furniture flying off it.
+        return None
+    if treatment == TREATMENT_ARRIVES:
+        span = max(0.1, FLIGHT_SECONDS - BASE_DISSOLVE_EARLY_SECONDS)
+        return f"A+(B-A)*clip(T/{span:.3f},0,1)"
+    if treatment == TREATMENT_BUILDS:
+        # A soft-edged wipe rising from the floor. H and Y are the blend filter's own
+        # frame height and row, so this is independent of the photo's shape.
+        return (f"A+(B-A)*clip((Y-H*(1-clip(T/{BUILD_SECONDS:.3f},0,1)))"
+                f"/(H*{BUILD_SOFT_EDGE:.3f})+0.5,0,1)")
+    if treatment == TREATMENT_PUNCH:
+        # The cut happens inside the white flash, so a hard switch is right here --
+        # a dissolve would be visible through the flash's edges.
+        return f"if(lt(T,{seconds / 2.0:.3f}),A,B)"
+    if treatment == TREATMENT_DISSOLVE:
+        return f"A+(B-A)*clip(T/{FALLBACK_DISSOLVE_SECONDS:.3f},0,1)"
+    raise ValueError(f"unknown treatment {treatment!r}")
+
+
+def _dramatic_still_clip(photo, out_path, workdir, name, knots, anchor, notice,
+                         seconds):
+    """One photograph -> one shot of the walk-through. No transformation.
+
+    The opening (the anonymised real exterior), the rebuilt exterior, and any room whose
+    redesign could not be made. Built from the Classic's own _contain_over_blur, so it
+    sits at exactly the scale the rest of the film does.
+    """
+    composite, _fills_width = _contain_over_blur(photo)
+    comp_path = os.path.join(workdir, f"d_still_{name}.bmp")
+    composite.save(comp_path, format="BMP")
+
+    clarity = _clarity_filter()
+    filters = ([_zoom_filter(knots, anchor), "setsar=1"]
+               + ([clarity] if clarity else [])
+               + _notice_filters(notice, workdir, name)
+               + ["format=yuv420p"])
+    frames = int(round(seconds * FPS))
+    _run_ffmpeg(
+        ["ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS), "-t", f"{seconds:.3f}",
+         "-i", comp_path, "-vf", ",".join(filters), "-frames:v", str(frames)]
+        + _ENCODE_ARGS + [out_path],
+        TIMEOUT_DRAMATIC_CLIP)
+
+
+def _dramatic_room_clip(before, after, out_path, workdir, name, treatment, knots,
+                        anchor, notice, seconds):
+    """One room's transformation. Returns the treatment it ACTUALLY used.
+
+    The return value matters: a room whose mask turns out to be unusable falls back to a
+    plain dissolve, and the caller has to be able to tell the agent so.
+
+    Every layer here is built at the foreground box _dramatic_backdrop reports -- the
+    size the photograph gets contained to, in the photograph's own aspect -- and the
+    zoom happens afterwards, in ffmpeg. See geometry mistake 1 at the top of this
+    section; getting this wrong is what makes the flight cut read as a jump.
+    """
+    # The backdrop comes from the AFTER frame: it is the state the shot rests in, and a
+    # blurred surround that changed mid-shot would be the only moving thing nobody asked
+    # to move. For a landscape photo it is invisible anyway (the foreground fills the
+    # width); it shows only on a source taller than 9:16.
+    backdrop, (fg_w, fg_h), (ox, oy) = _dramatic_backdrop(after)
+    backdrop_path = os.path.join(workdir, f"d_bd_{name}.bmp")
+    backdrop.save(backdrop_path, format="BMP")
+
+    old_fg = before.convert("RGB").resize((fg_w, fg_h), Image.LANCZOS)
+    new_fg = after.convert("RGB").resize((fg_w, fg_h), Image.LANCZOS)
+    old_path = os.path.join(workdir, f"d_old_{name}.bmp")
+    new_path = os.path.join(workdir, f"d_new_{name}.bmp")
+    old_fg.save(old_path, format="BMP")
+    new_fg.save(new_path, format="BMP")
+
+    # --- the flight, if this treatment flies anything -------------------------------
+    flight_pattern = None
+    layer_size = (max(2, int(fg_w * FLIGHT_LAYER_SCALE)),
+                  max(2, int(fg_h * FLIGHT_LAYER_SCALE)))
+    if treatment in TREATMENTS_NEEDING_PIECES:
+        mask, coverage = _difference_mask(old_fg, new_fg)
+        pieces = []
+        if MASK_MIN_COVERAGE <= coverage <= MASK_MAX_COVERAGE:
+            source = old_fg if treatment == TREATMENT_SCATTER else new_fg
+            pieces = _flight_pieces(source, mask, layer_size)
+        else:
+            logger.warning("room %s: %.1f%% of the frame changed, outside the usable "
+                           "%.0f-%.0f%% band; falling back to a plain dissolve",
+                           name, coverage * 100, MASK_MIN_COVERAGE * 100,
+                           MASK_MAX_COVERAGE * 100)
+        if pieces:
+            flight_pattern = _write_flight_sequence(
+                pieces, layer_size, workdir, name,
+                reverse=(treatment == TREATMENT_ARRIVES))
+        else:
+            # The spec's own instruction. A plain dissolve is a perfectly respectable
+            # before-and-after; a flight built on a nonsense mask is not.
+            treatment = TREATMENT_DISSOLVE
+
+    # --- inputs, in a fixed order so the filtergraph indices are readable -----------
+    still = ["-loop", "1", "-framerate", str(FPS), "-t", f"{seconds:.3f}", "-i"]
+    blend_expr = _base_blend_expr(treatment, seconds)
+    inputs = list(still) + [backdrop_path]
+    index_backdrop, next_index = 0, 1
+    index_old = None
+    if blend_expr is not None:
+        inputs += still + [old_path]
+        index_old, next_index = next_index, next_index + 1
+    inputs += still + [new_path]
+    index_new, next_index = next_index, next_index + 1
+    index_flight = None
+    if flight_pattern:
+        # No -loop: the sequence ends when the flight does, and overlay's eof_action
+        # keeps the finished room on screen afterwards.
+        inputs += ["-framerate", str(FPS), "-i", flight_pattern]
+        index_flight, next_index = next_index, next_index + 1
+
+    filters = []
+    if blend_expr is not None:
+        filters.append(f"[{index_old}:v]format=rgb24,setsar=1[old]")
+        filters.append(f"[{index_new}:v]format=rgb24,setsar=1[new]")
+        filters.append(f"[old][new]blend=all_expr='{blend_expr}'[base]")
+    else:
+        filters.append(f"[{index_new}:v]format=rgb24,setsar=1[base]")
+    filters.append(f"[{index_backdrop}:v]format=rgb24,setsar=1[bd]")
+    filters.append(f"[bd][base]overlay={ox}:{oy}:format=rgb[comp]")
+    last = "[comp]"
+    if flight_pattern:
+        # Back up to the foreground box BEFORE the overlay. The layer was drawn at half
+        # that box (a resolution economy on motion-blurred pixels); this is the line
+        # that keeps the composition in the photograph's space regardless.
+        filters.append(f"[{index_flight}:v]scale={fg_w}:{fg_h},format=rgba[fl]")
+        filters.append(f"{last}[fl]overlay={ox}:{oy}:eof_action=pass:format=rgb[flown]")
+        last = "[flown]"
+
+    clarity = _clarity_filter()
+    tail = [_zoom_filter(knots, anchor), "setsar=1"]
+    if clarity:
+        tail.append(clarity)
+    if treatment == TREATMENT_PUNCH:
+        half = seconds / 2.0
+        tail.append(f"fade=t=out:st={half - FLASH_SECONDS:.3f}"
+                    f":d={FLASH_SECONDS:.3f}:color=white")
+        tail.append(f"fade=t=in:st={half:.3f}:d={FLASH_SECONDS:.3f}:color=white")
+    tail += _notice_filters(notice, workdir, name)
+    tail.append("format=yuv420p")
+    filters.append(last + ",".join(tail) + "[v]")
+
+    frames = int(round(seconds * FPS))
+    _run_ffmpeg(
+        ["ffmpeg", "-y"] + inputs
+        + ["-filter_complex", ";".join(filters), "-map", "[v]",
+           "-frames:v", str(frames)]
+        + _ENCODE_ARGS + [out_path],
+        TIMEOUT_DRAMATIC_CLIP)
+    return treatment
+
+
+# ---------------------------------------------------------------------------
+# The film
+# ---------------------------------------------------------------------------
+def dramatic_shots(has_opening, has_exterior, rooms):
+    """The whole film's geometry, as one readable table. Pure; no images, no ffmpeg.
+
+    `rooms` is [(has_after, ...)] -- only whether each room can be transformed. Returns
+    one dict per shot with everything the clip builders need: kind, seconds, notice,
+    anchor, the treatment, and the zoom ramp.
+
+    SEPARATED FROM THE RENDERING ON PURPOSE. This is where the walk-through lives and
+    where the disclaimers are decided, and both are things a test should be able to
+    check without ffmpeg, without a network and without a generated image. It is also
+    THE SEAM FOR "ELEGANT": an Elegant room is a generated clip rather than a locally
+    built one, so it becomes another `kind` here and nothing else in the film changes.
+    """
+    shots = []
+    if has_opening:
+        # THE REAL PHOTOGRAPH, neighbours altered. Its own line, and NOT the AI notice:
+        # the house in this shot is a photograph and calling it a visualisation would be
+        # a false statement about the image.
+        #
+        # Its anchor is always the DOOR, because it is an exterior and the film is on
+        # its way inside. What it pushes TO depends on what follows:
+        #   * a rebuilt exterior -- it hands over its own closing zoom, and the rebuild
+        #     carries the move straight on. The two frames are the same camera on the
+        #     same plot (the rebuild was generated FROM this one), so the cut is a MATCH
+        #     CUT in which the only thing that changes is the house. That is the whole
+        #     reveal, and easing there would make the house appear to leap backwards at
+        #     the moment it changes. See `continuous` in _walkthrough_knots.
+        #   * no rebuilt exterior -- then THIS is the shot we go through the door from,
+        #     so it drives at the door itself and the first room pulls out of it.
+        shots.append({"kind": "still", "role": "opening",
+                      "seconds": OPENING_SECONDS, "notice": PRIVACY_NOTICE_TEXT,
+                      "anchor": DOOR_CENTRE,
+                      "push": CONTAIN_ZOOM_MAX if has_exterior else DOOR_PUSH_ZOOM})
+    if has_exterior:
+        shots.append({"kind": "still", "role": "exterior",
+                      "seconds": EXTERIOR_SECONDS, "notice": AI_NOTICE_TEXT,
+                      "anchor": DOOR_CENTRE, "push": DOOR_PUSH_ZOOM,
+                      "continuous": has_opening})
+    treatment_no = 0
+    for index, has_after in enumerate(rooms):
+        if has_after:
+            shots.append({
+                "kind": "room", "role": "room", "index": index,
+                "seconds": ROOM_SECONDS, "notice": AI_NOTICE_TEXT,
+                "anchor": FRAME_CENTRE, "push": ROOM_PUSH_ZOOM,
+                # Rotated so the film has rhythm. Counted over TRANSFORMED rooms only,
+                # so a room that fell back to a plain photograph does not use up a
+                # treatment and leave the next two looking like the same effect.
+                "treatment": DRAMATIC_TREATMENTS[treatment_no % len(DRAMATIC_TREATMENTS)],
+            })
+            treatment_no += 1
+        else:
+            # A real photograph of the room as it is. NEITHER notice: nothing in this
+            # frame was generated.
+            shots.append({"kind": "still", "role": "room", "index": index,
+                          "seconds": ROOM_SECONDS, "notice": None,
+                          "anchor": FRAME_CENTRE, "push": ROOM_PUSH_ZOOM})
+
+    if not shots:
+        return shots
+    # The last shot pushes into nothing -- it hands over to the closing card.
+    shots[-1]["push"] = None
+    # The shot after the LAST exterior shot is the one we arrive in, so it pulls out
+    # from the same point that shot drove at. That matched pair is the walk-through, and
+    # it is why a hard cut here reads as passing through a doorway rather than as an
+    # edit. "The last exterior shot" rather than "the exterior", because with no rebuild
+    # the opening is the one we come in from.
+    outside = (1 if has_opening else 0) + (1 if has_exterior else 0)
+    if outside and outside < len(shots):
+        shots[outside]["anchor"] = DOOR_CENTRE
+
+    for position, shot in enumerate(shots):
+        pull = shots[position - 1]["push"] if position else None
+        if shot.get("treatment") == TREATMENT_PUNCH:
+            # In hard, flash, then back out of the new room -- so the ramp is a peak in
+            # the middle rather than a climb, and it still MEETS its neighbours at both
+            # ends, which is what the cut depends on.
+            span = max(1, int(round(shot["seconds"] * FPS)) - 1)
+            shot["knots"] = [(0, float(pull) if pull else 1.0),
+                             (span // 2, PUNCH_ZOOM),
+                             (span, float(shot["push"]) if shot["push"]
+                              else CONTAIN_ZOOM_MAX)]
+        else:
+            shot["knots"] = _walkthrough_knots(
+                shot["seconds"], pull, shot["push"],
+                continuous=bool(shot.get("continuous")))
+    return shots
+
+
+def render_dramatic_video(plan, agent_name="", agent_contact_line="",
+                          agent_photo_url=None, property_type=None, music_seed=None,
+                          music_track=None, degradations=None):
+    """The "From Old to New" (Dramatic) video. Returns (mp4 bytes, degradations).
+
+    `plan` is an old_to_new.Plan: the anonymised exterior, the rebuilt exterior, and one
+    before/after pair per room, all as urls. Making those is a separate, paid step that
+    has already happened by the time this runs (see old_to_new.build_plan) -- this
+    function is local work only and costs nothing.
+
+    Everything degrades. A room whose after image is missing plays as the real
+    photograph; a room whose mask is unusable plays as a plain dissolve; a clip that
+    fails to encode is dropped; a film that runs out of budget stops early. The agent
+    gets a video, and `degradations` says what it did not do.
+
+    Raises only when there is no film to make at all.
+    """
+    degradations = list(degradations or [])
+    if not plan or not plan.rooms and not plan.opening_url:
+        raise ValueError("A From Old to New video needs at least one room photo")
+
+    started = time.monotonic()
+    if not _RENDER_SLOTS.acquire(timeout=RENDER_SLOT_WAIT_SECONDS):
+        raise RenderSlotBusy(
+            "The video service is busy with other renders right now. Please try again "
+            "in a few minutes."
+        )
+    try:
+        # --- the photographs -----------------------------------------------------------
+        def _fetch(url):
+            if not url:
+                return None
+            try:
+                return _fetch_image(url)
+            except Exception as e:
+                logger.warning("dramatic: could not read %s (%s)", url, e)
+                return None
+
+        opening = _fetch(plan.opening_url)
+        if plan.opening_url and opening is None:
+            degradations.append(DRAMATIC_NOTE_NO_EXTERIOR)
+        exterior = _fetch(plan.exterior_url) if opening is not None else None
+        rooms = []
+        for room in plan.rooms:
+            before = _fetch(room.get("before_url"))
+            if before is None:
+                degradations.append("a room photo could not be read and was left out")
+                continue
+            after = _fetch(room.get("after_url"))
+            if room.get("after_url") and after is None:
+                degradations.append(
+                    "a redesigned room image could not be read, so that room is shown "
+                    "as it is today")
+            rooms.append((before, after))
+        if not rooms and opening is None:
+            raise RuntimeError("None of this listing's photos could be downloaded")
+
+        shots = dramatic_shots(opening is not None, exterior is not None,
+                               [after is not None for _before, after in rooms])
+
+        with tempfile.TemporaryDirectory() as workdir:
+            clip_paths = []
+            fell_back = 0
+            for position, shot in enumerate(shots):
+                if clip_paths and time.monotonic() - started > RENDER_BUDGET_SECONDS:
+                    logger.warning("dramatic: budget reached after %d shots; finishing "
+                                   "early", len(clip_paths))
+                    degradations.append(
+                        f"took too long, so only the first {len(clip_paths)} shots were "
+                        "used")
+                    break
+                name = "%02d" % position
+                clip_path = os.path.join(workdir, f"d_clip_{name}.mp4")
+                try:
+                    if shot["kind"] == "room":
+                        before, after = rooms[shot["index"]]
+                        used = _dramatic_room_clip(
+                            before, after, clip_path, workdir, name,
+                            shot["treatment"], shot["knots"], shot["anchor"],
+                            shot["notice"], shot["seconds"])
+                        if used != shot["treatment"]:
+                            fell_back += 1
+                    else:
+                        photo = (opening if shot["role"] == "opening"
+                                 else exterior if shot["role"] == "exterior"
+                                 else rooms[shot["index"]][0])
+                        _dramatic_still_clip(
+                            photo, clip_path, workdir, name, shot["knots"],
+                            shot["anchor"], shot["notice"], shot["seconds"])
+                except Exception as e:
+                    logger.warning("dramatic: shot %d (%s) failed (%s); skipping it",
+                                   position, shot["role"], e)
+                    degradations.append("one shot failed to render and was left out")
+                    continue
+                clip_paths.append(clip_path)
+            if fell_back:
+                degradations.append(DRAMATIC_NOTE_ANGLE)
+            if not clip_paths:
+                raise RuntimeError("No shot could be rendered into the video")
+
+            body_path = os.path.join(workdir, "d_body.mp4")
+            estimated = sum(s["seconds"] for s in shots[:len(clip_paths)])
+            if len(clip_paths) == 1:
+                os.replace(clip_paths[0], body_path)
+            else:
+                # HARD CUTS, stream-copied. The walk-through's matched push and pull is
+                # what carries one shot into the next, so there is nothing to dissolve
+                # and nothing to re-encode.
+                _concat(clip_paths, body_path, workdir, "dramatic_list", TIMEOUT_CONCAT)
+            body_duration = _probe_duration(body_path, estimated)
+
+            agent_photo = _fetch(agent_photo_url)
+            if agent_photo_url and agent_photo is None:
+                # Reported, as the Classic reports it: the closing card is the agent's
+                # own face and its absence is something they will notice and ask about.
+                degradations.append("the agent's profile photo could not be loaded, so "
+                                    "the closing card has no portrait")
+            data, silent_duration = _finish_film(
+                body_path, body_duration, workdir, agent_name, agent_contact_line,
+                agent_photo, property_type, music_seed, music_track, degradations)
+
+        if degradations:
+            logger.warning("dramatic video rendered with degradations: %s",
+                           "; ".join(degradations))
+        logger.info(
+            "dramatic video rendered: %d shot(s), %.1fs, %.1fMB, %.0fs wall clock",
+            len(clip_paths), silent_duration, len(data) / 1024 / 1024,
+            time.monotonic() - started)
+        return data, degradations
+    finally:
+        _RENDER_SLOTS.release()
+
+
+# ---------------------------------------------------------------------------
+# Planning a From Old to New listing: which photo is which, and the model call
+#
+# This bridge lives here rather than in old_to_new because photo fetching, thumbnailing
+# and Anthropic keys all already live here, and there should not be a second copy of any
+# of them. old_to_new owns the prompts, the cost ceiling and the cache; this owns
+# getting it the pictures.
+# ---------------------------------------------------------------------------
+# Ceiling on reading the photos for the description pass. The same budget the Classic's
+# survey uses, for the same reason: this step only buys STYLE, and a slow CDN must never
+# stall a render on something optional.
+DESCRIBE_FETCH_BUDGET_SECONDS = SURVEY_FETCH_BUDGET_SECONDS
+
+
+def vision_text(photos, prompt, timeout, max_tokens, budget):
+    """One batched vision call over `photos` -> raw text, or None. Never raises.
+
+    The public face of _vision_call, so another module can ask a question about an
+    agent's photos without growing its own copy of the key, timeout and retry policy.
+    """
+    content = _photo_content(photos, prompt)
+    if content is None:
+        return None
+    raw, _error = _vision_call(content, timeout, max_tokens=max_tokens, budget=budget)
+    return raw
+
+
+def _describe_thumbnails(urls):
+    """Small copies of these photos for the model to read, one slot per url.
+
+    A url that cannot be read becomes a neutral grey placeholder rather than being
+    dropped. That keeps photo N in slot N -- the reply is keyed on position, and a
+    missing slot would hand one room's description to the next room along, which is how
+    a scheme ends up described as the wrong room's furniture.
+    """
+    deadline = time.monotonic() + DESCRIBE_FETCH_BUDGET_SECONDS
+    out = []
+    for url in urls:
+        try:
+            img = _fetch_image(url, attempts=1, deadline=deadline).convert("RGB")
+            img.thumbnail((SURVEY_THUMB_PX, SURVEY_THUMB_PX), Image.LANCZOS)
+        except Exception as e:
+            logger.warning("old-to-new: could not read %s for the description pass "
+                           "(%s)", url, e)
+            img = Image.new("RGB", (64, 64), (128, 128, 128))
+        out.append(img)
+    return out
+
+
+def plan_old_to_new(image_urls, photo_index=0, video_photos=None, cache=None,
+                    store_image=None, images_used_this_month=0,
+                    generate_image=None):
+    """Everything a Dramatic render needs, as an old_to_new.Plan.
+
+    WHICH PHOTO IS WHICH. The first chosen photo is the exterior and the next
+    old_to_new.MAX_ROOMS are the rooms, in that order. "Chosen" is the same rule the
+    Classic uses -- the agent's own pick when they made one (choose_video_photos),
+    otherwise their hero photo first and then the listing's own order. That is
+    deliberate: the agent already has a photo picker and a hero star, so the Dramatic
+    needs no new control, and the order they see in My Listings is the order they get.
+    A model-labelled space pass could choose better rooms; it would be a second vision
+    call, and it is noted as a follow-up rather than built.
+
+    Raises old_to_new.BudgetExhausted when this agent has no allowance left this month.
+    Everything else degrades onto the returned plan.
+    """
+    if not image_urls:
+        raise ValueError("At least one photo is required to generate a video")
+    if photo_index < 0 or photo_index >= len(image_urls):
+        photo_index = 0
+
+    chosen, note = choose_video_photos(video_photos, image_urls)
+    if not chosen:
+        hero = image_urls[photo_index]
+        chosen = [hero] + [u for u in image_urls if u != hero]
+    selected = chosen[:1 + old_to_new.MAX_ROOMS]
+    exterior_url = selected[0] if selected else None
+    room_urls = [(url, None) for url in selected[1:]]
+
+    def describe():
+        photos = _describe_thumbnails([exterior_url] + [u for u, _ in room_urls])
+        return old_to_new.describe_photos(
+            photos,
+            lambda prompt, timeout, max_tokens, budget: vision_text(
+                photos, prompt, timeout, max_tokens, budget))
+
+    plan = old_to_new.build_plan(
+        exterior_url, room_urls, cache,
+        generate_image=generate_image or fal_images.generate,
+        store_image=store_image,
+        describe=describe,
+        images_used_this_month=images_used_this_month,
+    )
+    if note:
+        plan.degradations.insert(0, note)
+    return plan

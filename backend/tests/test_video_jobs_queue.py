@@ -409,14 +409,25 @@ check("classic has no account-wide cap (CPU bound, per-process)",
       workers[0].JOB_TYPES["classic"].account_limit is None)
 check("the real ceiling is one render per worker process, whatever the type",
       workers[0].PER_PROCESS_RENDER_LIMIT == 1)
-check("one render type is declared in JOB_TYPES, and it is the Classic",
-      list(workers[0].JOB_TYPES) == ["classic"], str(list(workers[0].JOB_TYPES)))
+check("the declared render types are the Classic and the Dramatic",
+      list(workers[0].JOB_TYPES) == ["classic", "dramatic"], str(list(workers[0].JOB_TYPES)))
+check("Elegant is named but NOT declared, so no worker can ever claim one",
+      workers[0].JOB_TYPE_ELEGANT == "elegant"
+      and workers[0].JOB_TYPE_ELEGANT not in workers[0].JOB_TYPES)
+# The Dramatic generates up to six images through fal before a frame is rendered, so it
+# is bound by an EXTERNAL service as well as by this box -- which is exactly the
+# constraint a fleet-wide cap is the right lever for.
+check("the Dramatic has a fleet-wide cap, because fal is the constraint",
+      workers[0].JOB_TYPES["dramatic"].account_limit == 2)
+check("and a cold-start ETA that accounts for the generations",
+      workers[0].JOB_TYPES["dramatic"].default_seconds
+      > workers[0].JOB_TYPES["classic"].default_seconds)
 
-# The account-wide cap MECHANISM is kept for any type that needs one later -- the right
-# lever when the constraint is an external service rather than this box's CPU. Nothing
-# ships with one set, so it is exercised here by setting one on the Classic for the
-# duration of this check and putting it back afterwards. Each worker is its own module
-# instance, so each needs its own override.
+# The account-wide cap MECHANISM is exercised below on the CLASSIC, by setting one for
+# the duration of this check and putting it back afterwards -- the Classic ships without
+# one (its constraint is local), so this is where the mechanism itself gets tested at a
+# limit of exactly 1, which is the case two workers could in principle both claim. Each
+# worker is its own module instance, so each needs its own override.
 for wk in workers:
     wk.JOB_TYPES["classic"].account_limit = 1
 

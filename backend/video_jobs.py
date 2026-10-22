@@ -116,6 +116,13 @@ logger = logging.getLogger(__name__)
 TABLE = "video_jobs"
 
 JOB_TYPE_CLASSIC = "classic"
+# "From Old to New", the flying-furniture variation. Same id as its video template, so
+# there is one word for one thing from the request through to the job row.
+JOB_TYPE_DRAMATIC = "dramatic"
+# PHASE TWO. The Kling makeover. Declared nowhere else yet: it is not in JOB_TYPES and
+# has no renderer, so nothing can enqueue it -- adding it is a JOB_TYPES entry and one
+# register_renderer call, which is the seam this module was built to have.
+JOB_TYPE_ELEGANT = "elegant"
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -177,6 +184,25 @@ JOB_TYPES = {
     # the truth; scaled by that same ratio. It is ONLY the fallback until real
     # duration_seconds rows exist, after which the rolling mean takes over.
     JOB_TYPE_CLASSIC: JobTypeConfig(per_process_limit=1, account_limit=None, default_seconds=100),
+
+    # Dramatic ("From Old to New"). Two reasons its numbers differ from the Classic's.
+    #
+    # account_limit=2, where the Classic has none. The Classic is bound by OUR cpu, and
+    # PER_PROCESS_RENDER_LIMIT plus the worker count is the right ceiling for that. This
+    # type is also bound by an EXTERNAL service -- it generates up to six images through
+    # fal before a frame is rendered -- and the fleet-wide lever is the one that fits an
+    # external constraint. Two at a time keeps us well inside fal's per-account
+    # concurrency while still letting a second agent start, and a third is DEFERRED
+    # (which rewinds its attempt counter) rather than failed.
+    #
+    # default_seconds=300, against the Classic's 100. A cold Dramatic render pays for up
+    # to six generations before any ffmpeg runs: at fal's healthy 10-25s an image that
+    # is 1-2.5 minutes of waiting, then the local render. The quote an agent sees has to
+    # include it, and this is only the fallback until real duration_seconds rows exist.
+    # A REGENERATE is far quicker -- every image comes from the listing's cache -- so the
+    # rolling mean will sit well below this once both kinds have run.
+    JOB_TYPE_DRAMATIC: JobTypeConfig(per_process_limit=1, account_limit=2,
+                                     default_seconds=300),
 }
 
 # How many renders of ANY type one worker process may have in flight at once.
@@ -194,8 +220,9 @@ JOB_TYPES = {
 # It is a SEPARATE limit from the per-type ones because it is a limit on the SUM. The
 # per-type limits cannot express it: two types registered at 1 each would let one worker
 # claim one of each. That combination was real while the Signature tier existed
-# (withdrawn 2026-10-21); with one type registered this line is inert, and it is kept
-# because it is the thing that makes a second type safe to add.
+# (withdrawn 2026-10-21), was inert for a day with only 'classic' registered, and is
+# LIVE AGAIN since 'dramatic' arrived on 2026-10-22 -- a worker may be rendering a
+# Classic or a Dramatic, never one of each.
 PER_PROCESS_RENDER_LIMIT = 1
 
 # How often a running job proves it is still alive, and how long silence lasts before

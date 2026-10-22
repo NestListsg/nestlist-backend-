@@ -35,6 +35,8 @@ import poster_renderer
 import photo_tidy
 import video_renderer
 import video_jobs
+import fal_images
+import old_to_new
 import ura_market_pulse
 import autoenhance
 import cloudinary_enhance
@@ -370,12 +372,17 @@ async def startup_event():
     # db_execute (so it inherits the retry and poisoned-pool discipline), then the
     # renderers, and only then does it probe and start consuming.
     #
-    # One render type, 'classic'. The queue is built to take more (video_jobs.JOB_TYPES
-    # plus one register_renderer call each) -- the Signature tier was the second and was
-    # withdrawn on 2026-10-21.
+    # Two render types: 'classic' and 'dramatic' (From Old to New). One JOB_TYPES entry
+    # plus one register_renderer call each is the whole cost of a type -- 'elegant', the
+    # Kling makeover, is phase two and deliberately has neither, so nothing can request
+    # or enqueue it.
     video_jobs.configure(db_execute)
     video_jobs.register_renderer(video_jobs.JOB_TYPE_CLASSIC,
                                  _classic_job_run, _classic_job_failed)
+    video_jobs.register_renderer(video_jobs.JOB_TYPE_DRAMATIC,
+                                 _dramatic_job_run, _dramatic_job_failed)
+    logger.info("From Old to New (Dramatic) image generation: %s",
+                "ENABLED" if fal_images.is_enabled() else "off (FAL_KEY is not set)")
     # Backgrounded for the same reason as the probes above: a slow database must not
     # hold up the port binding.
     asyncio.create_task(_start_video_queue())
@@ -1830,8 +1837,12 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
     # video", and the queue is keyed on (listing, job type) -- so if a second render
     # type is ever added, a job of that type queued behind nine others must not show up
     # here as this listing's Classic position. Naming the tier is what prevents that.
-    active_video_jobs = video_jobs.describe_active_for_agent(
-        agent["id"], video_jobs.JOB_TYPE_CLASSIC)
+    # Both render types. describe_active_for_agent keys its result by LISTING and warns
+    # that two types in flight on one listing would make the last row win -- which is
+    # exactly why generate-video allows only one video job per listing whatever its type
+    # (see _find_active_video_job). With that held, omitting the type is correct and is
+    # what lets a Dramatic render show its queue position in My Listings.
+    active_video_jobs = video_jobs.describe_active_for_agent(agent["id"])
     for row in rows:
         row["display_location"] = _strip_house_number(row.get("location"))
         row["content"] = _home_safe_text(row, row.get("content"))
@@ -5219,9 +5230,88 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
 
 DEFAULT_VIDEO_TEMPLATE_ID = "classic"
 
+DRAMATIC_VIDEO_TEMPLATE_ID = video_renderer.DRAMATIC_STYLE_ID    # "dramatic"
+# PHASE TWO, the Kling makeover. Named here so the id exists in one place and so the
+# check in _resolve_video_template_id can say "not available yet" about it specifically
+# rather than "unknown template". Deliberately NOT in VIDEO_TEMPLATES, so the picker
+# never offers it and no job of that type can be enqueued.
+ELEGANT_VIDEO_TEMPLATE_ID = video_renderer.ELEGANT_STYLE_ID      # "elegant"
+
+# THE ID IS THE CONTRACT WITH THE FRONTEND -- it keys its option list on these exact
+# strings, and 'classic' is additionally written onto listing rows going back months, so
+# none of them may ever be renamed. `name` is a human label and is only a FALLBACK: the
+# frontend uses its own wording for an id it recognises and falls back to this for one
+# it does not, which is what makes adding a template here safe for an app that has not
+# been redeployed yet.
 VIDEO_TEMPLATES = [
-    {"id": DEFAULT_VIDEO_TEMPLATE_ID, "name": "Classic Video"},
+    {"id": DEFAULT_VIDEO_TEMPLATE_ID, "name": "Classic"},
+    {"id": DRAMATIC_VIDEO_TEMPLATE_ID, "name": "Dramatic"},
 ]
+
+# Which queue each template renders on. One template, one job type, same spelling, so
+# there is never a mapping table to get out of step -- and the Dramatic's own concurrency
+# and ETA (video_jobs.JOB_TYPES) apply to Dramatic renders only.
+VIDEO_TEMPLATE_JOB_TYPES = {
+    DEFAULT_VIDEO_TEMPLATE_ID: video_jobs.JOB_TYPE_CLASSIC,
+    DRAMATIC_VIDEO_TEMPLATE_ID: video_jobs.JOB_TYPE_DRAMATIC,
+}
+
+
+def _job_type_for_template(template_id):
+    """The queue a template renders on. Falls back to the Classic's, so an id that got
+    into a listing row before its type existed still renders rather than erroring."""
+    return VIDEO_TEMPLATE_JOB_TYPES.get(template_id, video_jobs.JOB_TYPE_CLASSIC)
+
+
+# ONE VIDEO JOB PER LISTING, WHATEVER ITS TYPE -- and this is the only thing enforcing
+# that, so do not remove it without replacing it.
+#
+# The database's partial unique index is over (listing_id, job_type), which is exactly
+# right while there is one type and not enough now there are two: an agent who presses
+# Generate on Classic and then switches to Dramatic and presses again would get two jobs
+# that are each perfectly legal, racing to write the SAME videos/{listing_id}.mp4 and the
+# same video_url. Whichever finished last would win the bytes while the row might record
+# the other, which is the one outcome worse than being told to wait.
+#
+# So the endpoint looks for an active job of ANY type before enqueuing and, finding one,
+# reports its position instead -- the same "a second press is not an error" behaviour the
+# Classic already had, widened across types. The honest limit: this is an
+# application-level check, so two presses of DIFFERENT types interleaving inside the same
+# few milliseconds could still both insert. Narrowing that to zero means widening the
+# index to (listing_id) alone, which is a migration; it is noted as a follow-up rather
+# than done here.
+VIDEO_JOB_TYPES = (video_jobs.JOB_TYPE_CLASSIC, video_jobs.JOB_TYPE_DRAMATIC)
+
+
+def _find_active_video_job(listing_id: str):
+    """This listing's video job in flight, of any type, or None. Never raises."""
+    for job_type in VIDEO_JOB_TYPES:
+        try:
+            job = video_jobs.find_active(job_type, listing_id)
+        except Exception as e:
+            logger.warning("could not look for an active %s job on %s (%s)",
+                           job_type, listing_id, e)
+            continue
+        if job:
+            return job
+    return None
+
+
+def _find_done_video_job(listing_id: str, video_url: str):
+    """The finished job of any type that produced THIS video, or None. Never raises.
+
+    Matched on result_url so a stale or unrelated job can never put another render's
+    notes on this one -- which also settles which type to look at without guessing."""
+    for job_type in VIDEO_JOB_TYPES:
+        try:
+            job = video_jobs.find_latest_done(job_type, listing_id)
+        except Exception as e:
+            logger.warning("could not look for a finished %s job on %s (%s)",
+                           job_type, listing_id, e)
+            continue
+        if job and job.get("result_url") == video_url:
+            return job
+    return None
 
 # Templates that shipped once and were then withdrawn. They stay listed here (but out
 # of VIDEO_TEMPLATES, so the frontend picker never offers them again) purely so we can
@@ -5231,6 +5321,11 @@ VIDEO_TEMPLATES = [
 # quietly renders the default instead of erroring -- an agent regenerating an old
 # listing must get a video, not a "Unknown video template" wall.
 RETIRED_VIDEO_TEMPLATE_IDS = {"card"}  # "Card Overlay", withdrawn 2026-08-15
+
+# Named, declared, and not built yet. Kept apart from "unknown" so an agent on a
+# frontend that lists all three is told it is coming rather than told they sent
+# nonsense -- and, more importantly, so it is never silently rendered as a Classic.
+UNRELEASED_VIDEO_TEMPLATE_IDS = {ELEGANT_VIDEO_TEMPLATE_ID}
 
 _LIVE_VIDEO_TEMPLATE_IDS = {t["id"] for t in VIDEO_TEMPLATES}
 
@@ -5656,6 +5751,307 @@ def _classic_job_failed(job: dict, error_text: str):
         logger.warning("video job %s: could not mark the listing failed (%s)", job["id"], e)
 
 
+# ---------------------------------------------------------------------------
+# "From Old to New" (Dramatic): the generated "after" photos, and the render.
+#
+# The split of ownership mirrors the Classic's. old_to_new owns the prompts, the cost
+# ceiling and the cache format; fal_images owns the call; video_renderer owns the film.
+# This file owns the two things only it can: STORAGE, and what a finished video means
+# for the listing row.
+# ---------------------------------------------------------------------------
+# Generated images live beside the listing's photos, in their own folder so they can
+# never be mistaken for the agent's own pictures -- nothing reads this prefix except the
+# Dramatic renderer, and listings.images never points into it.
+OLD_TO_NEW_PREFIX = "old-to-new"
+
+
+def _store_generated_image(listing_id: str, role: str, key: str, data: bytes) -> str:
+    """Upload one generated "after" photo and return its public URL.
+
+    Reuses the video upload's retry ladder for the same reason it exists there: this is
+    a multi-megabyte upload that can now land at the same moment as three others, and
+    losing it would mean paying fal again for a picture we already have. The path is
+    fixed and derived from the cache key, so retrying is an upsert of the same bytes to
+    the same place.
+
+    The URL must be PUBLIC and fetchable without a header: fal downloads the anonymised
+    exterior itself in order to generate the rebuild from it.
+    """
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{key}")
+    filename = f"{OLD_TO_NEW_PREFIX}/{listing_id}/{safe}.jpg"
+    delay = VIDEO_UPLOAD_BACKOFF_SECONDS
+    for attempt in range(1, VIDEO_UPLOAD_ATTEMPTS + 1):
+        try:
+            supabase = get_db()
+            supabase.storage.from_("listings-images").upload(
+                filename, data, {"content-type": "image/jpeg", "upsert": "true"})
+            return supabase.storage.from_("listings-images").get_public_url(filename)
+        except Exception as e:
+            logger.warning("old-to-new: upload of %s failed (attempt %d/%d): %s: %s",
+                           filename, attempt, VIDEO_UPLOAD_ATTEMPTS, type(e).__name__, e)
+            if attempt == VIDEO_UPLOAD_ATTEMPTS:
+                raise
+            if isinstance(e, _DB_TRANSPORT_ERRORS):
+                _reset_db()
+            time.sleep(delay)
+            delay *= 2
+
+
+def _old_to_new_images_used(agent_id: str, listing_id: str) -> int:
+    """An upper bound on the images this agent has generated this calendar month.
+
+    Counted as DISTINCT listings with a Dramatic job this month, times the most images
+    one listing can cost. Distinct listings rather than jobs, because a listing is only
+    ever paid for once however many times it is regenerated -- that is what the cache is
+    for -- and the CURRENT listing is excluded, because a regenerate must never be
+    refused by its own earlier render.
+
+    Durable and fleet-wide, which a process-local counter could not be: Railway runs
+    four workers and four separate counters would be four separate ceilings.
+
+    On any failure this returns 0 -- "no allowance used". Deliberate: the authoritative
+    hard cap is fal's own billing spend limit, and a database blip must not stop an agent
+    making a video they are entitled to. See the report accompanying this change.
+    """
+    try:
+        start = datetime.now(timezone.utc).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0)
+        res = db_execute(
+            lambda db: db.table(video_jobs.TABLE).select("listing_id")
+            .eq("agent_id", str(agent_id))
+            .eq("job_type", video_jobs.JOB_TYPE_DRAMATIC)
+            .gte("created_at", start.isoformat()),
+            what="old_to_new monthly usage count")
+        listings = {str(r.get("listing_id")) for r in (res.data or [])}
+        listings.discard(str(listing_id))
+        return len(listings) * old_to_new.IMAGES_PER_LISTING
+    except Exception as e:
+        logger.warning("old-to-new: could not count this month's usage (%s); allowing "
+                       "the render", e)
+        return 0
+
+
+def _render_dramatic_core(listing_id: str, agent: dict, listing: dict,
+                          photo_index: int, music_track: str = None,
+                          video_photos: list = None, ownership_check=None,
+                          record_degradations=None):
+    """Plan, generate, render, store, and write the finished URL onto the listing.
+
+    Shaped like _render_video_core and for the same reasons -- the listing is re-read at
+    job start so a photo deleted while the job waited is not used, and ownership is
+    confirmed immediately before the two writes the agent can actually see. Returns
+    (video_url, degradations); raises on failure.
+    """
+    try:
+        fresh = db_execute(
+            lambda db: db.table("listings").select("*").eq("id", listing_id)
+            .eq("agent_id", agent["id"]),
+            what="_render_dramatic_core listings select")
+        if fresh.data:
+            listing = fresh.data[0]
+    except Exception as e:
+        logger.warning("dramatic job %s: could not re-read listing (%s); using the "
+                       "queued snapshot", listing_id, e)
+
+    images = listing.get("images") or []
+    if not images:
+        raise RuntimeError("This listing has no photos any more -- add a photo and "
+                           "generate the video again.")
+    if photo_index < 0 or photo_index >= len(images):
+        photo_index = 0
+
+    # --- the paid step. Cached images cost nothing and are not re-generated. ---------
+    plan = video_renderer.plan_old_to_new(
+        images,
+        photo_index=photo_index,
+        video_photos=video_photos,
+        cache=old_to_new.read_cache(listing.get("old_to_new_images")),
+        store_image=lambda role, key, data: _store_generated_image(
+            listing_id, role, key, data),
+        images_used_this_month=_old_to_new_images_used(agent["id"], listing_id),
+    )
+    # STORE THE CACHE BEFORE RENDERING, not after. The images are already paid for; if
+    # the render then fails and the job retries, the retry must not pay again. Written
+    # only when the column exists (the fresh row has the key), so there is no failing
+    # write before the migration -- without it the feature works and simply costs again
+    # on every regeneration.
+    if plan.images_paid and "old_to_new_images" in listing:
+        try:
+            db_execute(
+                lambda db: db.table("listings").update({
+                    "old_to_new_images": old_to_new.write_cache(plan.cache)
+                }).eq("id", listing_id).eq("agent_id", agent["id"]),
+                what="_render_dramatic_core cache update")
+        except Exception as e:
+            logger.warning("dramatic %s: generated images but could not record them "
+                           "(%s) -- a regenerate will pay again", listing_id, e)
+
+    # The same end-slate contact line the Classic uses (the condo family adds its CEA
+    # lines here). The Dramatic draws no price or stats of its own, so those go in empty.
+    video_contact_line = _home_video_overlay(listing, agent, "", [])[0]
+
+    video_bytes, degradations = video_renderer.render_dramatic_video(
+        plan,
+        agent_name=agent["name"],
+        agent_contact_line=video_contact_line,
+        agent_photo_url=agent.get("photo_url"),
+        property_type=(listing.get("property_type") or "").upper(),
+        music_seed=listing_id,
+        music_track=music_track,
+        # Everything the planning step could not do exactly as asked travels with the
+        # film, so one list reaches the agent rather than two.
+        degradations=plan.degradations,
+    )
+    if degradations:
+        logger.warning("dramatic video %s rendered with degradations: %s",
+                       listing_id, "; ".join(degradations))
+
+    if ownership_check is not None and not ownership_check():
+        raise video_jobs.SupersededError(
+            "this render was reclaimed by another worker before its video was stored")
+    filename = f"videos/{listing_id}.mp4"
+    video_url = _store_rendered_video(filename, video_bytes)
+    if ownership_check is not None and not ownership_check():
+        raise video_jobs.SupersededError(
+            "this render was reclaimed by another worker before the listing was updated")
+
+    if record_degradations is not None:
+        try:
+            record_degradations(list(degradations))
+        except Exception as e:
+            logger.warning("dramatic %s: could not record degradations on the job (%s)",
+                           listing_id, e)
+    if "video_degradations" in listing:
+        try:
+            db_execute(
+                lambda db: db.table("listings").update(
+                    {"video_degradations": list(degradations)}
+                ).eq("id", listing_id).eq("agent_id", agent["id"]),
+                what="_render_dramatic_core degradations update")
+        except Exception as e:
+            logger.warning("dramatic %s: could not store degradations (%s)",
+                           listing_id, e)
+
+    db_execute(
+        lambda db: db.table("listings").update({
+            "video_url": video_url, "video_status": "done", "video_error": None,
+            "video_template_id": DRAMATIC_VIDEO_TEMPLATE_ID,
+        }).eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="_render_dramatic_core listings update")
+    return video_url, degradations
+
+
+def _dramatic_job_run(job: dict):
+    """Run one queued Dramatic render. Returns (video_url, degradations).
+
+    The agent is re-read here rather than carried in the job row, exactly as the
+    Classic's runner does it: the agent record holds Facebook and Instagram page tokens,
+    which must never be written into a queue table.
+    """
+    listing_id = str(job["listing_id"])
+    agent_id = str(job["agent_id"])
+    payload = job.get("payload") or {}
+
+    agent_res = db_execute(
+        lambda db: db.table("agents").select("*").eq("id", agent_id),
+        what="_dramatic_job_run agents select")
+    if not agent_res.data:
+        raise video_jobs.PermanentJobError("This agent account no longer exists.")
+    agent = agent_res.data[0]
+
+    listing_res = db_execute(
+        lambda db: db.table("listings").select("*").eq("id", listing_id)
+        .eq("agent_id", agent_id),
+        what="_dramatic_job_run listings select")
+    if not listing_res.data:
+        raise video_jobs.PermanentJobError(
+            "This listing was deleted before its video could be generated.")
+    listing = listing_res.data[0]
+
+    if not (listing.get("images") or []):
+        raise video_jobs.PermanentJobError(
+            "This listing has no photos any more -- add a photo and generate the video "
+            "again.")
+    if not fal_images.is_enabled():
+        # Without a key there is no "after" photograph, and a From Old to New video of
+        # unchanged photos is not the thing the agent asked for. Permanent, because no
+        # number of retries will put a key in the environment.
+        raise video_jobs.PermanentJobError(
+            "The Dramatic video style is not switched on for this account yet. The "
+            "Classic video is available in the meantime.")
+
+    try:
+        db_execute(
+            lambda db: db.table("listings").update({
+                "video_status": "rendering",
+                "video_render_started_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", listing_id).eq("agent_id", agent_id),
+            what="_dramatic_job_run mark rendering")
+    except Exception as e:
+        logger.warning("dramatic job %s: could not mirror 'rendering' onto the listing "
+                       "(%s)", job["id"], e)
+
+    try:
+        return _render_dramatic_core(
+            listing_id, agent, listing,
+            int(payload.get("photo_index") or 0),
+            ownership_check=lambda: video_jobs.heartbeat(job),
+            record_degradations=lambda degs: video_jobs.record_degradations(job, degs),
+            music_track=payload.get("music_track"),
+            video_photos=payload.get("video_photos"),
+        )
+    except old_to_new.BudgetExhausted as e:
+        # Not a fault, and not retryable: the allowance resets next month. Its message is
+        # already written for the agent.
+        raise video_jobs.PermanentJobError(str(e))
+    except video_renderer.RenderSlotBusy as e:
+        raise video_jobs.DeferJob(str(e))
+
+
+def _render_dramatic_job(listing_id: str, agent: dict, listing: dict,
+                         chosen_video_template_id: str, persist_video_template_id: bool,
+                         photo_index: int, music_track: str = None,
+                         video_photos: list = None):
+    """The in-process Dramatic render, for the window where video_jobs is unavailable.
+
+    Same shape and same purpose as _render_video_job: it exists so the backend can be
+    deployed before or after Jane runs a migration and video generation keeps working
+    either way. Takes chosen_video_template_id and persist_video_template_id for call
+    signature symmetry with the Classic's; the Dramatic always writes its own id.
+    """
+    try:
+        if not fal_images.is_enabled():
+            raise RuntimeError(
+                "The Dramatic video style is not switched on for this account yet. The "
+                "Classic video is available in the meantime.")
+        _render_dramatic_core(listing_id, agent, listing, photo_index,
+                              music_track=music_track, video_photos=video_photos)
+    except Exception as e:
+        try:
+            db_execute(
+                lambda db: db.table("listings").update({
+                    "video_status": "failed",
+                    "video_error": str(e)[:500],
+                }).eq("id", listing_id).eq("agent_id", agent["id"]),
+                what="_render_dramatic_job mark failed")
+        except Exception:
+            pass  # DB unreachable too -- the stale-lock timeout lets the agent retry
+
+
+def _dramatic_job_failed(job: dict, error_text: str):
+    """Called once, only when a Dramatic job has genuinely run out of attempts."""
+    try:
+        db_execute(
+            lambda db: db.table("listings").update({
+                "video_status": "failed",
+                "video_error": str(error_text)[:500],
+            }).eq("id", str(job["listing_id"])).eq("agent_id", str(job["agent_id"])),
+            what="_dramatic_job_failed listings update")
+    except Exception as e:
+        logger.warning("dramatic job %s: could not mark the listing failed (%s)",
+                       job["id"], e)
+
+
 @app.post("/api/listings/{listing_id}/generate-video")
 async def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, music_track: str = None, video_photos: Optional[List[str]] = Query(None), agent=Depends(get_current_agent)):
     result = await db_execute_async(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_video listings select")
@@ -5670,6 +6066,11 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
     # slideshow instead of failing the request.
     stored_video_template_id = listing.get("video_template_id")
     if video_template_id:
+        if video_template_id in UNRELEASED_VIDEO_TEMPLATE_IDS:
+            raise HTTPException(
+                status_code=400,
+                detail="That video style is not available yet -- choose Classic or "
+                       "Dramatic.")
         resolved = _resolve_video_template_id(video_template_id)
         if resolved is None:
             raise HTTPException(status_code=400, detail="Unknown video template")
@@ -5691,6 +6092,18 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
         raise HTTPException(status_code=400, detail="Upload at least one photo before generating a video")
     if photo_index < 0 or photo_index >= len(images):
         photo_index = 0
+
+    # Which queue this render belongs on. The Dramatic has its own concurrency ceiling
+    # and its own ETA because it is bound by an external image service as well as by our
+    # own cpu (see video_jobs.JOB_TYPES).
+    job_type = _job_type_for_template(chosen_video_template_id)
+    if job_type == video_jobs.JOB_TYPE_DRAMATIC and not fal_images.is_enabled():
+        # Checked here as well as in the job, so the agent is told now rather than after
+        # waiting in a queue for a render that cannot work.
+        raise HTTPException(
+            status_code=400,
+            detail="The Dramatic video style is not switched on for this account yet. "
+                   "The Classic video is available in the meantime.")
 
     # Music: blank / "auto" means the automatic selection exactly as before. Anything
     # else must be a track on the pickable list -- a stale browser tab naming a removed
@@ -5721,6 +6134,34 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
     # rendering and waits for nothing, so it answers in the time of two database calls
     # whether one agent is generating or fifty are.
     if video_jobs.available():
+        # ONE JOB PER LISTING ACROSS TYPES -- see _find_active_video_job. An agent who
+        # switched style mid-render is told where the render they already started has got
+        # to; they are not given a second one racing it to the same file.
+        existing = await asyncio.to_thread(_find_active_video_job,
+                                           str(listing.get("id") or listing_id))
+        if existing and (existing.get("job_type") or video_jobs.JOB_TYPE_CLASSIC) != job_type:
+            try:
+                progress = await asyncio.to_thread(video_jobs.describe, existing)
+            except Exception:
+                progress = {}
+            in_flight = (existing.get("payload") or {}).get("video_template_id") \
+                or DEFAULT_VIDEO_TEMPLATE_ID
+            logger.info("generate_video: listing %s already had a %s job in flight; "
+                        "the %s request was not queued", listing_id,
+                        existing.get("job_type"), chosen_video_template_id)
+            return dict({
+                "status": "rendering",
+                "music_track": (existing.get("payload") or {}).get("music_track") or "auto",
+                "video_photos": list((existing.get("payload") or {}).get("video_photos") or []),
+                "video_photos_mode": "custom" if (existing.get("payload") or {}).get("video_photos") else "auto",
+                "requested_video_photos": chosen_video_photos,
+                "video_photos_ignored": ignored_video_photos,
+                "max_video_photos": video_renderer.MAX_VIDEO_PHOTOS,
+                "video_template_id": in_flight,
+                "already_in_flight": True,
+                "requested_video_template_id": chosen_video_template_id,
+                "queued": True,
+            }, **progress)
         try:
             job, created = await asyncio.to_thread(
                 video_jobs.enqueue,
@@ -5730,7 +6171,7 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                 # -- and a differently-spelled key slips past the partial unique index,
                 # which is the one thing standing between a double-click and a double
                 # render.
-                video_jobs.JOB_TYPE_CLASSIC, listing.get("id") or listing_id, agent["id"],
+                job_type, listing.get("id") or listing_id, agent["id"],
                 {
                     "video_template_id": chosen_video_template_id,
                     "persist_video_template_id": persist_video_template_id,
@@ -5810,9 +6251,9 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                 or chosen_video_template_id
             )
             if not created:
-                logger.info("generate_video: listing %s already had a Classic job in "
+                logger.info("generate_video: listing %s already had a %s job in "
                             "flight (template %s); returning its position",
-                            listing_id, in_flight_template)
+                            listing_id, job_type, in_flight_template)
             in_flight_music_track = (job.get("payload") or {}).get("music_track") or "auto"
             # Same honesty rule: report the photos the render in flight will use.
             in_flight_video_photos = list((job.get("payload") or {}).get("video_photos") or [])
@@ -5865,8 +6306,12 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
         what="generate_video claim render lock",
     )
 
+    # Each type has its own in-process renderer, so the pre-queue fallback works for
+    # both and a Dramatic request is never silently delivered as a Classic.
+    legacy = (_render_dramatic_job if job_type == video_jobs.JOB_TYPE_DRAMATIC
+              else _render_video_job)
     task = asyncio.create_task(asyncio.to_thread(
-        _render_video_job, listing_id, agent, listing,
+        legacy, listing_id, agent, listing,
         chosen_video_template_id, persist_video_template_id, photo_index,
         chosen_music_track,
         chosen_video_photos or None,
@@ -5915,10 +6360,14 @@ async def get_video_status(listing_id: str, agent=Depends(get_current_agent)):
     }
     if video_jobs.available():
         try:
-            job = await asyncio.to_thread(
-                video_jobs.find_active, video_jobs.JOB_TYPE_CLASSIC, listing_id)
+            # Either type -- an agent polling a Dramatic render must not be told there is
+            # nothing in flight because only the Classic queue was looked at.
+            job = await asyncio.to_thread(_find_active_video_job, listing_id)
             if job:
                 out.update(await asyncio.to_thread(video_jobs.describe, job))
+                out["video_template_id"] = (
+                    (job.get("payload") or {}).get("video_template_id")
+                    or out.get("video_template_id"))
         except Exception as e:
             # Queue metadata is a nicety; the status itself already came from the
             # listing row, so a queue read failure must not fail the request.
@@ -5954,9 +6403,8 @@ async def _stored_video_degradations(listing_id: str, agent_id: str, video_url):
     except Exception:
         pass        # column not there yet (or a blip): fall through to the job row
     if video_jobs.available() and video_url:
-        job = await asyncio.to_thread(
-            video_jobs.find_latest_done, video_jobs.JOB_TYPE_CLASSIC, listing_id)
-        if job and job.get("result_url") == video_url:
+        job = await asyncio.to_thread(_find_done_video_job, listing_id, video_url)
+        if job:
             return [str(x) for x in (job.get("degradations") or [])]
     return []
 

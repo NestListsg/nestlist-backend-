@@ -506,7 +506,12 @@ _su = "\n".join(LINES[NODES["startup_event"].lineno - 1:NODES["startup_event"].e
 check("startup runs the CEA probe", "_probe_agent_cea_columns" in _su)
 check("video render passes the Home overlay contact to the renderer",
       SRC.count("video_contact_line, price_text, stats = _home_video_overlay(listing, agent, price_text, stats)") == 1
-      and SRC.count("agent_contact_line=video_contact_line,") == 1)
+      # BOTH video templates feed the renderer the Home overlay's contact line -- the
+      # Classic through the tuple above, the Dramatic through its own call (it draws no
+      # price or stats, so those go in empty and the contact is all it takes). Counted,
+      # so a third template that forgets the CEA lines is noticed here.
+      and SRC.count("agent_contact_line=video_contact_line,") == 2
+      and SRC.count('_home_video_overlay(listing, agent, "", [])[0]') == 1)
 
 # ---------------------------------------------------------------------------
 print("\n[7] public page")

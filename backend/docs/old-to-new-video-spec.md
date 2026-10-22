@@ -4,6 +4,42 @@ Two ways to show a property's potential, both agent-selectable. Decided with Jan
 2026-10-22 after building and rejecting several alternatives. This file is the recipe:
 the prompts are the valuable part and they are reproduced verbatim.
 
+---
+
+## Names, and what is built (2026-10-22)
+
+Agents choose between **three** videos. Jane named them, and the ids below are a
+contract with the frontend — `classic` is written onto listing rows going back months,
+and the frontend keys its option list on all three, so none of them may be renamed.
+
+| Agent sees | id | What it is | State |
+|---|---|---|---|
+| Classic | `classic` | today's slideshow, for a property that is already modern | shipped, **unchanged** |
+| Dramatic | `dramatic` | Variation A below — the old furniture flying out | **phase one, built** |
+| Elegant | `elegant` | Variation B below — carried out piece by piece, via Kling | **phase two, not built** |
+
+"Variation B — Makeover (gentle)" below is the **Elegant** video. The word *gentle*
+survives in this file because it describes the effect; *Elegant* is what it is called.
+
+**Phase one built** (`fal_images.py`, `old_to_new.py`, the Dramatic half of
+`video_renderer.py`, the wiring in `main.py` and `video_jobs.py`):
+
+- We **generate the "after" photographs ourselves** from the agent's own listing photos,
+  with `fal-ai/nano-banana/edit`, about 4 US cents each — the exterior pair and one
+  redesigned image per room, about 24 cents a listing, cached on the listing so a
+  regenerate pays nothing. There is deliberately **no upload path for after photos**:
+  generating the after FROM the before is what makes the two share a camera position by
+  construction, which is the requirement the whole effect rests on.
+- The Dramatic renderer, all four room treatments, and the walk-through (a hard push
+  into the front door and a matched pull-out inside, then a forward push room to room).
+- The disclaimers, enforced per shot rather than per film.
+
+**Phase two, for Elegant**, needs: a Kling client beside `fal_images` (the queue plumbing
+there is model-agnostic), a `JOB_TYPES` entry and one `register_renderer` call in
+`video_jobs`, the template added to `VIDEO_TEMPLATES`, and a `kind` in
+`video_renderer.dramatic_shots` for a room that is a generated clip rather than a locally
+built one. The prompts it needs are below, verbatim.
+
 Both variations need the **same two photographs of each room**: the room as it is, and
 the room redesigned. **The two shots must share a camera position.** That single
 requirement is what makes either effect work — see "Why the angle match matters".

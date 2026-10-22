@@ -228,6 +228,7 @@ def _run_endpoint(listing, **params):
     captured = {}
     class FakeJobs:
         JOB_TYPE_CLASSIC = "classic"
+        JOB_TYPE_DRAMATIC = "dramatic"
         @staticmethod
         def available(): return True
         @staticmethod
@@ -246,7 +247,16 @@ def _run_endpoint(listing, **params):
              DEFAULT_VIDEO_TEMPLATE_ID="classic",
              _resolve_video_template_id=lambda t: t if t in ("classic",) else None,
              logger=logging.getLogger("t"), _video_render_tasks=set(),
-             _render_video_job=lambda *a: captured.setdefault("legacy_args", a))
+             _render_video_job=lambda *a: captured.setdefault("legacy_args", a),
+             # Added when the Dramatic template arrived (2026-10-22). Stubbed so this
+             # file keeps asking its own question -- that the AUTO Classic path is
+             # unchanged -- rather than becoming a test of template routing, which
+             # test_dramatic_render.py owns.
+             UNRELEASED_VIDEO_TEMPLATE_IDS=set(),
+             _job_type_for_template=lambda t: "classic",
+             _find_active_video_job=lambda listing_id: None,
+             fal_images=types.SimpleNamespace(is_enabled=lambda: True),
+             _render_dramatic_job=lambda *a: captured.setdefault("legacy_args", a))
     node = fns["generate_video"]
     exec(compile("\n".join(src.splitlines()[node.lineno - 1:node.end_lineno]), "generate_video", "exec"), g)
     kw = dict(video_template_id=None, photo_index=0, music_track=None, video_photos=None, agent={"id": "a1"})
@@ -327,8 +337,13 @@ def _run_status(listing_row, column=None, column_missing=False, jobs_available=T
         return types.SimpleNamespace(data=[listing_row])
     g = dict(asyncio=asyncio, HTTPException=HTTPException, Depends=Depends, video_jobs=FJ,
              video_renderer=new, db_execute_async=db_exec, logger=logging.getLogger("t"),
-             get_current_agent=lambda: None)
-    for nm in ("get_video_status", "_stored_video_degradations"):
+             get_current_agent=lambda: None,
+             # Since 2026-10-22 there are two render types, so the status path looks for
+             # a job of EITHER. The two lookups are loaded from main.py below rather
+             # than stubbed, so this still tests the shipped code.
+             VIDEO_JOB_TYPES=("classic", "dramatic"))
+    for nm in ("_find_active_video_job", "_find_done_video_job",
+               "get_video_status", "_stored_video_degradations"):
         n = fns[nm]
         exec(compile("\n".join(src.splitlines()[n.lineno - 1:n.end_lineno]), nm, "exec"), g)
     return asyncio.run(g["get_video_status"]("L1", agent={"id": "a1"}))
