@@ -94,14 +94,30 @@ def call_with_deadline(fn, deadline, name="call"):
 
     For work that has NO interruptible file descriptor we can reach -- an SDK that owns
     its own httpx client, for instance. The worker thread is a daemon and is simply
-    abandoned: we stop waiting, the caller gets its deadline honoured, and the thread
-    dies whenever the underlying library finally gives up.
+    abandoned: we stop waiting, and the caller gets its deadline honoured.
 
     THE HONEST LIMITATION: this bounds how long the CALLER waits, not how long the work
-    runs. It is the right trade here because the thing being protected is a render
-    making forward progress, and an abandoned thread holds no lock the render needs. It
-    is NOT a substitute for the library having its own total timeout, and it would be
-    the wrong tool if the abandoned work held a scarce resource or wrote anything.
+    runs, and NOT how long the thread lives.
+
+    This docstring used to say the abandoned thread "dies whenever the underlying library
+    finally gives up". AGAINST A DRIBBLING SERVER IT NEVER GIVES UP -- which is the very
+    thing at the top of this module. requests' read timeout is per read, so one byte
+    every three seconds keeps every read healthy and the thread blocked for good.
+    Measured on 2026-10-22, against exactly that server: five calls through this function
+    left FIVE threads and five sockets alive 105 seconds later, and they would have
+    stayed. At tens of calls per render, a degraded endpoint fills a worker.
+
+    SO: this function alone is not enough for anything that holds a socket. Work that
+    does hold one must get the socket to the point where deadline_watchdog can shut it
+    down -- stream the response, read the body inside the watchdog, and the blocked read
+    raises and the thread ends. fal_images._request is the worked example; it carried
+    this weaker form for a day and leaked a thread per call while it did.
+
+    What is left for this function: work whose file descriptor we genuinely cannot reach
+    (video_renderer's vision call, which is inside an SDK), where a leaked thread is the
+    price of the deadline and is accepted knowingly. It is NOT a substitute for the
+    library having its own total timeout, and it is the wrong tool if the abandoned work
+    holds a scarce resource or writes anything.
     """
     box = {}
     done = threading.Event()

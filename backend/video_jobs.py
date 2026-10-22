@@ -191,9 +191,19 @@ JOB_TYPES = {
     # PER_PROCESS_RENDER_LIMIT plus the worker count is the right ceiling for that. This
     # type is also bound by an EXTERNAL service -- it generates up to six images through
     # fal before a frame is rendered -- and the fleet-wide lever is the one that fits an
-    # external constraint. Two at a time keeps us well inside fal's per-account
-    # concurrency while still letting a second agent start, and a third is DEFERRED
-    # (which rewinds its attempt counter) rather than failed.
+    # external constraint. A third render is DEFERRED (which rewinds its attempt
+    # counter) rather than failed.
+    #
+    # TWO IS NOT "well inside" FAL'S LIMIT, which an earlier version of this comment
+    # claimed. fal starts a NEW ACCOUNT at two concurrent requests, rising as credits are
+    # spent. Two renders, each with one request in flight, is therefore exactly that
+    # limit with no headroom at all -- and Jane's own experiments on ~/.nestlist_fal_key
+    # share the key, so a third request from her laptop collides with a real agent's
+    # render. That is survivable rather than fine: a 429 now comes back as
+    # fal_images.FalRateLimited, which main turns into a DeferJob, so a collision costs a
+    # wait of a few seconds instead of costing a room its transformation. If collisions
+    # turn out to be common, drop this to 1 (it halves throughput and doubles nothing
+    # else) or ask fal to raise the account's concurrency.
     #
     # default_seconds=300, against the Classic's 100. A cold Dramatic render pays for up
     # to six generations before any ffmpeg runs: at fal's healthy 10-25s an image that

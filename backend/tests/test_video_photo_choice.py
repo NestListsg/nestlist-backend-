@@ -229,6 +229,7 @@ def _run_endpoint(listing, **params):
     class FakeJobs:
         JOB_TYPE_CLASSIC = "classic"
         JOB_TYPE_DRAMATIC = "dramatic"
+        STATUS_QUEUED = "queued"
         @staticmethod
         def available(): return True
         @staticmethod
@@ -245,6 +246,9 @@ def _run_endpoint(listing, **params):
              video_renderer=new, video_jobs=FakeJobs, db_execute_async=db_exec,
              send_telegram_alert_throttled=noop, get_current_agent=lambda: None,
              DEFAULT_VIDEO_TEMPLATE_ID="classic",
+             # A stored style this deploy cannot render falls back to the Classic,
+             # so the endpoint needs the Dramatic id to recognise that case.
+             DRAMATIC_VIDEO_TEMPLATE_ID="dramatic",
              _resolve_video_template_id=lambda t: t if t in ("classic",) else None,
              logger=logging.getLogger("t"), _video_render_tasks=set(),
              _render_video_job=lambda *a: captured.setdefault("legacy_args", a),

@@ -13,15 +13,24 @@ This runs INSIDE an agent's render. A refused or slow generation must cost that 
 transformation, never the agent's video and never the worker. So:
 
   * ONE ABSOLUTE DEADLINE for the whole call, queue time included, and it actually
-    interrupts. requests' timeout=(connect, read) is PER READ: an endpoint dribbling a
-    byte just inside it resets the clock forever, and a deadline checked between polls
-    does not run while a read is blocked. slow_read has the measurements. Every HTTP
-    call here is therefore made under slow_read, not merely watched by a timer.
-  * BOUNDED ATTEMPTS. Two, and only for errors that could plausibly succeed next time.
+    interrupts -- AND IT FREES THE SOCKET AND THE THREAD, not only the caller. requests'
+    timeout=(connect, read) is PER READ: an endpoint dribbling a byte just inside it
+    resets the clock forever, and a deadline checked between polls does not run while a
+    read is blocked. slow_read has the measurements. Every HTTP call here therefore
+    streams its reply and reads it under slow_read's watchdog, which shuts the socket
+    down at the deadline. See _request for what the weaker version of this cost.
+  * BOUNDED ATTEMPTS, SPLIT BY WHAT THEY COST. At most two SUBMITS -- the only billable
+    call -- and only when we can tell that the first one never reached fal. Everything
+    after an accepted submit is collection, is free, and gets several more tries,
+    because throwing away an image fal has already charged us for is the expensive
+    outcome, not the slow one.
   * A PERMANENT / RETRYABLE SPLIT, because the two must not be treated alike. A content
     refusal or a malformed prompt will be refused identically every time; retrying it
-    spends the agent's wait and our money to arrive at the same answer. A 429 or a 502
-    is worth exactly one more try.
+    spends the agent's wait and our money to arrive at the same answer.
+  * A RATE LIMIT IS NEITHER. fal starts a new account at two concurrent requests, so a
+    429 is an expected outcome, not a rarity. Retrying it inside this call spends the
+    agent's wait on a queue that is full; FalRateLimited exists so the caller can put the
+    JOB back instead and let it run when there is room.
   * NOTHING HERE RAISES INTO A RENDER. Callers catch FalError and fall back; see
     old_to_new.py, where a refusal becomes a plain dissolve.
 
@@ -30,6 +39,16 @@ FAL_KEY comes from the process environment and from nowhere else. It is never re
 a file, never written to one, never logged, and never put in an error message -- errors
 from this module are shown to agents and copied into Railway's logs. _auth_headers()
 builds the header fresh per call for exactly that reason.
+
+AND WE DO NOT QUOTE FAL'S BODIES AT ALL. The first version of this module quoted 4xx
+bodies so a refusal was diagnosable, and relied on a redactor that replaced the key
+where it appeared BYTE FOR BYTE. An audit on 2026-10-22 walked straight past it with
+`Key%20<id>%3A<secret>`, with either half of the key on its own, and with the case
+changed -- every one of which would have reached Railway's logs. A body we do not quote
+cannot leak anything, so _classify now reports a status and a category from OUR OWN
+vocabulary and nothing fal wrote. _redact survives, now matching by PATTERN rather than
+by equality, for the one place prose from fal is still worth having (the
+completed-without-an-image explanation) and for anything that is quoted in future.
 
 COST
 Every successful generation is billed. generate() therefore does NOT decide whether we
@@ -40,11 +59,22 @@ one number rather than two that can drift.
 import io
 import logging
 import os
+import re
 import time
 
 import requests
 
 import slow_read
+
+# Bound at import, from the real requests, because tests and audit probes replace
+# `requests` in this module's namespace with a stub that has no .exceptions. A failure
+# we cannot classify is treated as "fal may already have our job", which is the safe
+# side of the only question that costs money.
+_UNSENT_TRANSPORT_ERRORS = (
+    requests.exceptions.ConnectTimeout,
+    requests.exceptions.SSLError,
+    requests.exceptions.ProxyError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +111,28 @@ HTTP_READ_SECONDS = 20
 POLL_FIRST_SECONDS = 1.5
 POLL_MAX_SECONDS = 6.0
 
-# Bounded attempts, and only retryable failures consume one.
-MAX_ATTEMPTS = 2
+# Bounded attempts, and only retryable failures consume one. TWO COUNTERS, because the
+# two kinds of attempt cost completely different things.
+#
+# MAX_SUBMITS is the number of times we may ask fal to GENERATE. Every one of those is
+# billed the moment fal queues it, whether or not we ever collect the picture. The second
+# one is spent only when we can tell the first never arrived (see _request and
+# `may_be_queued`): a failure that might have left a job in fal's queue is never answered
+# by submitting another.
+#
+# MAX_COLLECT_ATTEMPTS is the number of times we may go back for an image a submit has
+# ALREADY BOUGHT -- polling, fetching the result, downloading the file. None of those can
+# be billed, and an audit on 2026-10-22 showed every realistic failure in this phase
+# (a 429 on a poll, a 502 on the result fetch after the job had COMPLETED, a failed
+# download, a transport error mid-poll) made the old code SUBMIT AGAIN and pay twice for
+# one picture. So this phase is generous where the one above is strict.
+MAX_SUBMITS = 2
+MAX_COLLECT_ATTEMPTS = 4
 RETRY_BACKOFF_SECONDS = 2.0
+
+# A status or result reply is a few hundred bytes of JSON. Anything claiming to be
+# megabytes is not one, and reading it would be a way to spend the whole deadline.
+MAX_JSON_BYTES = 2 * 1024 * 1024
 
 # The generated image comes back as a URL we then download. Same decompression-bomb and
 # runaway-body guards the video renderer uses on listing photos.
@@ -106,7 +155,16 @@ REFUSED_WORDS = (
 
 
 class FalError(Exception):
-    """Anything that stopped a generation. Callers catch THIS and degrade."""
+    """Anything that stopped a generation. Callers catch THIS and degrade.
+
+    `may_be_queued` answers the only question in this module that costs money: could
+    fal have taken a job we are about to be billed for, before this went wrong? False
+    means we know it did not (it answered us with an error, or we never reached it), so
+    submitting again is safe. True means we cannot tell, so submitting again would risk
+    paying twice for one picture and generate() will not do it. Defaults to the safe
+    answer and is set to True only on the genuinely ambiguous paths."""
+
+    may_be_queued = False
 
 
 class FalNotConfigured(FalError):
@@ -129,7 +187,27 @@ class FalRefused(FalPermanent):
 
 
 class FalTemporary(FalError):
-    """Worth one more try: rate limiting, a 5xx, a transport error, a deadline."""
+    """Worth one more try: a 5xx, a transport error, a deadline."""
+
+
+class FalRateLimited(FalTemporary):
+    """fal is at this account's concurrency limit. Not a fault, and not ours to retry.
+
+    SEPARATE FROM FalTemporary BECAUSE THE RIGHT ANSWER IS DIFFERENT. fal starts a new
+    account at TWO concurrent requests, rising with credits spent -- and the Dramatic
+    queue allows two renders at once, each of which can have a request in flight, so a
+    third party on the same key (Jane's own ~/.nestlist_fal_key experiments share it) is
+    enough to make this an everyday answer rather than a rare one.
+
+    Retrying inside this call spends the agent's wait on a queue that is full, and when
+    it runs out the room silently loses its transformation. Handing it back instead lets
+    video_jobs.DeferJob put the whole job back for a few seconds -- which rewinds its
+    attempt counter, so waiting for capacity can never fail a render. That is what
+    DeferJob was built for, and this is the external-service 429 its docstring names.
+
+    The one exception is a rate limit hit while collecting an image we have ALREADY paid
+    for: there, waiting the few seconds inside this call is much cheaper than giving the
+    picture up, so generate() retries that case rather than handing it back."""
 
 
 def is_enabled():
@@ -161,89 +239,216 @@ def screen_prompt(prompt):
     return None
 
 
-def _redact(text):
-    """Any text we are about to quote, with the key taken out of it.
+# What a credential looks like once something has had its way with it.
+#
+# REDACTING BY EQUALITY WAS NOT ENOUGH, and that is the whole lesson here. The first
+# version of _redact replaced os.environ["FAL_KEY"] where it appeared byte for byte, and
+# its test echoed the key back byte for byte -- so the test passed against a redactor
+# that any transformation defeats. An audit walked past it on 2026-10-22 with
+# `Key%20<id>%3A<secret>` (url-encoded), with the secret half on its own, with the id
+# half on its own, and with the case changed. All four would have reached Railway's logs.
+#
+# A key is not a string we can look for, it is a SHAPE: a long run of key-ish characters,
+# usually just after a word like "Key". So that is what these match. They over-match
+# happily -- a long url path segment in an error message gets starred out too -- which is
+# the correct trade for a line in a log.
+_KEY_PATTERNS = (
+    # The header shape fal echoes back, however it has been escaped or cased:
+    # "Key <token>", "Bearer <token>", "authorization": "<token>", "Key%20<token>".
+    re.compile(r"""(?i)\b(key|bearer|token|authorization)\b([\s:=,"'\\]|%20|%22|%3A)+"""
+               r"""([^\s"',}\\]+)"""),
+    # Anything long enough and dense enough to BE a credential: hex, base64, a uuid, or
+    # a uuid and a secret joined by a colon -- url-encoded or not. 24 is comfortably
+    # below either half of a real fal key, so half a key is caught as readily as all of
+    # one, and so is a truncated echo.
+    re.compile(r"[A-Za-z0-9+=_%:-]{24,}"),
+)
 
-    THE REASON THIS EXISTS, found by a test rather than by reading the code: fal's 4xx
-    bodies echo request detail, and we quote them so a refusal is diagnosable. That text
-    reaches Railway's logs and, through a degradation note, the agent. An echoed
-    Authorization header would therefore have put the key in both. The key is never
-    DELIBERATELY formatted anywhere in this module -- this guards the path where
-    somebody else puts it in our mouth.
+
+def _redact(text):
+    """Any text we are about to quote, with anything credential-shaped taken out of it.
+
+    THE REASON THIS EXISTS: text that came from fal reaches Railway's logs and, through a
+    degradation note, the agent. The key is never DELIBERATELY formatted anywhere in this
+    module -- this guards the path where somebody else puts it in our mouth.
+
+    It is now a BELT rather than the braces. _classify quotes no fal body at all, so the
+    only external prose still passed through here is fal's own explanation of a
+    completed-without-an-image decline. Anything that starts quoting fal again must come
+    through this function, and must not go back to matching by equality.
     """
     text = str(text or "")
+    for pattern in _KEY_PATTERNS:
+        text = pattern.sub(
+            lambda m: (m.group(1) + " [redacted]") if m.lastindex else "[redacted]",
+            text)
+    # Last belt: the key itself, and the two cases a sloppy echo arrives in. Everything
+    # above should already have caught these; this costs nothing and does not rely on a
+    # pattern being right.
     key = os.environ.get(KEY_ENV, "").strip()
-    if key and key in text:
-        text = text.replace(key, "[redacted]")
+    for variant in {key, key.lower(), key.upper()} if key else ():
+        if variant and variant in text:
+            text = text.replace(variant, "[redacted]")
     return text
 
 
+# The words in a fal error that mean "we would not make this picture", as opposed to
+# "your request was wrong". OURS, not fal's: what we log is one of these words, never the
+# body it was found in, so the categorising cannot itself leak anything.
+_REFUSAL_MARKERS = ("safety", "policy", "blocked", "prohibited", "refus",
+                    "content filter", "not allowed")
+
+
+def _refusal_marker(body_text):
+    """Which refusal word fal's reply contains, or None. Scanned in memory and dropped."""
+    low = str(body_text or "").lower()
+    for word in _REFUSAL_MARKERS:
+        if word in low:
+            return word
+    return None
+
+
 def _classify(status_code, body_text):
-    """One HTTP failure -> the exception that says what to do about it."""
-    body_text = _redact(body_text)
+    """One HTTP failure -> the exception that says what to do about it.
+
+    THE BODY IS NEVER QUOTED, in any branch. fal's 4xx bodies echo request detail back,
+    and the detail includes the Authorization header we sent; quoting them put the key
+    one bad redaction away from Railway's logs, and the redaction WAS bad (see
+    _KEY_PATTERNS). What comes out of here is a status code, and for a refusal one word
+    from our own vocabulary. That is most of what the body was ever read for.
+
+    What this gives up: when fal rejects a request for a reason that is neither a refusal
+    nor obvious from the status, the log now says less than it did. The trade is
+    deliberate -- a reason we have to guess at costs a room its transformation, a leaked
+    key costs Jane her account.
+    """
     if status_code in (401, 403):
-        # Never include the body: fal echoes request details, and this one is about the
-        # key. "Check FAL_KEY in Railway" is the whole actionable content.
         return FalPermanent("fal rejected our credentials -- check FAL_KEY in Railway")
     if status_code == 429:
-        return FalTemporary("fal is rate limiting this account")
+        return FalRateLimited("fal is rate limiting this account")
     if status_code in (400, 422):
-        # fal's validation and safety refusals both land here. Distinguish on the body
-        # so a refusal reads as a refusal in the logs, and truncate hard -- this text
-        # reaches Railway's logs and, via a degradation note, the agent.
-        low = (body_text or "").lower()
-        if any(w in low for w in ("safety", "policy", "blocked", "prohibited",
-                                  "refus", "content filter", "not allowed")):
-            return FalRefused(f"fal would not generate this image: {body_text[:200]}")
-        return FalPermanent(f"fal rejected the request: {body_text[:200]}")
+        # fal's validation and safety refusals both land here, and they are not the same
+        # thing: a refusal is a normal, designed-for outcome and must read as one.
+        marker = _refusal_marker(body_text)
+        if marker:
+            return FalRefused(
+                f"fal would not generate this image (its reply mentions {marker!r})")
+        return FalPermanent(
+            f"fal rejected the request (HTTP {status_code}; its reply is not quoted -- "
+            "it can echo our own request headers)")
     if status_code == 404:
         return FalPermanent(f"fal does not know the model {EDIT_MODEL!r}")
     if status_code >= 500:
         return FalTemporary(f"fal returned {status_code}")
-    return FalTemporary(f"fal returned {status_code}: {(body_text or '')[:200]}")
+    return FalTemporary(f"fal returned {status_code}")
+
+
+def _ambiguous(exc):
+    """Mark an error as "fal might have taken our job before this went wrong"."""
+    exc.may_be_queued = True
+    return exc
 
 
 def _request(method, url, deadline, json_body=None):
     """One short HTTP call to fal, under the CALLER'S absolute deadline.
 
-    The deadline is enforced, not merely checked. requests' read timeout cannot bound
-    this (see the module docstring), and these bodies are small JSON with no socket
-    worth reaching into mid-read, so the call runs in slow_read's abandoned-thread form:
-    we stop waiting at the deadline and the daemon thread dies when requests eventually
-    gives up. It holds no lock a render needs and writes nothing.
+    THE DEADLINE NOW FREES THE SOCKET AND THE THREAD, not just the caller, and that is
+    the change worth reading. This function used to run the whole call -- connect, send,
+    and the entire body read -- inside slow_read.call_with_deadline and simply stop
+    waiting, on the stated grounds that these are "small JSON with no socket worth
+    reaching into" and that the abandoned thread dies when requests gives up.
+    Both halves of that were wrong:
+
+      * requests' read timeout is PER READ. A server dribbling one byte every three
+        seconds keeps every read healthy, so requests NEVER gives up -- which is the
+        exact lesson slow_read exists to encode, applied to the download next door but
+        not here. Measured by an audit on 2026-10-22: five calls to such an endpoint left
+        five threads AND five sockets alive 105 seconds later, for good.
+      * the socket is as reachable here as it is in _download. There was nothing special
+        about these replies except that they are smaller.
+
+    A cold Dramatic render makes tens of these calls, so a degraded fal could have filled
+    a Railway worker with stuck threads and file descriptors until it was redeployed.
+    So: stream=True, which returns as soon as the headers are in, and the body is then
+    read under slow_read.deadline_watchdog -- at the deadline the socket is shut down,
+    the blocked read raises, and the worker thread ends.
+
+    THE RESIDUAL, honestly: a server that never finishes sending HEADERS is still merely
+    abandoned, because there is no response object to reach into yet. requests' own
+    connect and read timeouts do bound that case, and it is the one shape where nothing
+    has arrived to reset them.
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise FalTemporary("ran out of time before calling fal")
 
     def attempt():
-        return requests.request(
+        response = requests.request(
             method, url,
             headers=_auth_headers(),
             json=json_body,
             timeout=(HTTP_CONNECT_SECONDS, HTTP_READ_SECONDS),
+            # So the body is read HERE, under the watchdog, instead of inside requests
+            # where nothing can interrupt it.
+            stream=True,
         )
+        try:
+            declared = int((getattr(response, "headers", None) or {})
+                           .get("content-length") or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared > MAX_JSON_BYTES:
+            raise FalTemporary("fal's reply is too big to be a status or a result")
+        try:
+            with slow_read.deadline_watchdog(response, deadline, warn=False):
+                if response.status_code >= 400:
+                    return response.status_code, response.text, None
+                try:
+                    return response.status_code, None, response.json()
+                except ValueError:
+                    # Not JSON. Reported by the caller as such, from payload=None, so a
+                    # 200 we cannot read is never mistaken for a transport failure.
+                    return response.status_code, None, None
+        finally:
+            # Never reused, and the tidy close is the slow one -- same reasoning as
+            # _download's finally.
+            slow_read.abandon_response(response)
 
     try:
-        response = slow_read.call_with_deadline(attempt, deadline, name="fal request")
+        status_code, body, payload = slow_read.call_with_deadline(
+            attempt, deadline, name="fal request")
     except FalNotConfigured:
         raise
+    except FalError:
+        # Raised by attempt() itself (the size guard). Already classified.
+        raise
     except TimeoutError as e:
-        raise FalTemporary("fal did not answer before the deadline") from e
+        # We stopped waiting at the deadline. If this was a submit, fal may well have the
+        # job: the deadline says nothing about whether the request arrived.
+        raise _ambiguous(
+            FalTemporary("fal did not answer before the deadline")) from e
     except Exception as e:
-        # Transport: DNS, connection reset, TLS. Worth one more try.
-        raise FalTemporary(f"could not reach fal ({type(e).__name__})") from e
+        if time.monotonic() > deadline:
+            # The watchdog shut the socket down and the blocked read surfaced as an
+            # ordinary transport error. Past the deadline, that is what it is -- the same
+            # reading _download gives it.
+            raise _ambiguous(
+                FalTemporary("fal did not answer before the deadline")) from e
+        error = FalTemporary(f"could not reach fal ({type(e).__name__})")
+        if not isinstance(e, _UNSENT_TRANSPORT_ERRORS):
+            # A connect timeout or a TLS failure happened before we sent anything. A
+            # reset, a short read, a body that was not JSON -- any of those can have
+            # happened after fal accepted the job, so they are ambiguous and must not be
+            # answered by submitting again.
+            _ambiguous(error)
+        raise error from e
 
-    if response.status_code >= 400:
-        try:
-            body = response.text
-        except Exception:
-            body = ""
-        raise _classify(response.status_code, body)
-    try:
-        return response.json()
-    except Exception as e:
-        raise FalTemporary("fal returned something that is not JSON") from e
+    if status_code >= 400:
+        # fal answered, with an error. It did not take the job, so a resubmit is safe.
+        raise _classify(status_code, body)
+    if payload is None:
+        raise _ambiguous(FalTemporary("fal returned something that is not JSON"))
+    return payload
 
 
 def _download(url, deadline):
@@ -301,8 +506,14 @@ def _download(url, deadline):
     return data
 
 
-def _submit_and_wait(prompt, image_urls, deadline):
-    """One attempt: submit, poll to completion, return the output payload."""
+def _submit(prompt, image_urls, deadline):
+    """Ask fal to generate. THIS IS THE ONLY BILLABLE CALL IN THIS MODULE.
+
+    Returns a small dict describing what fal accepted: where to poll it and where to
+    collect it, or -- when fal answered synchronously -- the finished payload itself.
+    Everything in _collect below works from that dict and cannot be billed, which is the
+    whole reason the two are separate functions rather than one.
+    """
     submitted = _request(
         "POST", f"{QUEUE_BASE}/{EDIT_MODEL}", deadline,
         json_body={
@@ -314,11 +525,27 @@ def _submit_and_wait(prompt, image_urls, deadline):
     )
     status_url = submitted.get("status_url")
     response_url = submitted.get("response_url")
-    if not status_url or not response_url:
-        # Includes the shape where fal answered synchronously; treat it as usable.
-        if submitted.get("images"):
-            return submitted
-        raise FalTemporary("fal accepted the request but gave us nothing to poll")
+    if status_url and response_url:
+        return {"status_url": status_url, "response_url": response_url, "payload": None}
+    if submitted.get("images"):
+        # fal answered synchronously. Nothing to poll, and the image is already paid for.
+        return {"status_url": None, "response_url": None, "payload": submitted}
+    # fal took our request, said 200, and gave us no way to collect what we are being
+    # charged for. PERMANENT on purpose: this is the one failure where trying again means
+    # paying a second time for a response shape we do not understand, and a second
+    # payment would not teach us anything the first one did not.
+    raise FalPermanent("fal accepted the request but gave us nothing to poll")
+
+
+def _collect(accepted, deadline):
+    """Poll an ALREADY SUBMITTED job to completion and fetch its result payload.
+
+    FREE. Every call in here is a GET against a job fal has already queued and already
+    charged for, so a failure in this phase is worth going back for rather than paying
+    for again -- see MAX_COLLECT_ATTEMPTS.
+    """
+    if accepted.get("payload") is not None:
+        return accepted["payload"]
 
     wait = POLL_FIRST_SECONDS
     while True:
@@ -327,16 +554,17 @@ def _submit_and_wait(prompt, image_urls, deadline):
         # Sleep BEFORE the first poll: a request submitted a moment ago is never done.
         time.sleep(min(wait, max(0.0, deadline - time.monotonic())))
         wait = min(wait * 1.6, POLL_MAX_SECONDS)
-        state = _request("GET", status_url, deadline)
+        state = _request("GET", accepted["status_url"], deadline)
         status = str(state.get("status") or "").upper()
         if status == "COMPLETED":
             break
         if status in ("FAILED", "ERROR", "CANCELLED", "CANCELED"):
             # fal's own terminal failure. Its error text is the only clue to whether
-            # this is a refusal or a fault, so classify on it rather than guessing.
+            # this is a refusal or a fault, so classify on it rather than guessing --
+            # _classify reads the text and quotes none of it.
             detail = str(state.get("error") or state.get("detail") or status)
-            raise _classify(422, detail)   # _classify redacts
-    return _request("GET", response_url, deadline)
+            raise _classify(422, detail)
+    return _request("GET", accepted["response_url"], deadline)
 
 
 def generate(prompt, image_urls, deadline=None):
@@ -363,37 +591,83 @@ def generate(prompt, image_urls, deadline=None):
 
     overall = (deadline if deadline is not None
                else time.monotonic() + CALL_DEADLINE_SECONDS)
+    started = time.monotonic()
+
+    # THE STATE THAT MAKES A RETRY FREE. Each of these, once set, is carried across every
+    # later attempt, so a failure is answered by going back for what we already bought
+    # rather than buying it again:
+    #   accepted  -- fal has queued (and billed) a job; where to poll and collect it.
+    #   payload   -- that job finished and this is its result.
+    #   image_url -- the address of the finished picture.
+    # The audit that produced this shape found all four realistic failures AFTER an
+    # accepted submit -- a 429 on a poll, a 502 on the result fetch once the job had
+    # COMPLETED, a failed download, a transport error mid-poll -- each making a SECOND
+    # submit. In the worst of them the picture was generated, charged for, thrown away
+    # and generated again.
+    accepted = None
+    payload = None
+    image_url = None
+
+    submits = 0
+    collects = 0
     last = None
-    for attempt in range(MAX_ATTEMPTS):
+    while True:
         if time.monotonic() >= overall:
             raise last or FalTemporary("ran out of time before generating an image")
-        started = time.monotonic()
         try:
-            payload = _submit_and_wait(prompt, image_urls, overall)
-            images = payload.get("images") or []
-            url = (images[0] or {}).get("url") if images else None
-            if not url:
-                # COMPLETED with no image is how nano-banana declines something its
-                # safety layer did not reject outright -- `description` says why. It is
-                # permanent: the same prompt gets the same answer.
-                raise FalRefused(
-                    "fal completed without producing an image"
-                    + (f": {_redact(payload.get('description'))[:200]}"
-                       if payload.get("description") else ""))
-            data = _download(url, overall)
-            logger.info("fal generated an image in %.1fs (%d KB, %s)",
-                        time.monotonic() - started, len(data) // 1024, EDIT_MODEL)
+            if accepted is None and payload is None:
+                submits += 1
+                accepted = _submit(prompt, image_urls, overall)
+            if payload is None:
+                payload = _collect(accepted, overall)
+            if image_url is None:
+                images = payload.get("images") or []
+                image_url = (images[0] or {}).get("url") if images else None
+                if not image_url:
+                    # COMPLETED with no image is how nano-banana declines something its
+                    # safety layer did not reject outright -- `description` says why. It
+                    # is permanent: the same prompt gets the same answer. The
+                    # description is fal's own prose rather than an echo of our request,
+                    # so it is worth keeping -- through _redact, and capped.
+                    raise FalRefused(
+                        "fal completed without producing an image"
+                        + (f": {_redact(payload.get('description'))[:200]}"
+                           if payload.get("description") else ""))
+            data = _download(image_url, overall)
+            logger.info("fal generated an image in %.1fs (%d KB, %s, %d submit(s))",
+                        time.monotonic() - started, len(data) // 1024, EDIT_MODEL,
+                        submits)
             return data
         except FalPermanent:
-            # Includes FalRefused. No retry: the answer will not change and the second
-            # attempt would be billed.
+            # Includes FalRefused. No retry: the answer will not change and a second
+            # attempt would be billed for the same answer.
             raise
         except FalTemporary as e:
             last = e
-            if attempt + 1 < MAX_ATTEMPTS and time.monotonic() + RETRY_BACKOFF_SECONDS < overall:
-                logger.warning("fal generation attempt %d failed (%s); retrying once",
-                               attempt + 1, e)
-                time.sleep(RETRY_BACKOFF_SECONDS)
-                continue
-            raise
-    raise last or FalTemporary("fal generation failed")
+            if accepted is None and payload is None:
+                # NOTHING PAID FOR YET. A rate limit here means fal has no room for us;
+                # hand it back so the whole job can wait for capacity (see
+                # FalRateLimited) instead of burning the agent's wait on a full queue.
+                if isinstance(e, FalRateLimited):
+                    raise
+                # Only resubmit when we can tell the first submit never arrived.
+                # Otherwise fal may be generating a picture we are already being charged
+                # for, and a second submit would charge us again for the same room.
+                if e.may_be_queued:
+                    logger.warning("fal submit failed in a way that may already have "
+                                   "queued a job (%s); not submitting again", e)
+                    raise
+                if submits >= MAX_SUBMITS:
+                    raise
+            else:
+                # ALREADY PAID FOR. Going back for it is free; giving it up is not.
+                collects += 1
+                if collects >= MAX_COLLECT_ATTEMPTS:
+                    raise
+            if time.monotonic() + RETRY_BACKOFF_SECONDS >= overall:
+                raise
+            logger.warning("fal generation failed (%s); %s", e,
+                           "collecting an image we have already paid for again"
+                           if accepted is not None or payload is not None
+                           else "submitting again")
+            time.sleep(RETRY_BACKOFF_SECONDS)

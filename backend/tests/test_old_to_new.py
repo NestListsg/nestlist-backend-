@@ -1,9 +1,18 @@
 """The paid half of "From Old to New": the fal client, the prompts, the ceiling, the cache.
 
 Nothing here touches the network or needs a key. The fal client's transport is stubbed,
-which is the only way to test the thing that actually matters about it -- that a refusal
-is never retried and never billed twice, that a deadline is honoured, and that the key
-cannot reach a log or an error message.
+which is the only way to test the things that actually matter about it: that A CONTENT
+REFUSAL is never retried and never billed twice, that ONE generate() never submits twice
+for one picture once fal has accepted a job, that a deadline is honoured, and that the
+key cannot reach a log or an error message.
+
+"Never billed twice" without the qualifier was too strong a claim and is corrected here
+deliberately. A refusal is never billed twice because it is never retried. A listing can
+still be billed twice over a longer arc -- a queued job that crashes and retries pays
+again if docs/old-to-new-images-migration.sql has not been run, because without the cache
+column there is nothing to remember the pictures by. The narrow claim is the one this
+file proves; see test_double_submit below for the part that was NOT true before
+2026-10-22.
 
 Run: python3 tests/test_old_to_new.py
 """
@@ -50,7 +59,11 @@ class FakeRequests:
         if isinstance(item, Exception):
             raise item
         return item
-    def request(self, method, url, headers=None, json=None, timeout=None):
+    # stream=True is not optional in the real client any more: it is how the body read
+    # gets inside slow_read's watchdog, which is what stops a dribbling fal endpoint
+    # leaking a thread and a socket per call. A fake that did not accept it would be
+    # asserting against a signature the code no longer uses.
+    def request(self, method, url, headers=None, json=None, timeout=None, stream=None):
         return self._next(method, url, headers)
     def get(self, url, timeout=None, stream=None):
         return self._next("GET", url, {})
@@ -145,6 +158,60 @@ check("(and the failures really did happen)", len(cap.lines) >= 1)
 
 
 # ===========================================================================
+print("\n[1b] The redaction survives the key being TRANSFORMED on the way back")
+# ===========================================================================
+# WHY THIS SECTION EXISTS, and it is the most useful thing in this file. The test above
+# echoes the key back BYTE FOR BYTE, and _redact used to work by replacing exactly that.
+# So it read green against a redactor that any transformation defeats, and an audit on
+# 2026-10-22 proved the point with four transformations that all reached Railway's logs:
+# url-encoded, either half alone, and the case changed.
+#
+# A realistically shaped fal key: a uuid, a colon, and a hex secret. The halves are
+# tested separately because half a credential is still a credential.
+REAL_SHAPE = "3f9a1c22-7b0e-4d55-9a11-aa0bb1cc2d33:9e4f7c1b5a28d60e3b7f91c4a85d2e60"
+os.environ[fal_images.KEY_ENV] = REAL_SHAPE
+ID_HALF, SECRET_HALF = REAL_SHAPE.split(":")
+
+TRANSFORMS = {
+    "exact header echo": '{"detail":"bad request","request":{"headers":'
+                         '{"authorization":"Key %s"}}}' % REAL_SHAPE,
+    "the key on its own": '{"detail":"invalid value %s"}' % REAL_SHAPE,
+    "UPPERCASED": '{"detail":"Key %s"}' % REAL_SHAPE.upper(),
+    "the secret half only": '{"detail":"token %s not recognised"}' % SECRET_HALF,
+    "the key id half only": '{"detail":"key %s is disabled"}' % ID_HALF,
+    "truncated to 24 characters": '{"detail":"key %s... rejected"}' % REAL_SHAPE[:24],
+    "url-encoded": '{"detail":"Key%%20%s"}' % REAL_SHAPE.replace(":", "%3A"),
+    "split by whitespace": '{"detail":"Key\\n%s"}' % REAL_SHAPE,
+}
+pieces = {"the whole key": REAL_SHAPE, "its secret half": SECRET_HALF,
+          "its id half": ID_HALF, "its first 24 characters": REAL_SHAPE[:24],
+          "the whole key uppercased": REAL_SHAPE.upper(),
+          "its secret half uppercased": SECRET_HALF.upper()}
+for label, body in TRANSFORMS.items():
+    cleaned = fal_images._redact(body)
+    still_there = [name for name, piece in pieces.items() if piece in cleaned]
+    check("_redact beats it: %s" % label, not still_there, str(still_there))
+
+# And the stronger guarantee on top of the redactor: _classify does not quote the body
+# AT ALL, so there is nothing for a transformation to hide inside.
+for label, body in TRANSFORMS.items():
+    said = [str(fal_images._classify(code, body)) for code in (400, 422, 500, 418, 401)]
+    still_there = [name for name, piece in pieces.items()
+                   if any(piece in text for text in said)]
+    check("and _classify quotes none of it: %s" % label, not still_there,
+          str(still_there))
+check("a 4xx error says what to do without repeating fal's reply",
+      "not quoted" in str(fal_images._classify(400, TRANSFORMS["url-encoded"])))
+check("a refusal still reads as a refusal, using OUR word and not fal's text",
+      isinstance(fal_images._classify(422, "blocked by the safety filter"),
+                 fal_images.FalRefused)
+      and "safety" in str(fal_images._classify(422, "blocked by the safety filter")))
+check("the fal-completed-without-an-image explanation is still redacted on the way out",
+      REAL_SHAPE not in fal_images._redact("I cannot do that with Key " + REAL_SHAPE))
+os.environ[fal_images.KEY_ENV] = SECRET
+
+
+# ===========================================================================
 print("\n[2] Permanent and retryable are not treated alike")
 # ===========================================================================
 for status, kind in ((429, fal_images.FalTemporary), (500, fal_images.FalTemporary),
@@ -168,11 +235,22 @@ check("every fal call carries the auth header",
           for c in fake.calls if c[1].startswith("https://fal/s")
           or c[1].endswith("/edit")))
 
+# A 429 BEFORE anything has been submitted is handed back, NOT retried here. fal starts
+# a new account at two concurrent requests, so this is an everyday answer; retrying it
+# inside the call spends the agent's wait on a queue that is full, and when the retries
+# run out the room silently loses its transformation. FalRateLimited exists so the job
+# can go back in OUR queue instead -- see main._dramatic_job_run.
 fake = install([FakeResponse(status=429, body="slow down"),
                 SUBMITTED, COMPLETED, RESULT, IMAGE])
-data = fal_images.generate("a calm room", ["https://x/a.jpg"])
-check("a 429 is retried once and then succeeds", data == b"JPEGBYTES")
-check("the retry really was a second submit", len(fake.calls) == 5)
+try:
+    fal_images.generate("a calm room", ["https://x/a.jpg"])
+    check("a 429 before any submit is handed back, not retried", False)
+except fal_images.FalRateLimited:
+    check("a 429 before any submit is handed back, not retried", True)
+check("and it is a kind of FalTemporary, so old callers still degrade",
+      isinstance(fal_images._classify(429, ""), fal_images.FalTemporary))
+check("it cost exactly one call -- no second submit into a full queue",
+      len(fake.calls) == 1, str(len(fake.calls)))
 
 fake = install([FakeResponse(status=422, body="blocked by the safety filter")])
 try:
@@ -189,8 +267,10 @@ try:
     check("attempts are BOUNDED, not endless", False)
 except fal_images.FalTemporary:
     check("attempts are BOUNDED, not endless", True)
-check("exactly MAX_ATTEMPTS of them", len(fake.calls) == fal_images.MAX_ATTEMPTS,
+check("exactly MAX_SUBMITS of them", len(fake.calls) == fal_images.MAX_SUBMITS,
       str(len(fake.calls)))
+check("and a 5xx answer is one fal did NOT take a job for, so resubmitting was safe",
+      fal_images._classify(500, "").may_be_queued is False)
 
 fake = install([SUBMITTED, COMPLETED,
                 FakeResponse(payload={"images": [], "description": "I can't make that"})])
@@ -199,6 +279,67 @@ try:
     check("COMPLETED with no image is a refusal, not a retry", False)
 except fal_images.FalRefused as e:
     check("COMPLETED with no image is a refusal, not a retry", "can't make that" in str(e))
+
+
+# ===========================================================================
+print("\n[2b] ONE generate() never submits twice for one picture")
+# ===========================================================================
+# THE BILL IS PER SUBMIT. fal charges for a job that reached its queue whether or not we
+# ever collect the picture, so the number that matters in each of these is how many
+# POSTs to /edit one generate() made. An audit on 2026-10-22 ran exactly these four
+# shapes against the shipped code and got TWO submits from every one of them -- worst of
+# all the second row, where the image was generated, charged for, thrown away and
+# generated again.
+#
+# The fix is that everything after an accepted submit is a resume: poll the same
+# status_url, fetch the same response_url, re-download the same file.
+def submits(fake):
+    return sum(1 for m, u, _h in fake.calls if m == "POST" and u.endswith("/edit"))
+
+
+DOUBLE_BILL_SHAPES = {
+    "429 on the status poll, after fal has queued the job":
+        [SUBMITTED, FakeResponse(status=429, body="slow down"),
+         COMPLETED, RESULT, IMAGE],
+    "502 on the result fetch, after the job COMPLETED (and billed)":
+        [SUBMITTED, COMPLETED, FakeResponse(status=502, body="bad gateway"),
+         COMPLETED, RESULT, IMAGE],
+    "the download of the finished image fails":
+        [SUBMITTED, COMPLETED, RESULT, FakeResponse(status=503, body=""), IMAGE],
+    "a transport error mid-poll":
+        [SUBMITTED, RuntimeError("connection reset"), COMPLETED, RESULT, IMAGE],
+}
+for label, script in DOUBLE_BILL_SHAPES.items():
+    fake = install(script)
+    try:
+        data = fal_images.generate("a calm room", ["https://x/a.jpg"])
+        got = data == b"JPEGBYTES"
+    except Exception as e:
+        got = "raised %s" % type(e).__name__
+    check("billed ONCE: %s" % label, submits(fake) == 1 and got is True,
+          "submits=%d, result=%r" % (submits(fake), got))
+
+# And the budget for free retries is bounded: a result we can never collect must not
+# poll until the deadline.
+fake = install([SUBMITTED] + [FakeResponse(status=502, body="")] * 20)
+try:
+    fal_images.generate("a calm room", ["https://x/a.jpg"])
+    check("collecting is bounded too, not endless", False)
+except fal_images.FalTemporary:
+    check("collecting is bounded too, not endless", True)
+check("and it never submitted again while doing it", submits(fake) == 1,
+      str(submits(fake)))
+
+# The ambiguous case: fal answered 200 to our submit with something unreadable, so a job
+# may be queued that we cannot collect. Submitting again would pay twice for one room.
+fake = install([FakeResponse(payload={"unexpected": "shape"}),
+                SUBMITTED, COMPLETED, RESULT, IMAGE])
+try:
+    fal_images.generate("a calm room", ["https://x/a.jpg"])
+    check("an un-collectable submit is NOT paid for twice", False)
+except fal_images.FalError:
+    check("an un-collectable submit is NOT paid for twice", submits(fake) == 1,
+          str(submits(fake)))
 
 
 # ===========================================================================
@@ -305,11 +446,29 @@ check("a full listing is the exterior pair plus the rooms",
       old_to_new.IMAGES_PER_LISTING == 2 + old_to_new.MAX_ROOMS == 6)
 cost = old_to_new.IMAGES_PER_LISTING * fal_images.COST_PER_IMAGE_USD
 check("which costs about 24 US cents (%.2f)" % cost, abs(cost - 0.24) < 0.001)
-check("the per-agent ceiling is derived from the listing ceiling, so they cannot drift",
-      old_to_new.MAX_IMAGES_PER_AGENT_PER_MONTH
-      == old_to_new.MAX_LISTINGS_PER_AGENT_PER_MONTH * old_to_new.IMAGES_PER_LISTING)
+# THE CEILING IS IN IMAGES, and the listing figure is derived FROM it rather than the
+# other way round. That inversion is the fix: a listing is not a unit of money (re-picking
+# a hero photo costs three more images on the same listing), so a ceiling counted in
+# listings was about 4x looser than the number it quoted, before the weekly reset.
+check("the ceiling is expressed in IMAGES, the thing fal bills for",
+      old_to_new.MAX_IMAGES_PER_AGENT_PER_MONTH == 240)
+check("and the listings figure is DERIVED from it, for talking to agents only",
+      old_to_new.TYPICAL_LISTINGS_PER_AGENT_PER_MONTH
+      == old_to_new.MAX_IMAGES_PER_AGENT_PER_MONTH // old_to_new.IMAGES_PER_LISTING
+      == 40)
 monthly = old_to_new.MAX_IMAGES_PER_AGENT_PER_MONTH * fal_images.COST_PER_IMAGE_USD
-check("about US$9.60 an agent a month (%.2f)" % monthly, abs(monthly - 9.6) < 0.01)
+check("about US$9.60 an agent a month (%.2f), unchanged -- now actually enforced"
+      % monthly, abs(monthly - 9.6) < 0.01)
+check("and about US$480 a month across fifty agents, which is the number Jane agreed to",
+      abs(monthly * 50 - 480) < 0.5)
+# The measured abuse case the old ceiling let through, as arithmetic rather than prose:
+# one ten-photo listing with the hero re-picked ten times cost 25 images.
+check("25 images on ONE listing is US$1.00 -- more than four listings' worth of "
+      "allowance, and the old ceiling counted it as one listing",
+      abs(25 * fal_images.COST_PER_IMAGE_USD - 1.00) < 0.001)
+check("counted in images, those 25 come off the allowance as 25",
+      old_to_new.reserve_budget(6, 25)
+      == min(6, old_to_new.MAX_IMAGES_PER_AGENT_PER_MONTH - 25) == 6)
 check("plenty of room left -> the whole plan", old_to_new.reserve_budget(6, 0) == 6)
 check("three images of allowance left -> a trimmed plan, not an error",
       old_to_new.reserve_budget(6, old_to_new.MAX_IMAGES_PER_AGENT_PER_MONTH - 3) == 3)

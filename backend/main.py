@@ -383,11 +383,44 @@ async def startup_event():
                                  _dramatic_job_run, _dramatic_job_failed)
     logger.info("From Old to New (Dramatic) image generation: %s",
                 "ENABLED" if fal_images.is_enabled() else "off (FAL_KEY is not set)")
+    # The per-agent monthly image ceiling lives in two columns on the agents row. If
+    # they are missing while the key IS set, we are generating paid images with no
+    # ceiling at all -- which is precisely the condition Jane must hear about rather
+    # than read in a log, because the only thing left standing between a bug and her
+    # card is fal's own spend limit.
+    asyncio.create_task(_check_old_to_new_ceiling())
     # Backgrounded for the same reason as the probes above: a slow database must not
     # hold up the port binding.
     asyncio.create_task(_start_video_queue())
     await send_telegram_alert("✅ <b>NestList Backend Started</b>\n\nAPI monitoring active. You will be alerted if the Anthropic key expires.")
     await register_telegram_webhook()
+
+
+async def _check_old_to_new_ceiling():
+    """Probe the monthly-tally columns and tell Jane if the ceiling is not enforced.
+
+    Backgrounded, like the other probes, so a slow database cannot hold up the port
+    binding. Silent when there is no FAL_KEY: with the key absent nothing can be
+    generated, so a missing column costs nothing and is not worth a message.
+    """
+    try:
+        present = await asyncio.to_thread(_probe_old_to_new_usage_columns)
+    except Exception as e:
+        logger.warning("could not probe the old-to-new tally columns (%s)", e)
+        return
+    if present or not fal_images.is_enabled():
+        return
+    await send_telegram_alert_throttled(
+        "old_to_new_ceiling_missing",
+        "⚠️ <b>NestList Warning</b>\n\nOld-to-New (Dramatic) videos are switched ON, "
+        "but the monthly picture allowance is <b>not being counted</b>: the "
+        "<code>agents.old_to_new_month</code> / "
+        "<code>agents.old_to_new_images_used</code> columns are missing.\n\nVideos still "
+        "work. What is missing is the per-agent spending limit, so nothing but fal's own "
+        "billing cap stops an unexpected bill.\n\nFix: run "
+        "<code>docs/old-to-new-images-migration.sql</code> in the Supabase SQL editor.",
+        cooldown_seconds=86400,
+    )
 
 
 async def _start_video_queue():
@@ -5275,11 +5308,17 @@ def _job_type_for_template(template_id):
 #
 # So the endpoint looks for an active job of ANY type before enqueuing and, finding one,
 # reports its position instead -- the same "a second press is not an error" behaviour the
-# Classic already had, widened across types. The honest limit: this is an
-# application-level check, so two presses of DIFFERENT types interleaving inside the same
-# few milliseconds could still both insert. Narrowing that to zero means widening the
-# index to (listing_id) alone, which is a migration; it is noted as a follow-up rather
-# than done here.
+# Classic already had, widened across types.
+#
+# THE REMAINING WINDOW IS NOW CLOSED BY A MIGRATION, which an audit was right to insist
+# on. The check above is application-level, so two presses of DIFFERENT types can still
+# both insert if they interleave between the look and the write -- and that window is not
+# sub-millisecond, it is the two Supabase round trips in between, measured at 50-150ms.
+# Pressing Classic and then switching to Dramatic is an ordinary thing for an agent to
+# do, and if it fires, both jobs write videos/{listing_id}.mp4 and the listing row can
+# end up naming the other style. docs/video-jobs-dramatic-migration.sql widens the
+# partial unique index to (listing_id) alone so the database refuses the second row
+# whatever the app does. Until Jane runs it, this check is all there is.
 VIDEO_JOB_TYPES = (video_jobs.JOB_TYPE_CLASSIC, video_jobs.JOB_TYPE_DRAMATIC)
 
 
@@ -5343,6 +5382,29 @@ def _resolve_video_template_id(requested_id):
 
 @app.get("/api/video-templates")
 def get_video_templates(agent=Depends(get_current_agent)):
+    """The styles an agent can actually choose RIGHT NOW on this deploy.
+
+    THE DRAMATIC IS OMITTED WHEN THERE IS NO FAL_KEY, and that is the whole point of
+    this function existing rather than returning the list. The feature needs a key that
+    only Jane can paste into Railway, and until she does, generate-video answers a
+    Dramatic request with a 400 ("not switched on for this account yet") -- correctly,
+    but only after the agent has picked it and pressed the button. Listing it
+    unconditionally meant that on the day this deployed, every agent would have been
+    offered a style that cannot work and told so only on the press.
+
+    Omitting it needs no frontend change, but NOT for the reason it is tempting to write
+    down. MyListings.js renders one button per entry in this list and has no "coming
+    soon" state at all (checked, 2026-10-22, around its videoTemplates.map) -- so an
+    omitted style is simply not drawn. That is the outcome we want and it is better than
+    a disabled button, but it means this list IS the picker: anything taken out of it
+    disappears, and anything added to it appears on the next page load.
+
+    An agent on a stale browser tab who presses Dramatic anyway still gets the 400 with
+    the plain-language message, which was already right.
+    """
+    if not fal_images.is_enabled():
+        return [t for t in VIDEO_TEMPLATES
+                if t["id"] != DRAMATIC_VIDEO_TEMPLATE_ID]
     return VIDEO_TEMPLATES
 
 
@@ -5797,50 +5859,215 @@ def _store_generated_image(listing_id: str, role: str, key: str, data: bytes) ->
             delay *= 2
 
 
+# The agent's month-to-date generated-image tally.
+#
+# TWO COLUMNS ON THE AGENT ROW, and WHY NOT THE OBVIOUS THING. The first version of this
+# counted rows in video_jobs: distinct listings with a Dramatic job since the 1st, times
+# six. It looked durable and fleet-wide, and it was neither accurate nor durable:
+#
+#   * video_jobs.prune_finished() DELETES finished rows older than PRUNE_AFTER_DAYS = 7.
+#     From the 8th of the month the count could only see a week, so the ceiling reset
+#     itself roughly weekly -- about four times the allowance Jane had agreed to. An
+#     audit on 2026-10-22 pruned a seeded table and watched a used-up ceiling come back.
+#   * it counted LISTINGS. The bill is per image per press, and re-picking a hero photo
+#     costs three more images on the same listing, so a listing is not a unit of money.
+#   * the in-process fallback renderer (_render_dramatic_job, used whenever video_jobs is
+#     unavailable) writes NO job row, so during that window there was nothing to count
+#     and the ceiling was not approximate, it was absent. That window is not theoretical:
+#     the live video_jobs check constraint allows only 'classic' and 'signature', so
+#     every Dramatic enqueue fails over to that path until the new migration is run.
+#
+# A total on the agent row answers all three. Nothing prunes it, it is in images, and
+# every path that pays for an image adds to it whether or not a job row exists.
+#
+# `old_to_new_month` is the calendar month the tally belongs to ("2026-10"), so the reset
+# is a comparison rather than a cron job: a tally from last month reads as zero and is
+# overwritten by the first write of this one.
+OLD_TO_NEW_MONTH_COLUMN = "old_to_new_month"
+OLD_TO_NEW_IMAGES_COLUMN = "old_to_new_images_used"
+# Set by the startup probe. None means "not probed yet".
+_old_to_new_usage_columns_supported = None
+# Compare-and-swap, the same shape as the photo-array one above and for the same reason:
+# two Dramatic renders may run at once (JOB_TYPES caps the type at two fleet-wide), and a
+# plain read-modify-write would let one of them lose its images from the tally.
+_OLD_TO_NEW_CAS_ATTEMPTS = 4
+
+
+def _current_usage_month() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _read_old_to_new_usage(agent_id: str):
+    """The tally as the agent row actually stores it, or None if the row is not there.
+
+    Returns (month, images) where either may be None. NULL IS KEPT DISTINCT FROM ZERO on
+    purpose: a never-counted agent has NULL in both columns, and a compare-and-swap that
+    pinned `images = 0` against a NULL column would never match and would quietly lose
+    every first write. The same trap the photo-array compare-and-swap documents above.
+    """
+    res = db_execute(
+        lambda db: db.table("agents")
+        .select(f"{OLD_TO_NEW_MONTH_COLUMN},{OLD_TO_NEW_IMAGES_COLUMN}")
+        .eq("id", str(agent_id)),
+        what="old_to_new usage read")
+    if not res.data:
+        return None
+    row = res.data[0]
+    month = row.get(OLD_TO_NEW_MONTH_COLUMN)
+    raw = row.get(OLD_TO_NEW_IMAGES_COLUMN)
+    images = None
+    if raw is not None:
+        try:
+            images = max(0, int(raw))
+        except (TypeError, ValueError):
+            images = None
+    return (str(month) if month else None), images
+
+
 def _old_to_new_images_used(agent_id: str, listing_id: str) -> int:
-    """An upper bound on the images this agent has generated this calendar month.
+    """How many images this agent has been billed for this calendar month.
 
-    Counted as DISTINCT listings with a Dramatic job this month, times the most images
-    one listing can cost. Distinct listings rather than jobs, because a listing is only
-    ever paid for once however many times it is regenerated -- that is what the cache is
-    for -- and the CURRENT listing is excluded, because a regenerate must never be
-    refused by its own earlier render.
+    `listing_id` is accepted and deliberately unused: the current listing used to be
+    excluded so that a regenerate could not be refused by its own earlier render. It no
+    longer needs to be, and excluding it would now mean forgetting real spending. A full
+    cache hit generates nothing, so it never asks for budget at all (old_to_new.build_plan
+    only calls reserve_budget when something is missing) -- which protects a regenerate
+    more precisely than an exclusion did, and without pretending money was not spent.
 
-    Durable and fleet-wide, which a process-local counter could not be: Railway runs
-    four workers and four separate counters would be four separate ceilings.
-
-    On any failure this returns 0 -- "no allowance used". Deliberate: the authoritative
-    hard cap is fal's own billing spend limit, and a database blip must not stop an agent
-    making a video they are entitled to. See the report accompanying this change.
+    On any failure this returns 0 -- "no allowance used". Deliberate, and unchanged: the
+    authoritative hard cap is fal's own billing spend limit, and a database blip must not
+    stop an agent making a video they are entitled to. The failure is loud (see the
+    startup probe, which tells Jane on Telegram if the columns are missing while the key
+    is live) rather than silent.
     """
     try:
-        start = datetime.now(timezone.utc).replace(
-            day=1, hour=0, minute=0, second=0, microsecond=0)
-        res = db_execute(
-            lambda db: db.table(video_jobs.TABLE).select("listing_id")
-            .eq("agent_id", str(agent_id))
-            .eq("job_type", video_jobs.JOB_TYPE_DRAMATIC)
-            .gte("created_at", start.isoformat()),
-            what="old_to_new monthly usage count")
-        listings = {str(r.get("listing_id")) for r in (res.data or [])}
-        listings.discard(str(listing_id))
-        return len(listings) * old_to_new.IMAGES_PER_LISTING
+        usage = _read_old_to_new_usage(agent_id)
     except Exception as e:
-        logger.warning("old-to-new: could not count this month's usage (%s); allowing "
-                       "the render", e)
+        logger.warning("old-to-new: could not read this month's image tally (%s); "
+                       "allowing the render", e)
         return 0
+    if not usage:
+        return 0
+    month, images = usage
+    if month != _current_usage_month():
+        # Last month's tally, or none at all. Either way nothing has been spent this
+        # month; the next write replaces both columns.
+        return 0
+    return images or 0
+
+
+def _add_old_to_new_images(agent_id: str, images: int) -> bool:
+    """Add `images` to this agent's month-to-date tally. Returns whether it landed.
+
+    Called after the generation pass, with the number of images that were actually paid
+    for -- including any we paid for and then failed to store, because fal charged for
+    those too.
+
+    NEVER RAISES. A tally we cannot write is a ceiling that drifts low, which is a
+    problem for Jane's bill; an exception here would be a problem for the agent's video,
+    and the video is the thing they are paying us for. It is logged at warning, and the
+    startup probe is what makes a missing column visible before any of this runs.
+    """
+    images = max(0, int(images or 0))
+    if not images:
+        return True
+    month = _current_usage_month()
+    for attempt in range(_OLD_TO_NEW_CAS_ATTEMPTS):
+        try:
+            usage = _read_old_to_new_usage(agent_id)
+            if usage is None:
+                logger.warning("old-to-new: no agent row to record %d image(s) against",
+                               images)
+                return False
+            stored_month, stored_images = usage
+            previous = (stored_images or 0) if stored_month == month else 0
+            update = db_execute(
+                lambda db: _old_to_new_cas(db, agent_id, stored_month, stored_images,
+                                           month, previous + images),
+                what="old_to_new usage increment")
+        except Exception as e:
+            logger.warning("old-to-new: could not record %d image(s) against this "
+                           "agent's monthly tally (%s: %s)", images, type(e).__name__, e)
+            return False
+        if bool(getattr(update, "data", None)):
+            return True
+        # Zero rows changed means somebody else wrote the tally between our read and our
+        # write -- the other concurrent render. Re-read and add to theirs.
+        time.sleep(0.05 * (attempt + 1))
+    logger.warning("old-to-new: gave up recording %d image(s) after %d attempts; this "
+                   "month's tally is low by that much", images, _OLD_TO_NEW_CAS_ATTEMPTS)
+    return False
+
+
+def _old_to_new_cas(db, agent_id, stored_month, stored_images, month, total):
+    """One compare-and-swap on the tally.
+
+    Both stored values are pinned in the WHERE clause, so the write only lands if the row
+    still says what we read a moment ago. That is what makes two concurrent Dramatic
+    renders able to add to the same tally without one of them losing its images, and it
+    needs no Postgres function Jane would have to install. Zero rows back means we lost
+    the race, and the caller re-reads and adds to the other one's total.
+    """
+    q = (db.table("agents")
+         .update({OLD_TO_NEW_MONTH_COLUMN: month, OLD_TO_NEW_IMAGES_COLUMN: total})
+         .eq("id", str(agent_id)))
+    q = (q.eq(OLD_TO_NEW_IMAGES_COLUMN, stored_images) if stored_images is not None
+         else q.filter(OLD_TO_NEW_IMAGES_COLUMN, "is", "null"))
+    return (q.eq(OLD_TO_NEW_MONTH_COLUMN, stored_month) if stored_month
+            else q.filter(OLD_TO_NEW_MONTH_COLUMN, "is", "null"))
+
+
+def _probe_old_to_new_usage_columns():
+    """Are the agent-row tally columns there? Sets the module flag; never raises."""
+    global _old_to_new_usage_columns_supported
+    try:
+        get_db().table("agents").select(
+            f"{OLD_TO_NEW_MONTH_COLUMN},{OLD_TO_NEW_IMAGES_COLUMN}").limit(1).execute()
+        _old_to_new_usage_columns_supported = True
+        logger.info("old-to-new monthly image tally columns present -- the per-agent "
+                    "ceiling is enforced")
+    except Exception:
+        _old_to_new_usage_columns_supported = False
+        logger.warning("old-to-new monthly image tally columns are MISSING -- generated "
+                       "images are not counted and the per-agent monthly ceiling is "
+                       "NOT enforced. Run docs/old-to-new-images-migration.sql.")
+    return _old_to_new_usage_columns_supported
+
+
+def _job_age_seconds(job: dict):
+    """How long ago this job row was created, or None if the timestamp is unreadable.
+
+    None means "do not use age to decide anything" -- every caller treats it as the
+    patient answer, so a row with a timestamp we cannot parse is never punished for it.
+    """
+    raw = (job or {}).get("created_at")
+    if not raw:
+        return None
+    try:
+        created = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - created).total_seconds())
+    except Exception:
+        return None
 
 
 def _render_dramatic_core(listing_id: str, agent: dict, listing: dict,
                           photo_index: int, music_track: str = None,
                           video_photos: list = None, ownership_check=None,
-                          record_degradations=None):
+                          record_degradations=None, defer_on_rate_limit: bool = True):
     """Plan, generate, render, store, and write the finished URL onto the listing.
 
     Shaped like _render_video_core and for the same reasons -- the listing is re-read at
     job start so a photo deleted while the job waited is not used, and ownership is
     confirmed immediately before the two writes the agent can actually see. Returns
     (video_url, degradations); raises on failure.
+
+    `defer_on_rate_limit` -- when fal says the account is at its concurrency limit,
+    raise old_to_new.RateLimited instead of rendering a film with a room left untouched.
+    True from the queue, where the caller can put the job back and try again in a few
+    seconds. False from the in-process fallback, which has no queue to wait in, and on
+    the last try from the queue, where a slightly plainer video beats no video.
     """
     try:
         fresh = db_execute(
@@ -5870,6 +6097,15 @@ def _render_dramatic_core(listing_id: str, agent: dict, listing: dict,
             listing_id, role, key, data),
         images_used_this_month=_old_to_new_images_used(agent["id"], listing_id),
     )
+    # COUNT WHAT WE PAID FOR, BEFORE ANYTHING ELSE CAN FAIL. This is the per-agent
+    # monthly ceiling's only source of truth, it is in images because images are what
+    # fal bills, and it is written from here rather than from the queue runner so that
+    # the in-process fallback path -- which writes no job row at all -- is counted
+    # exactly the same way. An image we generated and then failed to store is still
+    # counted: fal charged for it.
+    if plan.images_paid:
+        _add_old_to_new_images(agent["id"], plan.images_paid)
+
     # STORE THE CACHE BEFORE RENDERING, not after. The images are already paid for; if
     # the render then fails and the job retries, the retry must not pay again. Written
     # only when the column exists (the fresh row has the key), so there is no failing
@@ -5885,6 +6121,17 @@ def _render_dramatic_core(listing_id: str, agent: dict, listing: dict,
         except Exception as e:
             logger.warning("dramatic %s: generated images but could not record them "
                            "(%s) -- a regenerate will pay again", listing_id, e)
+
+    # ONLY NOW, with the money spent recorded and the pictures saved, is it safe to stop.
+    # A 429 from fal used to cost a room its transformation: it was retried once inside
+    # the fal client and then the room played as it is today, which is a visibly worse
+    # film for a reason that clears itself in seconds. fal starts a new account at TWO
+    # concurrent requests, and the Dramatic queue allows two renders at once, so this is
+    # an ordinary Tuesday rather than an edge case.
+    if plan.rate_limited and defer_on_rate_limit:
+        raise old_to_new.RateLimited(
+            "fal is at this account's concurrency limit; waiting rather than rendering "
+            "a room without its transformation")
 
     # The same end-slate contact line the Classic uses (the condo family adds its CEA
     # lines here). The Dramatic draws no price or stats of its own, so those go in empty.
@@ -5991,7 +6238,14 @@ def _dramatic_job_run(job: dict):
         logger.warning("dramatic job %s: could not mirror 'rendering' onto the listing "
                        "(%s)", job["id"], e)
 
-    try:
+    # How long a render may keep going back in the queue because fal has no room for it,
+    # before we give the agent the film we can make instead. Deferring costs nothing but
+    # a wait, so this is generous; it is bounded because fal could be busy all day (and
+    # Jane's own experiments share the key), and a video with one plain room beats an
+    # agent watching a spinner until the queue's 30-minute escape hatch fires.
+    rate_limit_patience = 600
+
+    def _run(defer_on_rate_limit):
         return _render_dramatic_core(
             listing_id, agent, listing,
             int(payload.get("photo_index") or 0),
@@ -5999,7 +6253,23 @@ def _dramatic_job_run(job: dict):
             record_degradations=lambda degs: video_jobs.record_degradations(job, degs),
             music_track=payload.get("music_track"),
             video_photos=payload.get("video_photos"),
+            defer_on_rate_limit=defer_on_rate_limit,
         )
+
+    try:
+        try:
+            return _run(True)
+        except old_to_new.RateLimited as e:
+            # Age measured from when the AGENT pressed Generate, not from this attempt,
+            # so the patience is the agent's wait and not a multiple of it. A deferral
+            # rewinds the attempt counter, so none of this can push the job into
+            # 'failed'.
+            waited = _job_age_seconds(job)
+            if waited is None or waited < rate_limit_patience:
+                raise video_jobs.DeferJob(str(e))
+            logger.warning("dramatic job %s: fal has been at its limit for %.0fs; "
+                           "rendering with whatever transformed", job["id"], waited)
+            return _run(False)
     except old_to_new.BudgetExhausted as e:
         # Not a fault, and not retryable: the allowance resets next month. Its message is
         # already written for the agent.
@@ -6024,8 +6294,11 @@ def _render_dramatic_job(listing_id: str, agent: dict, listing: dict,
             raise RuntimeError(
                 "The Dramatic video style is not switched on for this account yet. The "
                 "Classic video is available in the meantime.")
+        # defer_on_rate_limit=False: there is no queue to go back into on this path, so
+        # a rate limit degrades the film rather than failing it.
         _render_dramatic_core(listing_id, agent, listing, photo_index,
-                              music_track=music_track, video_photos=video_photos)
+                              music_track=music_track, video_photos=video_photos,
+                              defer_on_rate_limit=False)
     except Exception as e:
         try:
             db_execute(
@@ -6079,6 +6352,19 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
         chosen_video_template_id = (
             _resolve_video_template_id(stored_video_template_id) if stored_video_template_id else None
         ) or DEFAULT_VIDEO_TEMPLATE_ID
+        # A STORED style this deploy cannot render falls back to the Classic rather than
+        # refusing. Reached when a listing was rendered as Dramatic and the key has since
+        # gone (credits spent, key rotated): without this the agent presses Generate on
+        # their own listing and is told no, having asked for nothing in particular. An
+        # EXPLICIT request for Dramatic still gets the honest 400 below -- being told
+        # "not switched on" is right when you chose it and wrong when you did not.
+        # persist_video_template_id below then heals the row, so this fires once.
+        if chosen_video_template_id == DRAMATIC_VIDEO_TEMPLATE_ID \
+                and not fal_images.is_enabled():
+            logger.info("generate_video: listing %s remembers the Dramatic style but "
+                        "this deploy has no FAL_KEY; rendering the Classic instead",
+                        listing_id)
+            chosen_video_template_id = DEFAULT_VIDEO_TEMPLATE_ID
 
     # Write the template back when the agent picked one (existing behaviour), and also
     # whenever the row's stored id isn't what we actually rendered -- that heals a
@@ -6149,6 +6435,15 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
             logger.info("generate_video: listing %s already had a %s job in flight; "
                         "the %s request was not queued", listing_id,
                         existing.get("job_type"), chosen_video_template_id)
+            # `status` is the UNCHANGED wire value the existing app polls on, exactly as
+            # in the enqueue path below -- it means "on its way", not "ffmpeg is
+            # running". Whether the job is actually queued or actually rendering is
+            # job_status, which comes from describe(). When describe() fails we fill it
+            # in from the row we already have rather than leaving the caller with
+            # nothing: "rendering" on its own, in front of a job that is 4th in a queue,
+            # is the one reading of this response that is simply untrue.
+            progress.setdefault("job_status",
+                                existing.get("status") or video_jobs.STATUS_QUEUED)
             return dict({
                 "status": "rendering",
                 "music_track": (existing.get("payload") or {}).get("music_track") or "auto",
@@ -6197,8 +6492,11 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                 "⚠️ <b>NestList Warning</b>\n\nA video request could not be added to "
                 "the render queue, so it rendered the old way instead "
                 f"(<code>{type(e).__name__}</code>).\n\nVideos are still being made, "
-                "but renders in progress will not survive a redeploy. Check the "
-                "<code>video_jobs</code> table and that SUPABASE_KEY is the service key.",
+                "but renders in progress will not survive a redeploy.\n\nMost likely "
+                "cause for a <b>Dramatic</b> video: the queue table does not allow that "
+                "style yet. Run <code>docs/video-jobs-dramatic-migration.sql</code>. "
+                "Otherwise check the <code>video_jobs</code> table and that "
+                "SUPABASE_KEY is the service key.",
                 cooldown_seconds=3600,
             )
         else:
@@ -6237,6 +6535,11 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                 logger.warning("generate_video: could not describe job %s (%s)",
                                job.get("id"), e)
                 progress = {}
+            # Same reasoning as the cross-type early return above: `status` is the old
+            # wire value and job_status is the truth about queued-versus-rendering, so
+            # job_status must survive a failed describe().
+            progress.setdefault("job_status",
+                                job.get("status") or video_jobs.STATUS_QUEUED)
 
             # THE TEMPLATE WE REPORT IS THE ONE THAT WILL ACTUALLY BE RENDERED.
             #

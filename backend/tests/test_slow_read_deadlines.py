@@ -216,5 +216,48 @@ try:
 finally:
     vr._anthropic_keys = saved
 
+print("\n[fal client] a dribbling fal leaves no thread and no socket behind")
+# THE MEASUREMENT THIS GUARDS, taken by an audit on 2026-10-22 against the shipped code:
+# five calls to a one-byte-every-three-seconds endpoint returned on time and left FIVE
+# 'fal request' threads -- and their sockets -- alive 105 seconds later, for good. The
+# caller's deadline was honoured and nothing else was. A cold Dramatic render makes tens
+# of these calls, so a degraded fal could fill a Railway worker with stuck threads.
+#
+# The fix is the one slow_read's own docstring now insists on: stream the reply and read
+# the body inside deadline_watchdog, so the deadline shuts the socket down and the
+# blocked read raises. This asserts the THREADS GO, not merely that the caller returns.
+os.environ["FAL_KEY"] = "test-only-placeholder-not-a-key"
+import fal_images  # noqa: E402
+
+def _fal_threads():
+    return [t for t in threading.enumerate() if t.name == "fal request" and t.is_alive()]
+
+server3 = DribblingServer(gap=0.2)
+try:
+    before = len(_fal_threads())
+    took = []
+    for _ in range(5):
+        started = time.monotonic()
+        try:
+            fal_images._request("GET", server3.url, time.monotonic() + 1.2)
+            check("a dribbling endpoint does not return a result", False)
+        except fal_images.FalError:
+            pass
+        took.append(time.monotonic() - started)
+    check("every call returned at its own deadline (worst %.1fs)" % max(took),
+          max(took) <= 4.0, "%.1fs" % max(took))
+    # The socket shutdown and the thread's exit are not instantaneous; a short grace
+    # here is about scheduling, not about waiting for a timeout to expire. The leak
+    # being guarded against survived 105 seconds, so a second is a fair test.
+    deadline = time.monotonic() + 3.0
+    while len(_fal_threads()) > before and time.monotonic() < deadline:
+        time.sleep(0.1)
+    leaked = len(_fal_threads()) - before
+    check("and NO thread was left blocked on the dribble (leaked %d of 5)" % leaked,
+          leaked == 0, str([t.name for t in _fal_threads()]))
+finally:
+    server3.close()
+    os.environ.pop("FAL_KEY", None)
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

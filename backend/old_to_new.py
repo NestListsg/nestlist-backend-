@@ -51,38 +51,62 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Cost ceiling
 #
-# WHAT ONE LISTING COSTS. Six images -- the exterior pair plus one per room, four rooms
-# being the number of treatments the Dramatic renderer rotates through:
+# THE UNIT IS AN IMAGE, AND THAT IS THE WHOLE POINT OF THIS BLOCK.
 #
-#     6 images x US$0.04 = US$0.24 per listing, paid ONCE (the cache below)
+# It used to be a listing: forty listings an agent a month, six images each, US$9.60.
+# That number was wrong in the direction that costs money, because the bill is per image
+# per press and a listing is neither. An audit measured it on 2026-10-22:
 #
-# THE PER-AGENT CEILING, which is the one the brief asked for. Expressed in LISTINGS
-# because that is the unit an agent and Jane think in, with the image ceiling derived so
-# the two cannot drift:
+#   * re-picking which photo is the hero costs THREE more images (a new exterior pair and
+#     a new room), because the cache is keyed on the source photo.
+#   * one ten-photo listing, hero re-picked ten times, reached 25 images -- US$1.00 --
+#     while still counting as ONE of the forty.
+#   * with the cache column absent (the state this feature ships in until Jane runs
+#     docs/old-to-new-images-migration.sql), five presses of the same listing paid five
+#     times: US$1.20, still counted as one.
 #
-#     40 listings/agent/month  =  240 images  =  about US$9.60 per agent per month
+# Forty of those is about US$40 an agent a month, not US$9.60 -- and the count was
+# re-opening roughly weekly on top of that (see "HOW ALREADY USED IS COUNTED"), so the
+# true worst case was nearer US$160 an agent and US$8,000 across fifty agents, against a
+# quoted US$480. So we count what is billed.
 #
-# 40 is generous against observed behaviour -- Janel posts a handful of real listings a
-# month -- and bounded: fifty agents all hitting the ceiling is about US$480 a month,
-# which is a number Jane can decide about rather than discover. It is NOT an accountant,
-# and it is not the authoritative cap. The authoritative cap belongs on fal's own billing
-# spend limit, which no bug on our side can outrun, exactly as photo_upscale says of
-# Replicate.
+#     ONE IMAGE                     = US$0.04
+#     ONE FULL LISTING, first press = 6 images (the exterior pair + one per room) = $0.24
+#     THE CEILING                   = 240 images per agent per calendar month = US$9.60
 #
-# HOW "ALREADY USED" IS COUNTED, and why it is counted the way it is. The caller supplies
-# it from the video_jobs table: the number of DISTINCT listings this agent has had an
-# old-to-new job for this calendar month, excluding the listing being rendered now. That
-# makes the count durable and fleet-wide (a process-local counter would be four separate
-# ceilings on a four-worker Railway instance), and it is an UPPER BOUND on real spend --
-# a listing is only ever paid for once, however many times it is regenerated, because of
-# the cache. Excluding the current listing matters: a regenerate must never be refused by
-# its own earlier render.
+# 240 images is about forty listings IF every press is a first press, which is why the
+# money ceiling is unchanged and the headline number Jane has already decided about
+# (fifty agents x US$9.60 = US$480 a month) still holds. The difference is that it now
+# holds whatever agents actually do: an agent who re-picks photos on one listing spends
+# the same allowance faster rather than spending it invisibly.
+#
+# It is NOT an accountant, and it is not the authoritative cap. The authoritative cap
+# belongs on fal's own billing spend limit, which no bug on our side can outrun, exactly
+# as photo_upscale says of Replicate.
+#
+# HOW "ALREADY USED" IS COUNTED, and why it changed. The caller supplies a month-to-date
+# IMAGE TOTAL kept on the AGENT row (main.py's _old_to_new_images_used). It used to count
+# rows in video_jobs, which was durable-looking and was not: prune_finished() deletes
+# finished rows after PRUNE_AFTER_DAYS = 7, so from the 8th of the month the counter
+# could only ever see a week, and the ceiling quietly reset about weekly -- roughly four
+# times the quoted allowance. A total on the agent row cannot be pruned, counts the
+# in-process fallback renderer (which writes no job row at all) just as happily, and
+# counts IMAGES, which is the thing with a price.
+#
+# A regenerate still cannot be refused by its own earlier render, and now for a better
+# reason than an exclusion: a full cache hit generates nothing, so it never asks for
+# budget at all (see build_plan -- reserve_budget is only called when something is
+# missing).
 # ---------------------------------------------------------------------------
 MAX_ROOMS = 4
 IMAGES_PER_LISTING = 2 + MAX_ROOMS          # the exterior pair, then the rooms
-MAX_LISTINGS_PER_AGENT_PER_MONTH = 40
-MAX_IMAGES_PER_AGENT_PER_MONTH = (
-    MAX_LISTINGS_PER_AGENT_PER_MONTH * IMAGES_PER_LISTING)
+# The real ceiling, in the unit that is billed.
+MAX_IMAGES_PER_AGENT_PER_MONTH = 240
+# What that is worth in listings, for talking to agents. DERIVED, and only ever
+# approximate -- a listing whose photos get re-picked costs more than one listing's worth
+# of images. Never used as a limit.
+TYPICAL_LISTINGS_PER_AGENT_PER_MONTH = (
+    MAX_IMAGES_PER_AGENT_PER_MONTH // IMAGES_PER_LISTING)
 
 # Bump to regenerate every listing's after images with a changed prompt. Part of every
 # cache key, so a bump is a cache miss rather than a migration.
@@ -108,6 +132,18 @@ class BudgetExhausted(Exception):
     The one failure here that is not a degradation: there is no Dramatic video without
     an after image, so the caller turns this into a plain-language permanent failure and
     points the agent at the Classic."""
+
+
+class RateLimited(Exception):
+    """fal had no room for this account, so part of this plan was not generated.
+
+    NOT raised from build_plan -- that would throw away the cache for the images this
+    pass already paid for, which is the opposite of what we want. build_plan sets
+    `plan.rate_limited` and returns the plan intact; the caller stores the cache and
+    THEN decides, and the decision it wants is to put the whole job back for a few
+    seconds (video_jobs.DeferJob) rather than hand the agent a film with a room missing
+    its transformation. See fal_images.FalRateLimited for why a 429 is an everyday
+    answer on a fresh fal account rather than a rarity."""
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +419,12 @@ class Plan:
     degradations  -- plain-language notes for the agent.
     cache         -- the full {key: url} map to store back on the listing.
     images_paid   -- how many images this pass actually generated (0 on a full cache
-                     hit), so the caller can log what the render cost.
+                     hit). The caller logs what the render cost AND adds it to the
+                     agent's month-to-date total, which is the ceiling's only source of
+                     truth, so this number must stay honest about anything billed --
+                     including an image we paid for and then could not store.
+    rate_limited  -- fal had no room, so at least one image was not even attempted. The
+                     caller turns this into a deferral; see RateLimited.
     """
 
     def __init__(self):
@@ -393,6 +434,7 @@ class Plan:
         self.degradations = []
         self.cache = {}
         self.images_paid = 0
+        self.rate_limited = False
 
     @property
     def transformable_rooms(self):
@@ -408,16 +450,20 @@ class Plan:
 def reserve_budget(wanted, images_used_this_month):
     """How many of `wanted` images this agent may generate. Checked ONCE, up front.
 
-    Returns a number between 1 and `wanted`, or raises BudgetExhausted when there is no
-    allowance at all. Trimming rather than refusing is deliberate: an agent who is three
-    images short of a full plan should get a shorter film, not an error.
+    `images_used_this_month` is a count of IMAGES, month to date -- the thing that is
+    billed -- not a count of listings. Returns a number between 1 and `wanted`, or raises
+    BudgetExhausted when there is no allowance at all. Trimming rather than refusing is
+    deliberate: an agent who is three images short of a full plan should get a shorter
+    film, not an error.
     """
     allowance = MAX_IMAGES_PER_AGENT_PER_MONTH - max(0, int(images_used_this_month or 0))
     if allowance <= 0:
         raise BudgetExhausted(
-            "You have made the most Old-to-New videos this account can make this month "
-            f"({MAX_LISTINGS_PER_AGENT_PER_MONTH} listings). The Classic video is still "
-            "available, and the limit resets at the start of next month.")
+            "This account has used its whole Old-to-New picture allowance for this "
+            f"month (enough for about {TYPICAL_LISTINGS_PER_AGENT_PER_MONTH} listings, "
+            "and faster than that if the same listing's photos are changed and "
+            "regenerated). The Classic video is still available, and the allowance "
+            "resets at the start of next month.")
     return max(1, min(wanted, allowance))
 
 
@@ -438,8 +484,12 @@ def build_plan(exterior_url, room_urls, cache, generate_image, store_image,
                      cost. None means "use the house defaults".
     deadline      -- absolute time.monotonic(); defaults to TOTAL_BUDGET_SECONDS from now
                      and is SHARED by every generation in the pass.
+    images_used_this_month -- IMAGES this agent has already been billed for this calendar
+                     month. See the cost-ceiling block: images, not listings.
 
-    Never raises except BudgetExhausted. Everything else is a degradation on the plan.
+    Never raises except BudgetExhausted. Everything else is a degradation on the plan --
+    except a rate limit, which sets plan.rate_limited for the caller to act on and is
+    not a degradation either.
     """
     plan = Plan()
     plan.cache = dict(cache or {})
@@ -512,10 +562,24 @@ def build_plan(exterior_url, room_urls, cache, generate_image, store_image,
 
     def _make(role, source_urls, prompt, key):
         """Generate one image, store it, cache it. Returns the url or None."""
+        if plan.rate_limited:
+            # fal has already told us this account is at its limit. Asking again, five
+            # more times, for the same answer only makes the agent wait for it.
+            return None
         try:
             data = generate_image(prompt, source_urls, overall)
         except fal_images.FalNotConfigured as e:
             logger.warning("old-to-new: %s", e)
+            return None
+        except fal_images.FalRateLimited as e:
+            # NOT a degradation, and the one failure here the caller must act on rather
+            # than report: the picture is makeable, there is simply no room right now.
+            # Flagged and returned, so the images this pass DID pay for still reach the
+            # cache before the job goes back in the queue.
+            logger.warning("old-to-new: fal is at this account's concurrency limit "
+                           "(%s); the render will wait rather than lose the %s image",
+                           e, role)
+            plan.rate_limited = True
             return None
         except fal_images.FalRefused as e:
             # The expected, designed-for failure. A refusal is not a fault.

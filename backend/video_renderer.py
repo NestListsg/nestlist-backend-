@@ -3541,6 +3541,7 @@ def render_dramatic_video(plan, agent_name="", agent_contact_line="",
 
         with tempfile.TemporaryDirectory() as workdir:
             clip_paths = []
+            clip_seconds = []
             fell_back = 0
             for position, shot in enumerate(shots):
                 if clip_paths and time.monotonic() - started > RENDER_BUDGET_SECONDS:
@@ -3574,13 +3575,20 @@ def render_dramatic_video(plan, agent_name="", agent_contact_line="",
                     degradations.append("one shot failed to render and was left out")
                     continue
                 clip_paths.append(clip_path)
+                # The seconds of the shots that SURVIVED, in case ffprobe cannot read the
+                # concatenated body. Accumulated here rather than summed from the plan
+                # afterwards, because the two are not the same list: a shot in the middle
+                # can fail and be skipped, and summing the FIRST len(clip_paths) shots
+                # would then total the wrong ones -- the estimate drifts by the
+                # difference, and the music fade is placed against it.
+                clip_seconds.append(shot["seconds"])
             if fell_back:
                 degradations.append(DRAMATIC_NOTE_ANGLE)
             if not clip_paths:
                 raise RuntimeError("No shot could be rendered into the video")
 
             body_path = os.path.join(workdir, "d_body.mp4")
-            estimated = sum(s["seconds"] for s in shots[:len(clip_paths)])
+            estimated = sum(clip_seconds)
             if len(clip_paths) == 1:
                 os.replace(clip_paths[0], body_path)
             else:

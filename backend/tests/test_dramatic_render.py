@@ -177,9 +177,14 @@ print("\n[4] The treatments, and the two load-bearing facts, in the real command
 # ===========================================================================
 def capture(plan, **kwargs):
     commands = []
+    # Names one clip whose ffmpeg call fails while every other call still writes its
+    # file -- the shape of "one shot died and the rest of the film is fine".
+    fail_clip = kwargs.pop("fail_clip", None)
     def fake_run(cmd, timeout):
         commands.append(list(cmd))
         out = cmd[-1]
+        if fail_clip and fail_clip in str(out):
+            raise RuntimeError("ffmpeg died on this shot")
         if not out.startswith("-"):
             with open(out, "wb") as f:
                 f.write(b"\0" * 2048)
@@ -276,6 +281,52 @@ check("the flight layer is drawn smaller and scaled up -- a resolution economy o
 # ===========================================================================
 print("\n[5] Every way it degrades, and none of them is a failed video")
 # ===========================================================================
+# THE MUSIC IS TIMED AGAINST THE SHOTS THAT SURVIVED, not the first few in the plan.
+# When ffprobe cannot read the joined body, the fallback estimate used to be
+# sum(shot["seconds"] for shot in shots[:len(clip_paths)]) -- the first N shots rather
+# than the N that worked. Drop a shot from the middle and those are different lists, so
+# the estimate drifts by the difference and the fade is placed against a length the film
+# does not have. (With every shot the same length the bug is invisible, which is why the
+# room length is changed here: the arithmetic has to be right whatever the durations are.)
+def _trim_seconds(commands):
+    """The body length the music was timed against, read out of the real filter."""
+    for cmd in reversed(commands):
+        joined = " ".join(str(a) for a in cmd)
+        for token in joined.split():
+            if token.startswith("[1:a]atrim=0:"):
+                return float(token.split("[1:a]atrim=0:")[1].split(",")[0])
+    return None
+
+
+_saved_room_seconds = vr.ROOM_SECONDS
+vr.ROOM_SECONDS = 7.0
+try:
+    plan = make_plan([("b%d" % i, "a%d" % i) for i in range(4)])
+    shots = vr.dramatic_shots(True, True, [True] * 4)
+    # The closing card is added on top of the body, so the trim is body + card. Measure
+    # that offset from a clean render rather than restating the card's own constants.
+    clean_cmds, _clean = capture(plan, photos=PHOTOS, agent_name="J")
+    card_offset = _trim_seconds(clean_cmds) - sum(s["seconds"] for s in shots)
+    # THE OPENING is the shot to drop: it is the one whose length differs from the rooms',
+    # so "the shots that survived" and "the first N shots" give different totals. Dropping
+    # a room would not -- every room is the same length, which is exactly why the bug was
+    # invisible until the durations were pulled apart.
+    survived = sum(s["seconds"] for s in shots[1:])
+    first_n = sum(s["seconds"] for s in shots[:len(shots) - 1])
+    cmds, (data, degs) = capture(plan, photos=PHOTOS, agent_name="J",
+                                 fail_clip="d_clip_00")
+    timed = _trim_seconds(cmds) - card_offset
+    check("a shot that fails is dropped and reported, not fatal",
+          any("one shot failed" in d for d in degs) and data, str(degs))
+    check("the music is timed against the %.1fs that survived, not the %.1fs of the "
+          "first five shots in the plan" % (survived, first_n),
+          timed is not None and abs(timed - survived) < 0.05,
+          "timed=%r survived=%.1f firstN=%.1f" % (timed, survived, first_n))
+    check("(and the two really do differ, so this test can fail)",
+          abs(survived - first_n) > 0.5)
+finally:
+    vr.ROOM_SECONDS = _saved_room_seconds
+
 plan = make_plan([("b0", "same"), ("b1", "a1")])
 cmds, (data, degs) = capture(plan, photos=PHOTOS, agent_name="J")
 check("an after that is identical to its before gives an unusable mask",
@@ -410,13 +461,52 @@ check("the cache write is skipped when the column is not there yet",
       '"old_to_new_images" in listing' in seg("_render_dramatic_core"))
 check("ownership is confirmed before the upload AND before the listing write",
       seg("_render_dramatic_core").count("ownership_check()") == 2)
-check("the monthly count excludes this listing, so a regenerate is never refused by "
-      "its own earlier render",
-      "listings.discard(str(listing_id))" in seg("_old_to_new_images_used"))
-check("and a database blip allows the render rather than blocking it",
+# THE COUNT DOES NOT COME OUT OF THE JOBS TABLE ANY MORE. It used to count distinct
+# listings with a Dramatic job since the 1st -- and video_jobs.prune_finished() deletes
+# finished rows after PRUNE_AFTER_DAYS, so from the 8th the ceiling could only see a week
+# and reset itself about weekly.
+check("the monthly tally is NOT read from the prunable jobs table",
+      "video_jobs.TABLE" not in seg("_old_to_new_images_used")
+      and "video_jobs" not in seg("_old_to_new_images_used"))
+check("it is read from the agent row, which nothing prunes",
+      'db.table("agents")' in seg("_read_old_to_new_usage"))
+check("and it is counted in IMAGES, which is what fal bills for",
+      'OLD_TO_NEW_IMAGES_COLUMN = "old_to_new_images_used"' in src)
+check("a database blip allows the render rather than blocking it",
       "return 0" in seg("_old_to_new_images_used"))
-check("there is a migration for the cache column, and it says what happens without it",
+check("the paid images are recorded from the CORE, so the in-process fallback path -- "
+      "which writes no job row at all -- is counted the same way",
+      "_add_old_to_new_images(agent[\"id\"], plan.images_paid)"
+      in seg("_render_dramatic_core"))
+check("recording cannot cost an agent their video: it never raises",
+      "NEVER RAISES" in seg("_add_old_to_new_images"))
+check("there is a migration for both money controls, and it no longer calls itself "
+      "optional",
       os.path.exists(os.path.join(BACKEND, "docs", "old-to-new-images-migration.sql")))
+_mig = open(os.path.join(BACKEND, "docs", "old-to-new-images-migration.sql"),
+            encoding="utf-8").read()
+check("the migration header says it IS a blocker, on the money axis",
+      "not a blocker" not in _mig and "RUN THIS BEFORE" in _mig)
+check("and it creates the tally columns as well as the cache column",
+      "old_to_new_images_used" in _mig and "old_to_new_month" in _mig
+      and "old_to_new_images jsonb" in _mig)
+check("there is a separate migration for the cross-type enqueue race, for Jane to run "
+      "on its own",
+      os.path.exists(os.path.join(BACKEND, "docs",
+                                  "video-jobs-dramatic-migration.sql")))
+_vjmig = open(os.path.join(BACKEND, "docs", "video-jobs-dramatic-migration.sql"),
+              encoding="utf-8").read()
+check("it widens the unique index to the listing alone",
+      "on public.video_jobs (listing_id)" in _vjmig
+      and "where status in ('queued', 'running')" in _vjmig)
+check("the new index is created BEFORE the old one is dropped, so there is never an "
+      "instant with no rule in force",
+      _vjmig.index("create unique index if not exists "
+                   "video_jobs_one_active_per_listing")
+      < _vjmig.index("drop index if exists"))
+check("and it lets the queue accept 'dramatic' at all -- the live check constraint "
+      "allows only classic and signature",
+      "video_jobs_type_check" in _vjmig and "'dramatic'" in _vjmig)
 check("the Dramatic has its own fleet-wide cap, because fal is the constraint",
       video_jobs.JOB_TYPES[video_jobs.JOB_TYPE_DRAMATIC].account_limit == 2)
 check("startup registers both renderers",
@@ -435,13 +525,19 @@ LISTING = {"id": "l1", "images": ["https://x/%d.jpg" % i for i in range(6)],
            "video_status": None}
 
 
-def run_endpoint(fal_on=True, active=None, **params):
+def run_endpoint(fal_on=True, active=None, stored=None, **params):
     seen = {}
+    listing = dict(LISTING)
+    if stored is not None:
+        listing["video_template_id"] = stored
 
     class FakeJobs:
         JOB_TYPE_CLASSIC = "classic"
         JOB_TYPE_DRAMATIC = "dramatic"
         TABLE = "video_jobs"
+        # The endpoint falls back to this when describe() fails, so that a
+        # response can never say "rendering" with no queued/running truth in it.
+        STATUS_QUEUED = "queued"
         @staticmethod
         def available(): return True
         @staticmethod
@@ -456,7 +552,7 @@ def run_endpoint(fal_on=True, active=None, **params):
             return active if active and active["job_type"] == job_type else None
 
     async def db_exec(fn, what=""):
-        return types.SimpleNamespace(data=[LISTING])
+        return types.SimpleNamespace(data=[listing])
     async def noop(*a, **k): return None
 
     g = dict(asyncio=asyncio, datetime=_dt.datetime, timezone=_dt.timezone,
@@ -465,6 +561,7 @@ def run_endpoint(fal_on=True, active=None, **params):
              video_renderer=vr, video_jobs=FakeJobs, db_execute_async=db_exec,
              send_telegram_alert_throttled=noop, get_current_agent=lambda: None,
              DEFAULT_VIDEO_TEMPLATE_ID="classic",
+             DRAMATIC_VIDEO_TEMPLATE_ID="dramatic",
              UNRELEASED_VIDEO_TEMPLATE_IDS={"elegant"},
              VIDEO_JOB_TYPES=("classic", "dramatic"),
              _resolve_video_template_id=lambda t: t if t in ("classic", "dramatic") else None,
@@ -501,6 +598,20 @@ resp, seen = run_endpoint(fal_on=False, video_template_id="dramatic")
 check("WITHOUT FAL_KEY the agent is told NOW, not after waiting in a queue",
       resp[0] == "HTTP" and resp[1] == 400 and "not switched on" in resp[2], str(resp))
 check("and nothing was queued", "job_type" not in seen)
+
+# A listing that REMEMBERS the Dramatic style, on a deploy that has lost the key.
+# Nobody asked for Dramatic on this press -- the row did -- so refusing would tell
+# an agent no about a listing of their own for a reason they cannot see. An explicit
+# request still gets the honest 400 (the check above).
+resp, seen = run_endpoint(fal_on=False, stored="dramatic")
+check("a listing that remembers Dramatic renders the CLASSIC when the key is gone, rather than refusing",
+      seen.get("job_type") == "classic"
+      and seen["payload"]["video_template_id"] == "classic", str(seen))
+check("and the row is healed, so the fallback fires once rather than every render",
+      seen["payload"]["persist_video_template_id"] is True, str(seen.get("payload")))
+resp, seen = run_endpoint(fal_on=True, stored="dramatic")
+check("with the key present a remembered Dramatic is still a Dramatic",
+      seen.get("job_type") == "dramatic", str(seen.get("job_type")))
 
 resp, seen = run_endpoint(video_template_id="elegant")
 check("Elegant is a clear 'not available yet', never a silent Classic",
