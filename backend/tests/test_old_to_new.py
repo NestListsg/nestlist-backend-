@@ -34,13 +34,18 @@ SECRET = "fal-secret-key-nobody-should-ever-see"
 
 
 class FakeResponse:
-    def __init__(self, status=200, payload=None, body="", chunks=None):
+    def __init__(self, status=200, payload=None, body="", chunks=None, not_json=False):
         self.status_code = status
         self._payload = payload if payload is not None else {}
         self.text = body
         self._chunks = chunks if chunks is not None else [b"JPEGBYTES"]
         self.raw = None
+        # A 200 that is not JSON at all -- a proxy's html error page in front of fal. It
+        # matters because fal has still taken (and charged for) the job.
+        self._not_json = not_json
     def json(self):
+        if self._not_json:
+            raise ValueError("not json")
         return self._payload
     def iter_content(self, chunk_size=None):
         return iter(self._chunks)
@@ -202,6 +207,24 @@ for label, body in TRANSFORMS.items():
           str(still_there))
 check("a 4xx error says what to do without repeating fal's reply",
       "not quoted" in str(fal_images._classify(400, TRANSFORMS["url-encoded"])))
+# THE MIDDLE PATH, added after the second audit pointed out we had skipped it. "HTTP 422;
+# its reply is not quoted" cannot tell a renamed request field from a safety refusal, and
+# those want different answers from whoever reads the log. The SHAPE of the body separates
+# them, and a shape carries no values.
+shape = str(fal_images._classify(422, '{"detail": "%s", "status": 422}' % REAL_SHAPE))
+check("a 4xx now reports the body's SHAPE -- its size and its top-level field names",
+      "bytes" in shape and "detail" in shape and "status" in shape, shape)
+check("...and still no value from it, not even the one that looks like a key",
+      REAL_SHAPE not in shape and "Key" not in shape, shape)
+check("a body that is not JSON at all says so, which is how a proxy in the way is told "
+      "apart from fal refusing us",
+      "not JSON" in str(fal_images._classify(422, "<html>502 Bad Gateway</html>")))
+check("an empty body says that rather than inventing a shape",
+      "empty" in str(fal_images._classify(422, "")))
+# A field NAME cannot normally carry a credential, but that is exactly how the leak this
+# module was rewritten for got argued, so the names go through _redact too.
+sneaky = str(fal_images._classify(422, '{"Key %s": 1}' % REAL_SHAPE))
+check("even a credential-shaped FIELD NAME is redacted", REAL_SHAPE not in sneaky, sneaky)
 check("a refusal still reads as a refusal, using OUR word and not fal's text",
       isinstance(fal_images._classify(422, "blocked by the safety filter"),
                  fal_images.FalRefused)
@@ -340,6 +363,130 @@ try:
 except fal_images.FalError:
     check("an un-collectable submit is NOT paid for twice", submits(fake) == 1,
           str(submits(fake)))
+
+
+# ===========================================================================
+print("\n[2c] WHAT FAL BILLED LEAVES WITH THE ERROR, so the ceiling can count it")
+# ===========================================================================
+# THE SECOND AUDIT'S LARGEST FINDING, in one sentence: the ceiling counted pictures we
+# RECEIVED, and fal charges for pictures it ACCEPTED. Everything above proves one generate()
+# never pays twice; none of it noticed that five everyday shapes pay ONCE and hand us
+# nothing, while the tally -- whose only input was "did bytes come back" -- read zero.
+#
+# Measured costs of that gap, before this section existed:
+#   * fal incident, every collect attempt 502s: 5 pictures per press, US$0.20, tally $0.00
+#   * fal rate-limiting collection: the same picture re-bought once per deferral cycle,
+#     17 cycles inside the patience window, US$0.68 for one press, tally $0.00
+#
+# So every error now carries images_billed, and old_to_new adds THAT to the tally.
+_saved = (fal_images.POLL_FIRST_SECONDS, fal_images.POLL_MAX_SECONDS,
+          fal_images.RETRY_BACKOFF_SECONDS)
+fal_images.POLL_FIRST_SECONDS = fal_images.POLL_MAX_SECONDS = 0.01
+fal_images.RETRY_BACKOFF_SECONDS = 0.01
+
+NOT_JSON = FakeResponse(status=200, not_json=True, body="<html>502</html>")
+NO_SHAPE = FakeResponse(payload={"request_id": "abc"})
+NO_IMAGE = FakeResponse(payload={"images": [], "description": "could not do this"})
+
+# (label, transport script, how many pictures fal was paid for)
+BILLED_SHAPES = [
+    ("every collect attempt 502s (a fal incident)",
+     [SUBMITTED] + [FakeResponse(status=502, body="bad gateway")] * 6, 1),
+    ("the submit answers 200 with something that is not JSON",
+     [NOT_JSON], 1),
+    ("the submit answers 200 with a shape we cannot collect from",
+     [NO_SHAPE], 1),
+    ("fal COMPLETED and produced no picture -- nano-banana's quiet decline",
+     [SUBMITTED, COMPLETED, NO_IMAGE], 1),
+    ("429 on every collect attempt, after an accepted submit",
+     [SUBMITTED] + [FakeResponse(status=429, body="slow down")] * 6, 1),
+    # The control. A 429 on the SUBMIT means fal never took the job, so nothing is owed --
+    # and this is the shape the whole deferral design rests on.
+    ("429 on the SUBMIT itself -- nothing was queued, nothing is owed",
+     [FakeResponse(status=429, body="slow down")], 0),
+]
+for label, script, owed in BILLED_SHAPES:
+    fake = install(script)
+    try:
+        fal_images.generate("a calm cream room", ["https://x/a.jpg"])
+        billed, raised = None, "returned bytes"
+    except fal_images.FalError as e:
+        billed, raised = fal_images.billed_images(e), type(e).__name__
+    check("fal was paid for %d, and the error says so: %s" % (owed, label),
+          billed == owed, "billed=%r (%s)" % (billed, raised))
+    check("  ...and it still only submitted once", submits(fake) == 1, str(submits(fake)))
+
+# A plain exception from an injected generator has never heard of images_billed. It must
+# read as zero rather than crash inside a degradation handler.
+check("an exception that knows nothing about billing reads as zero, not as an error",
+      fal_images.billed_images(RuntimeError("boom")) == 0
+      and fal_images.billed_images(None) == 0
+      and fal_images.billed_images(types.SimpleNamespace(images_billed="nonsense")) == 0)
+check("a screened prompt is refused before the request, so it owes nothing",
+      fal_images.billed_images(
+          fal_images.FalRefused("the prompt contains 'fire'")) == 0)
+
+# AND NOW THE PART THAT ACTUALLY PROTECTS JANE: the real build_plan, through the real
+# fal_images.generate, over each of those transports. images_paid is the per-agent
+# ceiling's only input (main._add_old_to_new_images), so this is the number that used to
+# be zero on a bad day.
+def plan_over(script_for_each):
+    """build_plan for a one-room listing, with each generation getting a fresh script."""
+    scripts = iter(script_for_each)
+    def gen(prompt, sources, deadline):
+        install(list(next(scripts)))
+        return fal_images.generate(prompt, sources, deadline)
+    return old_to_new.build_plan(
+        "https://x/e.jpg", [("https://x/r0.jpg", None)], {},
+        generate_image=gen, store_image=lambda r, k, d: "https://store/%s.jpg" % r[:4],
+        images_used_this_month=0)
+
+
+incident = [FakeResponse(status=502, body="bad gateway")] * 6
+plan = plan_over([[SUBMITTED] + incident] * 3)
+# TWO, not three: a failed anonymised frame means the rebuild is not even attempted,
+# because there is nothing to generate it from. So a one-room listing pays for the
+# anonymised exterior and the room.
+check("THE REGRESSION: a fal incident bills 2 pictures and the tally now SEES both "
+      "(it used to see 0)", plan.images_paid == 2, str(plan.images_paid))
+check("and it knows they are LOST -- paid for, uncollected, so nothing is cached and a "
+      "retry would buy them again", plan.images_lost == 2 and plan.cache == {},
+      "lost=%d cache=%d" % (plan.images_lost, len(plan.cache)))
+check("the agent still gets a film, with the rooms as they are today",
+      plan.rooms and not plan.transformable_rooms)
+
+plan = plan_over([[SUBMITTED, COMPLETED, NO_IMAGE]] * 3)
+check("a COMPLETED-with-no-picture decline is billed and counted too",
+      plan.images_paid == 2 and plan.images_lost == 2, repr(plan))
+
+plan = plan_over([[SUBMITTED] + [FakeResponse(status=429, body="slow")] * 6])
+check("a 429 while COLLECTING is billed, counted, and flagged for the caller",
+      plan.images_paid == 1 and plan.images_lost == 1 and plan.rate_limited,
+      repr(plan))
+plan = plan_over([[FakeResponse(status=429, body="slow")]])
+check("a 429 on the SUBMIT costs nothing, so NOTHING is counted and nothing is lost -- "
+      "which is what makes waiting free", plan.images_paid == 0
+      and plan.images_lost == 0 and plan.rate_limited, repr(plan))
+
+healthy = [SUBMITTED, COMPLETED, RESULT, IMAGE]
+plan = plan_over([healthy] * 2)
+check("and the healthy path is unchanged: 2 pictures, 2 counted, none lost, both cached",
+      plan.images_paid == 2 and plan.images_lost == 0 and len(plan.cache) == 2,
+      repr(plan))
+
+# An image we generated and then could not store was already counted as paid. It is now
+# counted as LOST as well, because a retry would pay for it again.
+stored_ok = []
+plan = old_to_new.build_plan(
+    "https://x/e.jpg", [], {},
+    generate_image=lambda p, s, d: b"IMAGE",
+    store_image=lambda r, k, d: (_ for _ in ()).throw(RuntimeError("bucket down")),
+    images_used_this_month=0)
+check("a picture we paid for and could not store is counted as paid AND as lost",
+      plan.images_paid == 1 and plan.images_lost == 1, repr(plan))
+
+fal_images.POLL_FIRST_SECONDS, fal_images.POLL_MAX_SECONDS, \
+    fal_images.RETRY_BACKOFF_SECONDS = _saved
 
 
 # ===========================================================================

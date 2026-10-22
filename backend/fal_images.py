@@ -51,12 +51,20 @@ by equality, for the one place prose from fal is still worth having (the
 completed-without-an-image explanation) and for anything that is quoted in future.
 
 COST
-Every successful generation is billed. generate() therefore does NOT decide whether we
-can afford to generate -- that belongs to the caller, up front, before the first call
-(old_to_new.reserve_budget). This module only reports what one image costs so there is
-one number rather than two that can drift.
+EVERY ACCEPTED SUBMIT IS BILLED, not every picture we receive. That distinction is the
+whole of the second audit's most expensive finding: five measured shapes (every collect
+attempt 502s, a non-JSON 200, a 200 shape we do not understand, COMPLETED with no
+picture, 429 throughout collection) all leave fal paid and us empty-handed. So every
+error this module raises carries `images_billed` -- how many pictures fal may already
+have charged for -- and billed_images() reads it. old_to_new's tally adds that number,
+not the number of files it got.
+
+generate() still does NOT decide whether we can afford to generate -- that belongs to the
+caller, up front, before the first call (old_to_new.reserve_budget). This module only
+reports what one image costs so there is one number rather than two that can drift.
 """
 import io
+import json
 import logging
 import os
 import re
@@ -162,9 +170,17 @@ class FalError(Exception):
     means we know it did not (it answered us with an error, or we never reached it), so
     submitting again is safe. True means we cannot tell, so submitting again would risk
     paying twice for one picture and generate() will not do it. Defaults to the safe
-    answer and is set to True only on the genuinely ambiguous paths."""
+    answer and is set to True only on the genuinely ambiguous paths.
+
+    `images_billed` answers the same question in money rather than in policy: HOW MANY
+    pictures fal may already have charged for when this was raised. generate() sets it on
+    every error it raises, and billed_images() below is how callers read it. It exists
+    because the two had been conflated -- may_be_queued decided whether to resubmit, and
+    NOTHING decided what to count, so an audit on 2026-10-22 measured five everyday
+    failure shapes in which fal was paid and the per-agent tally stayed at zero."""
 
     may_be_queued = False
+    images_billed = 0
 
 
 class FalNotConfigured(FalError):
@@ -194,10 +210,11 @@ class FalRateLimited(FalTemporary):
     """fal is at this account's concurrency limit. Not a fault, and not ours to retry.
 
     SEPARATE FROM FalTemporary BECAUSE THE RIGHT ANSWER IS DIFFERENT. fal starts a new
-    account at TWO concurrent requests, rising with credits spent -- and the Dramatic
-    queue allows two renders at once, each of which can have a request in flight, so a
-    third party on the same key (Jane's own ~/.nestlist_fal_key experiments share it) is
-    enough to make this an everyday answer rather than a rare one.
+    account at TWO concurrent requests, rising with credits spent, and a third party on
+    the same key (Jane's own ~/.nestlist_fal_key experiments share it) is enough to make
+    this an everyday answer rather than a rare one. The Dramatic queue was dropped to ONE
+    render at a time for the rollout partly for that reason -- see
+    video_jobs.JOB_TYPES.
 
     Retrying inside this call spends the agent's wait on a queue that is full, and when
     it runs out the room silently loses its transformation. Handing it back instead lets
@@ -214,6 +231,31 @@ def is_enabled():
     """True when a key is present. No second switch: a deploy either has the key or it
     does not, and a half-configured deploy behaves exactly like an unconfigured one."""
     return bool(os.environ.get(KEY_ENV, "").strip())
+
+
+def billed_images(exc):
+    """How many pictures fal may already have charged for before `exc` stopped the call.
+
+    THE TALLY MUST COUNT THIS, NOT THE PICTURES THAT ARRIVED. A submit fal accepted is
+    billed whether or not we ever collect the file, so "we received nothing" and "we were
+    charged nothing" are different statements, and the ceiling has to be built on the
+    second one. Measured costs of getting that wrong, on 2026-10-22:
+
+      * fal incident, every collect attempt 502s: five pictures billed per press of
+        Generate, US$0.20, and the old tally read US$0.00.
+      * fal rate-limiting collection: the same picture re-submitted and re-paid for once
+        per deferral cycle -- 17 cycles inside the 600s patience window, US$0.68 for one
+        press, tally US$0.00. (That loop is closed in old_to_new, by not deferring a pass
+        that already lost money; this function is how the money becomes visible at all.)
+
+    Tolerant on purpose: `exc` is often an exception from an INJECTED generator (tests,
+    video_renderer) that has never heard of this attribute, and "I do not know" has to
+    mean zero rather than a crash inside a degradation handler.
+    """
+    try:
+        return max(0, int(getattr(exc, "images_billed", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _auth_headers():
@@ -308,6 +350,38 @@ def _refusal_marker(body_text):
     return None
 
 
+def _body_shape(body_text):
+    """What a reply we will NOT quote looks like: how big it is, and if it is JSON, the
+    NAMES of its top-level fields. No values, in any branch.
+
+    THE MIDDLE PATH, and it was pointed out as one we had skipped. Quoting fal's 4xx
+    bodies put the key one bad redaction away from Railway's logs, so we stopped; but
+    "HTTP 422; its reply is not quoted" cannot tell a renamed request field from a safety
+    refusal, and those two want completely different answers from whoever reads the log.
+    The SHAPE separates them: a 422 whose body carries `detail` is a schema complaint, one
+    that is not JSON at all is a proxy in the way, one with fields we have never seen is
+    fal changing its API.
+
+    A field name is not a credential -- but the names go through _redact anyway, and are
+    capped in number and length, because "cannot carry a key" is exactly how the leak
+    that started all this was argued.
+    """
+    text = str(body_text or "")
+    if not text.strip():
+        return "its reply is empty"
+    size = "%d bytes" % len(text)
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return f"{size}, not JSON"
+    if isinstance(parsed, dict):
+        names = [_redact(str(name))[:40] for name in list(parsed.keys())[:8]]
+        if not names:
+            return f"{size}, JSON with no fields"
+        return f"{size}, JSON fields: {', '.join(names)}"
+    return f"{size}, JSON {type(parsed).__name__}"
+
+
 def _classify(status_code, body_text):
     """One HTTP failure -> the exception that says what to do about it.
 
@@ -318,9 +392,10 @@ def _classify(status_code, body_text):
     from our own vocabulary. That is most of what the body was ever read for.
 
     What this gives up: when fal rejects a request for a reason that is neither a refusal
-    nor obvious from the status, the log now says less than it did. The trade is
-    deliberate -- a reason we have to guess at costs a room its transformation, a leaked
-    key costs Jane her account.
+    nor obvious from the status, the log says less than it did. The trade is deliberate --
+    a reason we have to guess at costs a room its transformation, a leaked key costs Jane
+    her account -- but it gave up MORE than it had to, so the 4xx branch now reports the
+    body's SHAPE (see _body_shape): its size and its top-level field names, never a value.
     """
     if status_code in (401, 403):
         return FalPermanent("fal rejected our credentials -- check FAL_KEY in Railway")
@@ -334,8 +409,8 @@ def _classify(status_code, body_text):
             return FalRefused(
                 f"fal would not generate this image (its reply mentions {marker!r})")
         return FalPermanent(
-            f"fal rejected the request (HTTP {status_code}; its reply is not quoted -- "
-            "it can echo our own request headers)")
+            f"fal rejected the request (HTTP {status_code}; {_body_shape(body_text)}; its "
+            "reply is not quoted -- it can echo our own request headers)")
     if status_code == 404:
         return FalPermanent(f"fal does not know the model {EDIT_MODEL!r}")
     if status_code >= 500:
@@ -373,10 +448,27 @@ def _request(method, url, deadline, json_body=None):
     read under slow_read.deadline_watchdog -- at the deadline the socket is shut down,
     the blocked read raises, and the worker thread ends.
 
-    THE RESIDUAL, honestly: a server that never finishes sending HEADERS is still merely
-    abandoned, because there is no response object to reach into yet. requests' own
-    connect and read timeouts do bound that case, and it is the one shape where nothing
-    has arrived to reset them.
+    THE RESIDUAL, AND THIS NOTE USED TO GET IT WRONG. A server that never finishes
+    sending HEADERS is still merely abandoned: there is no response object yet, so the
+    watchdog has no socket to shut down. The previous version of this paragraph credited
+    requests' own connect and read timeouts with bounding that case, on the grounds that
+    nothing has arrived to reset them. NOTHING ARRIVING IS NOT THE SHAPE: header lines are
+    arriving, every individual read is therefore healthy, and the read timeout never fires
+    -- the per-read trap at the top of this module, one phase earlier.
+
+    What really bounds it is http.client._MAXHEADERS -- 100 header lines, after which the
+    thread ends however long they took. Measured on 2026-10-22 against a server sending
+    one header line every 0.02s / 0.05s / 0.15s: the thread and its socket were released
+    after 2.7s / 5.6s / 15.6s, i.e. 100 x the gap each time, not HTTP_READ_SECONDS.
+
+    SO THE WORST CASE IS 100 x HTTP_READ_SECONDS, about 33 minutes, for one thread and one
+    socket per call. It is reached by a gap just UNDER the read timeout; a gap above it
+    does fire the timeout (measured: a 2.0s gap against a 1.0s read timeout released at
+    1.0s), which is what makes 33 minutes a bound rather than an open end. Bounding it
+    honestly would need the connection before its headers arrive, which requests does not
+    hand out, so this is left measured rather than fixed, and
+    tests/test_slow_read_deadlines.py pins the number so the next person to read this gets
+    one that was checked.
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -534,7 +626,12 @@ def _submit(prompt, image_urls, deadline):
     # charged for. PERMANENT on purpose: this is the one failure where trying again means
     # paying a second time for a response shape we do not understand, and a second
     # payment would not teach us anything the first one did not.
-    raise FalPermanent("fal accepted the request but gave us nothing to poll")
+    #
+    # Marked ambiguous as well, which costs nothing in retry policy (a FalPermanent is
+    # never retried either way) and makes the BILLING rule in generate() a single
+    # question: fal answered 200, so fal has the job, so we were charged.
+    raise _ambiguous(
+        FalPermanent("fal accepted the request but gave us nothing to poll"))
 
 
 def _collect(accepted, deadline):
@@ -611,63 +708,95 @@ def generate(prompt, image_urls, deadline=None):
     submits = 0
     collects = 0
     last = None
-    while True:
-        if time.monotonic() >= overall:
-            raise last or FalTemporary("ran out of time before generating an image")
-        try:
-            if accepted is None and payload is None:
-                submits += 1
-                accepted = _submit(prompt, image_urls, overall)
-            if payload is None:
-                payload = _collect(accepted, overall)
-            if image_url is None:
-                images = payload.get("images") or []
-                image_url = (images[0] or {}).get("url") if images else None
-                if not image_url:
-                    # COMPLETED with no image is how nano-banana declines something its
-                    # safety layer did not reject outright -- `description` says why. It
-                    # is permanent: the same prompt gets the same answer. The
-                    # description is fal's own prose rather than an echo of our request,
-                    # so it is worth keeping -- through _redact, and capped.
-                    raise FalRefused(
-                        "fal completed without producing an image"
-                        + (f": {_redact(payload.get('description'))[:200]}"
-                           if payload.get("description") else ""))
-            data = _download(image_url, overall)
-            logger.info("fal generated an image in %.1fs (%d KB, %s, %d submit(s))",
-                        time.monotonic() - started, len(data) // 1024, EDIT_MODEL,
-                        submits)
-            return data
-        except FalPermanent:
-            # Includes FalRefused. No retry: the answer will not change and a second
-            # attempt would be billed for the same answer.
-            raise
-        except FalTemporary as e:
-            last = e
-            if accepted is None and payload is None:
-                # NOTHING PAID FOR YET. A rate limit here means fal has no room for us;
-                # hand it back so the whole job can wait for capacity (see
-                # FalRateLimited) instead of burning the agent's wait on a full queue.
-                if isinstance(e, FalRateLimited):
-                    raise
-                # Only resubmit when we can tell the first submit never arrived.
-                # Otherwise fal may be generating a picture we are already being charged
-                # for, and a second submit would charge us again for the same room.
-                if e.may_be_queued:
-                    logger.warning("fal submit failed in a way that may already have "
-                                   "queued a job (%s); not submitting again", e)
-                    raise
-                if submits >= MAX_SUBMITS:
-                    raise
-            else:
-                # ALREADY PAID FOR. Going back for it is free; giving it up is not.
-                collects += 1
-                if collects >= MAX_COLLECT_ATTEMPTS:
-                    raise
-            if time.monotonic() + RETRY_BACKOFF_SECONDS >= overall:
+    # WHAT FAL HAS CHARGED US FOR SO FAR IN THIS CALL. Counted at the submit, which is
+    # where the charge happens, and not at the download, which is where the old count
+    # happened and where five measured failure shapes never arrive. A list rather than an
+    # int so the handler at the bottom can read whatever the loop got to.
+    billed = [0]
+    try:
+        while True:
+            if time.monotonic() >= overall:
+                raise last or FalTemporary("ran out of time before generating an image")
+            try:
+                if accepted is None and payload is None:
+                    submits += 1
+                    try:
+                        accepted = _submit(prompt, image_urls, overall)
+                    except FalError as e:
+                        # A submit fal ANSWERED with an error cost nothing -- it did not
+                        # take the job. A submit that might have reached fal's queue (a
+                        # deadline, a reset, a 200 we could not read, a 200 with nothing
+                        # to poll) is counted as charged, because an uncertain bill has to
+                        # read as a bill: the other way round is how the ceiling came to
+                        # be exact on the healthy path and zero on a bad day.
+                        if e.may_be_queued:
+                            billed[0] += 1
+                        raise
+                    billed[0] += 1
+                if payload is None:
+                    payload = _collect(accepted, overall)
+                if image_url is None:
+                    images = payload.get("images") or []
+                    image_url = (images[0] or {}).get("url") if images else None
+                    if not image_url:
+                        # COMPLETED with no image is how nano-banana declines something
+                        # its safety layer did not reject outright -- `description` says
+                        # why. It is permanent: the same prompt gets the same answer. The
+                        # description is fal's own prose rather than an echo of our
+                        # request, so it is worth keeping -- through _redact, and capped.
+                        # IT IS ALSO BILLED: the submit was accepted, and this decline is
+                        # the quietest of the five shapes that used to cost nothing on
+                        # paper.
+                        raise FalRefused(
+                            "fal completed without producing an image"
+                            + (f": {_redact(payload.get('description'))[:200]}"
+                               if payload.get("description") else ""))
+                data = _download(image_url, overall)
+                logger.info("fal generated an image in %.1fs (%d KB, %s, %d submit(s))",
+                            time.monotonic() - started, len(data) // 1024, EDIT_MODEL,
+                            submits)
+                return data
+            except FalPermanent:
+                # Includes FalRefused. No retry: the answer will not change and a second
+                # attempt would be billed for the same answer.
                 raise
-            logger.warning("fal generation failed (%s); %s", e,
-                           "collecting an image we have already paid for again"
-                           if accepted is not None or payload is not None
-                           else "submitting again")
-            time.sleep(RETRY_BACKOFF_SECONDS)
+            except FalTemporary as e:
+                last = e
+                if accepted is None and payload is None:
+                    # NOTHING COLLECTABLE YET. A rate limit here means fal has no room for
+                    # us; hand it back so the whole job can wait for capacity (see
+                    # FalRateLimited) instead of burning the agent's wait on a full queue.
+                    if isinstance(e, FalRateLimited):
+                        raise
+                    # Only resubmit when we can tell the first submit never arrived.
+                    # Otherwise fal may be generating a picture we are already being
+                    # charged for, and a second submit would charge us again for the same
+                    # room.
+                    if e.may_be_queued:
+                        logger.warning("fal submit failed in a way that may already have "
+                                       "queued a job (%s); not submitting again", e)
+                        raise
+                    if submits >= MAX_SUBMITS:
+                        raise
+                else:
+                    # ALREADY PAID FOR. Going back for it is free; giving it up is not.
+                    collects += 1
+                    if collects >= MAX_COLLECT_ATTEMPTS:
+                        raise
+                if time.monotonic() + RETRY_BACKOFF_SECONDS >= overall:
+                    raise
+                logger.warning("fal generation failed (%s); %s", e,
+                               "collecting an image we have already paid for again"
+                               if accepted is not None or payload is not None
+                               else "submitting again")
+                time.sleep(RETRY_BACKOFF_SECONDS)
+    except FalError as e:
+        # EVERY ERROR THIS FUNCTION RAISES LEAVES CARRYING WHAT IT COST, so no caller has
+        # to reconstruct it from the exception type -- which is the mistake the second
+        # audit found: `may_be_queued` and `accepted` already knew the answer and only the
+        # retry logic was asking. old_to_new reads it with billed_images().
+        e.images_billed = billed[0]
+        if billed[0]:
+            logger.warning("fal was charged for %d image(s) we did not get (%s)",
+                           billed[0], e)
+        raise

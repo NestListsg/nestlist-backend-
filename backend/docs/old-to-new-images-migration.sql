@@ -1,6 +1,24 @@
 -- NestList -- the money controls for Old-to-New videos: the picture cache and the
 --             per-agent monthly allowance
 -- ============================================================================
+-- THERE ARE TWO FILES TO RUN, AND THIS ONE GOES FIRST.
+--
+--   1. THIS FILE   (old-to-new-images-migration.sql)   <-- run this one first
+--   2. then        video-jobs-dramatic-migration.sql
+--
+-- The order matters, and not in a tidy-minded way. This file is what remembers the
+-- pictures (so they are paid for once) and what counts each agent's monthly allowance.
+-- The other file lets the render queue accept Dramatic videos at all. If you run the
+-- other one first, Dramatic videos start being made while nothing is remembering the
+-- pictures and nothing is counting the spending -- which is the single most expensive
+-- state this feature has.
+--
+-- Run in this order there is no bad window at all: until this file has run, the backend
+-- simply does not offer the Dramatic style (agents see the Classic, and are told the
+-- Dramatic is not switched on yet).
+--
+-- Both files are safe to run twice, and neither needs a deploy or a restart.
+-- ============================================================================
 -- RUN THIS BEFORE ANY AGENT MAKES AN OLD-TO-NEW VIDEO. It is the only thing that stops
 -- the same pictures being paid for over and over, and the only thing that counts an
 -- agent's monthly allowance. An earlier version of this file said it was "not a

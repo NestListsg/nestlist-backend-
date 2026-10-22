@@ -187,23 +187,30 @@ JOB_TYPES = {
 
     # Dramatic ("From Old to New"). Two reasons its numbers differ from the Classic's.
     #
-    # account_limit=2, where the Classic has none. The Classic is bound by OUR cpu, and
-    # PER_PROCESS_RENDER_LIMIT plus the worker count is the right ceiling for that. This
-    # type is also bound by an EXTERNAL service -- it generates up to six images through
-    # fal before a frame is rendered -- and the fleet-wide lever is the one that fits an
-    # external constraint. A third render is DEFERRED (which rewinds its attempt
+    # account_limit=1 FOR THE ROLLOUT, where the Classic has none. The Classic is bound by
+    # OUR cpu, and PER_PROCESS_RENDER_LIMIT plus the worker count is the right ceiling for
+    # that. This type is also bound by an EXTERNAL service -- it generates up to six images
+    # through fal before a frame is rendered -- and the fleet-wide lever is the one that
+    # fits an external constraint. A second render is DEFERRED (which rewinds its attempt
     # counter) rather than failed.
     #
-    # TWO IS NOT "well inside" FAL'S LIMIT, which an earlier version of this comment
-    # claimed. fal starts a NEW ACCOUNT at two concurrent requests, rising as credits are
-    # spent. Two renders, each with one request in flight, is therefore exactly that
-    # limit with no headroom at all -- and Jane's own experiments on ~/.nestlist_fal_key
-    # share the key, so a third request from her laptop collides with a real agent's
-    # render. That is survivable rather than fine: a 429 now comes back as
-    # fal_images.FalRateLimited, which main turns into a DeferJob, so a collision costs a
-    # wait of a few seconds instead of costing a room its transformation. If collisions
-    # turn out to be common, drop this to 1 (it halves throughput and doubles nothing
-    # else) or ask fal to raise the account's concurrency.
+    # IT WAS TWO, AND TWO WAS THE LIMIT WITH NO HEADROOM. fal starts a NEW ACCOUNT at two
+    # concurrent requests, rising as credits are spent. Two renders, each with one request
+    # in flight, is exactly that -- and Jane's own experiments on ~/.nestlist_fal_key share
+    # the key, so a third request from her laptop collides with a real agent's render. An
+    # earlier version of this comment called a collision "a wait of a few seconds". A
+    # second audit on 2026-10-22 measured the wait: ONE collision costs about 37 seconds
+    # (four collect attempts at POLL_MAX + RETRY_BACKOFF, then DEFER_BACKOFF_SECONDS), not
+    # "seconds". Worse, a collision that lands AFTER fal has accepted a submit is billed
+    # and used to be invisible to the per-agent tally -- see old_to_new.RateLimited.
+    #
+    # So for the rollout this is 1. Deferring costs a wait and nothing else, so halving
+    # throughput buys headroom inside fal's limit for the price of time: at one render at a
+    # time, Jane's laptop and an agent's render no longer collide at all, and nothing is
+    # ever billed for a picture lost to a 429. REVISIT once real 429 rates are known from
+    # live renders (or once fal raises the account's concurrency with spend), because 1 is
+    # a deliberately conservative number for a feature whose failure modes have only been
+    # measured in a test harness, not a permanent judgement about throughput.
     #
     # default_seconds=300, against the Classic's 100. A cold Dramatic render pays for up
     # to six generations before any ffmpeg runs: at fal's healthy 10-25s an image that
@@ -211,7 +218,7 @@ JOB_TYPES = {
     # include it, and this is only the fallback until real duration_seconds rows exist.
     # A REGENERATE is far quicker -- every image comes from the listing's cache -- so the
     # rolling mean will sit well below this once both kinds have run.
-    JOB_TYPE_DRAMATIC: JobTypeConfig(per_process_limit=1, account_limit=2,
+    JOB_TYPE_DRAMATIC: JobTypeConfig(per_process_limit=1, account_limit=1,
                                      default_seconds=300),
 }
 

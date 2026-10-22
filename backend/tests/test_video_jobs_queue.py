@@ -417,8 +417,17 @@ check("Elegant is named but NOT declared, so no worker can ever claim one",
 # The Dramatic generates up to six images through fal before a frame is rendered, so it
 # is bound by an EXTERNAL service as well as by this box -- which is exactly the
 # constraint a fleet-wide cap is the right lever for.
+#
+# ONE, not two, for the rollout. fal starts a new account at TWO concurrent requests and
+# Jane's own experiments share the key, so two renders left no headroom at all: a measured
+# collision costs about 37 seconds of deferral, and a collision landing after fal has
+# accepted a submit is billed. One render at a time trades throughput, which deferral
+# turns into a wait rather than a failure, for not colliding. Revisit on real 429 rates.
 check("the Dramatic has a fleet-wide cap, because fal is the constraint",
-      workers[0].JOB_TYPES["dramatic"].account_limit == 2)
+      workers[0].JOB_TYPES["dramatic"].account_limit == 1)
+check("and the cap is below fal's own starting concurrency of two, so our own renders "
+      "cannot rate-limit each other",
+      workers[0].JOB_TYPES["dramatic"].account_limit < 2)
 check("and a cold-start ETA that accounts for the generations",
       workers[0].JOB_TYPES["dramatic"].default_seconds
       > workers[0].JOB_TYPES["classic"].default_seconds)

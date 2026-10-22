@@ -372,6 +372,7 @@ print("\n[5] The picker does not offer what this deploy cannot make")
 # ===========================================================================
 node = NODES["get_video_templates"]
 g = {"fal_images": types.SimpleNamespace(is_enabled=lambda: False),
+     "_old_to_new_ceiling_enforceable": lambda: True,
      "DRAMATIC_VIDEO_TEMPLATE_ID": "dramatic",
      "VIDEO_TEMPLATES": [{"id": "classic", "name": "Classic"},
                          {"id": "dramatic", "name": "Dramatic"}],
@@ -448,6 +449,253 @@ check("the ceiling is 240 pictures = US$9.60 an agent a month",
 check("= US$480 a month across fifty agents, and that is now a real bound rather than "
       "a quoted one",
       abs(old_to_new.MAX_IMAGES_PER_AGENT_PER_MONTH * per_image * 50 - 480) < 1)
+
+# ===========================================================================
+print("\n[8] A DEFERRAL MUST NOT RE-BUY A PICTURE IT ALREADY PAID FOR")
+# ===========================================================================
+# The second audit's worst case in money terms. The deferral was designed for a 429 on the
+# SUBMIT: nothing queued, nothing charged, waiting costs a wait. A 429 that arrives while
+# COLLECTING a picture fal has already accepted is a different animal -- that picture is
+# billed, never collected, therefore never cached -- so the next cycle submits it again.
+# MEASURED on 2026-10-22 against the shipped code: 17 deferral cycles inside the
+# 600-second patience window, US$0.68 for one press of Generate, all of it for one
+# picture, and the per-agent tally read US$0.00 throughout.
+#
+# The rule now is "defer only when waiting is free", and the test reads that rule OUT OF
+# main.py rather than restating it, so prose cannot pass a test about behaviour.
+_defer_if = None
+for _node in ast.walk(NODES["_render_dramatic_core"]):
+    if not isinstance(_node, ast.If):
+        continue
+    if any(isinstance(s, ast.Raise) and isinstance(s.exc, ast.Call)
+           and "RateLimited" in ast.dump(s.exc.func) for s in ast.walk(_node)):
+        _defer_if = _node.test
+        break
+check("the shipped deferral decision was found in _render_dramatic_core",
+      _defer_if is not None)
+
+
+def would_defer(plan, from_the_queue=True):
+    """Evaluate the SHIPPED condition against a plan."""
+    expr = ast.Expression(body=_defer_if)
+    ast.fix_missing_locations(expr)
+    return bool(eval(compile(expr, "defer", "eval"),
+                     {"plan": plan, "defer_on_rate_limit": from_the_queue}))
+
+
+class _P:
+    """Just the three fields the decision reads."""
+    def __init__(self, rate_limited=False, images_lost=0, images_paid=0):
+        self.rate_limited = rate_limited
+        self.images_lost = images_lost
+        self.images_paid = images_paid
+
+
+check("a free rate limit (429 on the submit -- nothing billed) STILL defers, which is "
+      "the whole point of the deferral", would_defer(_P(rate_limited=True)))
+check("a rate limit that already cost money does NOT defer, because the next cycle "
+      "would buy the same picture again",
+      not would_defer(_P(rate_limited=True, images_lost=1, images_paid=1)))
+check("money lost without a rate limit does not defer either (there is nothing to wait "
+      "for)", not would_defer(_P(images_lost=1, images_paid=1)))
+check("and the in-process fallback never defers, whatever happened, because it has no "
+      "queue to wait in",
+      not would_defer(_P(rate_limited=True), from_the_queue=False))
+
+# The arithmetic, with the shipped constants, for both kinds of 429.
+_per_collect = fal_images.POLL_MAX_SECONDS + fal_images.RETRY_BACKOFF_SECONDS
+_cycle = fal_images.MAX_COLLECT_ATTEMPTS * _per_collect + video_jobs.DEFER_BACKOFF_SECONDS
+_patience = 600.0
+
+
+def _cycles(plan_factory):
+    """How many deferral cycles one press can run before the rule says stop."""
+    cache, cycles, elapsed = {}, 0, 0.0
+    while elapsed < _patience:
+        plan = plan_factory(cache)
+        cache = dict(plan.cache)
+        cycles += 1
+        elapsed += _cycle
+        if not would_defer(plan):
+            break
+    return cycles, plan
+
+
+def _billed_429(cache, at_collect):
+    """One generation pass where fal 429s -- at the submit, or during collection.
+
+    `at_collect` is the expensive one: fal accepted the submit (and charged for it) and
+    then refused to let us collect the result.
+    """
+    def gen(prompt, sources, deadline):
+        e = fal_images.FalRateLimited("fal is rate limiting this account")
+        if at_collect:
+            e.images_billed = 1          # exactly what fal_images.generate now sets
+        raise e
+    return old_to_new.build_plan(
+        "https://x/e.jpg", [("https://x/r%d.jpg" % i, None) for i in range(4)], cache,
+        generate_image=gen, store_image=lambda r, k, d: "https://store/x.jpg",
+        images_used_this_month=0)
+
+
+cycles_free, plan_free = _cycles(lambda c: _billed_429(c, at_collect=False))
+cycles_paid, plan_paid = _cycles(lambda c: _billed_429(c, at_collect=True))
+check("one pass plus its backoff is about %.0fs, so %.0fs of patience is about %d "
+      "cycles -- which is why this was expensive" % (_cycle, _patience, cycles_free),
+      cycles_free > 10, str(cycles_free))
+check("a 429 that cost nothing may use every one of them: %d cycles, US$0.00"
+      % cycles_free, plan_free.images_paid == 0 and plan_free.images_lost == 0)
+check("a 429 THAT WAS BILLED stops after ONE cycle (it was 17), so one press costs "
+      "US$%.2f instead of US$%.2f"
+      % (plan_paid.images_paid * fal_images.COST_PER_IMAGE_USD,
+         cycles_free * fal_images.COST_PER_IMAGE_USD),
+      cycles_paid == 1, str(cycles_paid))
+check("and what it did spend is counted, so the monthly ceiling can see it",
+      plan_paid.images_paid == 1 and plan_paid.images_lost == 1, repr(plan_paid))
+check("once fal has said no, the pass stops asking for the other five pictures",
+      plan_paid.images_paid == 1, repr(plan_paid))
+
+
+# ===========================================================================
+print("\n[9] The tally holds at the concurrency the IN-PROCESS path can reach")
+# ===========================================================================
+# Section [2] proves the compare-and-swap at the queue's own limit. It does not hold far
+# above it, and far above it is reachable: the in-process fallback renderer's only other
+# lock is per LISTING, so one agent pressing Generate across ten listings used to get ten
+# concurrent renders tallying onto one row -- and that is the live path for every Dramatic
+# render until docs/video-jobs-dramatic-migration.sql has run.
+#
+# MEASURED at 16 writers with the old 4 attempts: 36 of 96 images lost, and the loss always
+# runs in the direction that permits more spending. Eight attempts closed it.
+check("the shipped retry count is the one that was measured, not the one that fitted the "
+      "queue's limit", ASSIGNS["_OLD_TO_NEW_CAS_ATTEMPTS"] >= 8,
+      str(ASSIGNS["_OLD_TO_NEW_CAS_ATTEMPTS"]))
+
+WRITERS, EACH = 16, 6
+for trial in range(3):
+    race_db = FakeAgents([{"id": "a1", "old_to_new_month": None,
+                           "old_to_new_images_used": None}])
+    gr = build(race_db)
+    racers = [threading.Thread(target=gr["_add_old_to_new_images"], args=("a1", EACH))
+              for _ in range(WRITERS)]
+    for t in racers:
+        t.start()
+    for t in racers:
+        t.join()
+    got = race_db.rows[0]["old_to_new_images_used"] or 0
+    check("%d renders on one agent row, trial %d: all %d images counted (%d)"
+          % (WRITERS, trial + 1, WRITERS * EACH, got), got == WRITERS * EACH,
+          "lost %d, races %d" % (WRITERS * EACH - got, race_db.lost_races))
+
+check("(and the races were real -- the writers genuinely contended)",
+      race_db.lost_races > 0, "lost_races=%d" % race_db.lost_races)
+
+# And the in-process path now has a cap of its own, so 16 is a test number rather than a
+# Tuesday.
+check("the in-process fallback caps its own Dramatic concurrency",
+      "MAX_INPROCESS_DRAMATIC_RENDERS" in ASSIGNS
+      and ASSIGNS["MAX_INPROCESS_DRAMATIC_RENDERS"] >= 1,
+      str(ASSIGNS.get("MAX_INPROCESS_DRAMATIC_RENDERS")))
+_gv = ast.get_source_segment(SRC, NODES["generate_video"])
+check("...and the endpoint checks that cap BEFORE it claims the listing's render lock, "
+      "so a refusal cannot leave a listing stuck on 'rendering'",
+      _gv.index("MAX_INPROCESS_DRAMATIC_RENDERS")
+      < _gv.index("generate_video claim render lock"))
+check("...and the slot is given back by add_done_callback, which runs whether the "
+      "render returns or raises, so a crash cannot wedge the feature",
+      "_dramatic_inprocess_tasks.discard" in _gv
+      and "add_done_callback" in _gv)
+
+
+# ===========================================================================
+print("\n[10] The month is Singapore's, because every agent is in Singapore")
+# ===========================================================================
+# A UTC month rolls over at 08:00 Singapore time on the 1st, so for eight hours an agent
+# at their limit was refused a video that reserve_budget's own message had promised them
+# ("the allowance resets at the start of next month").
+_month_src = ast.get_source_segment(SRC, NODES["_current_usage_month"])
+check("the tally's month is computed with Singapore's +8 offset, not in UTC",
+      "hours=8" in _month_src, _month_src.strip().splitlines()[-1])
+# Proved rather than read: 00:30 on the 1st in Singapore is still the 31st in UTC, and the
+# allowance has to have reset by then.
+_sg = dt.timezone(dt.timedelta(hours=8))
+for label, moment, expected in (
+        ("23:30 on the 31st, Singapore", dt.datetime(2026, 10, 31, 23, 30, tzinfo=_sg),
+         "2026-10"),
+        ("00:30 on the 1st, Singapore -- the reset Jane's message promises",
+         dt.datetime(2026, 11, 1, 0, 30, tzinfo=_sg), "2026-11"),
+        ("07:30 on the 1st, Singapore -- the eight-hour hole UTC used to leave",
+         dt.datetime(2026, 11, 1, 7, 30, tzinfo=_sg), "2026-11")):
+    got = (moment.astimezone(dt.timezone.utc) + dt.timedelta(hours=8)).strftime("%Y-%m")
+    check("%s reads as %s" % (label, expected), got == expected, got)
+check("and the agent-facing promise the code now keeps is still the one written down",
+      "resets at the start of next month" in io.open(
+          os.path.join(BACKEND, "old_to_new.py"), encoding="utf-8").read())
+
+
+# ===========================================================================
+print("\n[11] NO TALLY, NO SPENDING: the probe's answer is wired to behaviour")
+# ===========================================================================
+# _old_to_new_usage_columns_supported was set by the startup probe and read by NOTHING,
+# unlike its siblings which gate behaviour -- so the one thing the probe knew (that the
+# money is not being counted) changed nothing about what we were willing to spend. It is
+# now the gate, which also makes the migration ORDER load-bearing in code: before
+# old-to-new-images-migration.sql there is no cache and no tally, which is the worst
+# combination there is.
+gate = build(FakeAgents([{"id": "a1"}], columns=("id",)),
+             names=("_probe_old_to_new_usage_columns",
+                    "_old_to_new_ceiling_enforceable"))
+gate["_old_to_new_usage_columns_supported"] = None
+check("before the probe has run, the gate is OPEN -- a start-up race must not refuse an "
+      "agent their video", gate["_old_to_new_ceiling_enforceable"]() is True)
+gate["_old_to_new_usage_columns_supported"] = True
+check("with the columns there, the gate is open",
+      gate["_old_to_new_ceiling_enforceable"]() is True)
+gate["_old_to_new_usage_columns_supported"] = False
+check("with the columns MISSING, the gate is SHUT -- no ceiling means no paid pictures",
+      gate["_old_to_new_ceiling_enforceable"]() is False)
+
+for name in ("get_video_templates", "generate_video", "_render_dramatic_core"):
+    seg = ast.get_source_segment(SRC, NODES[name])
+    check("%s consults it, so there is no path that spends with no ceiling" % name,
+          "_old_to_new_ceiling_enforceable" in seg)
+check("the picker stops OFFERING the Dramatic, rather than letting the press 400",
+      "_old_to_new_ceiling_enforceable"
+      in ast.get_source_segment(SRC, NODES["get_video_templates"]))
+check("the render core refuses PERMANENTLY, since no retry creates a database column",
+      "PermanentJobError" in ast.get_source_segment(SRC, NODES["_render_dramatic_core"]))
+check("and the agent is told something they can act on, not a column name",
+      "not switched on for this account yet"
+      in ast.get_source_segment(SRC, NODES["_render_dramatic_core"]))
+check("while Jane's Telegram alert says what actually happened and in which order to "
+      "run the two migrations",
+      "old-to-new-images-migration.sql" in SRC
+      and "video-jobs-dramatic-migration.sql" in ast.get_source_segment(
+          SRC, NODES["_check_old_to_new_ceiling"]))
+
+
+# ===========================================================================
+print("\n[12] The two migrations say which one goes first, in both files")
+# ===========================================================================
+# Run the queue migration first and Dramatic renders start queueing and deferring with no
+# cache and no tally -- findings 1 and 2 at the same time. The order now lives at the top
+# of both files, in Jane's words, as well as being enforced by [11].
+_images_sql = io.open(os.path.join(BACKEND, "docs",
+                                   "old-to-new-images-migration.sql"),
+                      encoding="utf-8").read()
+_queue_sql = io.open(os.path.join(BACKEND, "docs",
+                                  "video-jobs-dramatic-migration.sql"),
+                     encoding="utf-8").read()
+for label, text, other in (("the pictures migration", _images_sql,
+                            "video-jobs-dramatic-migration.sql"),
+                           ("the queue migration", _queue_sql,
+                            "old-to-new-images-migration.sql")):
+    head = text[:1600]
+    check("%s names the other one in its first lines" % label, other in head,
+          head[:120])
+    check("%s says plainly which runs first" % label,
+          "first" in head.lower(), head[:120])
+
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

@@ -259,5 +259,142 @@ finally:
     server3.close()
     os.environ.pop("FAL_KEY", None)
 
+
+print("\n[fal client, header phase] what REALLY bounds a server that never finishes "
+      "its headers")
+# THE RESIDUAL, PINNED WITH A NUMBER BECAUSE A NOTE ABOUT IT HAS NOW BEEN WRONG TWICE.
+#
+# The section above fixed the BODY phase: the reply is streamed, the body is read under
+# the watchdog, the socket is shut down at the deadline. The HEADER phase cannot have that
+# -- there is no response object yet, so there is no socket to reach -- and _request's
+# docstring used to claim "requests' own connect and read timeouts do bound that case".
+# They do not bound it in SECONDS: header lines keep arriving, so every individual read is
+# healthy and the read timeout never fires. It is the per-read trap this whole file exists
+# to encode, moved one phase earlier.
+#
+# What bounds it is http.client._MAXHEADERS: 100 header lines, after which the thread ends
+# however long they took. These two cases are the measurement the corrected docstring
+# quotes, so the claim and the test cannot drift apart.
+import http.client  # noqa: E402
+
+os.environ["FAL_KEY"] = "test-only-placeholder-not-a-key"
+
+
+class HeaderTrickler:
+    """Answers with a status line, then one header line every `gap` seconds, for ever.
+
+    Never sends the blank line that ends the headers, so requests never returns a
+    response object at all.
+    """
+
+    def __init__(self, gap):
+        self.gap = gap
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.stop = threading.Event()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    @property
+    def url(self):
+        return "http://127.0.0.1:%d/status" % self.port
+
+    def _serve(self):
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\n")
+            while not self.stop.is_set():
+                conn.sendall(b"X-Pad: y\r\n")
+                time.sleep(self.gap)
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def close(self):
+        self.stop.set()
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def _header_release(gap, read_timeout, give_up=30.0):
+    """(seconds the caller waited, seconds until the worker thread exited)."""
+    saved = fal_images.HTTP_READ_SECONDS
+    fal_images.HTTP_READ_SECONDS = read_timeout
+    server = HeaderTrickler(gap)
+    try:
+        before = len(_fal_threads())
+        started = time.monotonic()
+        try:
+            fal_images._request("GET", server.url, time.monotonic() + 0.5)
+        except Exception:
+            pass
+        returned = time.monotonic() - started
+        released = None
+        while time.monotonic() - started < give_up:
+            if len(_fal_threads()) <= before:
+                released = time.monotonic() - started
+                break
+            time.sleep(0.05)
+        return returned, released
+    finally:
+        server.close()
+        fal_images.HTTP_READ_SECONDS = saved
+
+
+check("http.client._MAXHEADERS is the constant the bound is made of",
+      http.client._MAXHEADERS == 100, str(http.client._MAXHEADERS))
+
+# Case 1: a gap BELOW the read timeout. Every read is healthy, so the timeout never
+# fires and the thread lives for 100 header lines -- here 100 x 0.05s = 5s, NOT the 1s
+# read timeout the old docstring credited.
+returned, released = _header_release(gap=0.05, read_timeout=1.0)
+check("the CALLER is still released at its own deadline (%.1fs)" % returned,
+      returned < 2.0, "%.1fs" % returned)
+check("but the thread is NOT bounded by the read timeout: it lived %s against a 1.0s "
+      "read timeout" % (("%.1fs" % released) if released else ">30s"),
+      released is not None and released > 2.0,
+      "released=%r" % released)
+check("it is bounded by 100 header lines instead (~%.1fs at a 0.05s gap)"
+      % (http.client._MAXHEADERS * 0.05),
+      released is not None
+      and abs(released - http.client._MAXHEADERS * 0.05) < 3.0,
+      "released=%r expected=%.1f" % (released, http.client._MAXHEADERS * 0.05))
+
+# Case 2: a gap ABOVE the read timeout. NOW the timeout does fire, which is what makes
+# the worst case 100 x HTTP_READ_SECONDS rather than open-ended -- and is why the audit's
+# "a header every 30 seconds holds a thread for 50 minutes" overstates it: a 30s gap
+# against a 20s read timeout is answered in 20s.
+returned, released = _header_release(gap=2.0, read_timeout=0.6)
+check("a gap ABOVE the read timeout DOES fire it, so the bound is 100 x "
+      "HTTP_READ_SECONDS and not endless",
+      released is not None and released < 2.0,
+      "released=%r" % released)
+
+# And the docstring has to say so, in the terms that were measured. This is the part the
+# audit actually asked for: the written claim was the risk.
+_fal_src = open(os.path.join(BACKEND, "fal_images.py"), encoding="utf-8").read()
+_request_doc = fal_images._request.__doc__ or ""
+check("_request's docstring names _MAXHEADERS as the real bound",
+      "_MAXHEADERS" in _request_doc, _request_doc[-200:])
+check("and no longer claims the connect and read timeouts bound the header phase",
+      "connect and read timeouts do bound that case" not in _fal_src)
+os.environ.pop("FAL_KEY", None)
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

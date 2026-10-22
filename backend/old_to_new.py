@@ -97,6 +97,22 @@ logger = logging.getLogger(__name__)
 # reason than an exclusion: a full cache hit generates nothing, so it never asks for
 # budget at all (see build_plan -- reserve_budget is only called when something is
 # missing).
+#
+# AND WHAT IS COUNTED IS WHAT FAL BILLED, which is not the same as what we received. A
+# second audit on 2026-10-22 measured the gap: the tally was exact whenever fal behaved
+# and read ZERO whenever it did not. Five everyday shapes -- every collect attempt 502s, a
+# non-JSON 200, a 200 shape we cannot read, COMPLETED with no picture, 429 throughout
+# collection -- all leave fal paid and the old counter untouched, because the counter rose
+# only after bytes arrived:
+#
+#   * fal incident, 502s on collection:   5 pictures billed per press, US$0.20, read as $0
+#   * fal rate-limiting collection:       the SAME picture re-submitted once per deferral
+#                                         cycle, 17 cycles in the 600s window, US$0.68 for
+#                                         one press, read as $0
+#
+# So Plan.images_paid now rises on the CHARGE (fal_images.billed_images), and
+# Plan.images_lost records the subset we got nothing for -- which is what stops the
+# deferral loop above from buying the same picture seventeen times.
 # ---------------------------------------------------------------------------
 MAX_ROOMS = 4
 IMAGES_PER_LISTING = 2 + MAX_ROOMS          # the exterior pair, then the rooms
@@ -143,7 +159,17 @@ class RateLimited(Exception):
     THEN decides, and the decision it wants is to put the whole job back for a few
     seconds (video_jobs.DeferJob) rather than hand the agent a film with a room missing
     its transformation. See fal_images.FalRateLimited for why a 429 is an everyday
-    answer on a fresh fal account rather than a rarity."""
+    answer on a fresh fal account rather than a rarity.
+
+    A DEFERRAL IS ONLY FREE WHEN THE PASS LOST NO MONEY, and that qualifier is the second
+    audit's other expensive finding. The deferral was designed for the 429 that arrives on
+    the SUBMIT: nothing was queued, nothing was charged, and waiting costs a wait. A 429
+    that arrives while COLLECTING a picture fal already accepted is a different animal --
+    that picture is billed, uncollected and therefore uncached, so the next cycle submits
+    it again and pays again. Measured on 2026-10-22: 17 deferral cycles fit inside the
+    600-second patience window, US$0.68 for one press of Generate, every cent of it for
+    one picture. So `plan.images_lost` counts the pictures this pass was charged for and
+    did not get, and the caller defers only when that number is zero."""
 
 
 # ---------------------------------------------------------------------------
@@ -418,13 +444,19 @@ class Plan:
     rooms         -- [{"before_url", "after_url" or None, "space"}], in cut order.
     degradations  -- plain-language notes for the agent.
     cache         -- the full {key: url} map to store back on the listing.
-    images_paid   -- how many images this pass actually generated (0 on a full cache
+    images_paid   -- how many images FAL CHARGED FOR in this pass (0 on a full cache
                      hit). The caller logs what the render cost AND adds it to the
                      agent's month-to-date total, which is the ceiling's only source of
                      truth, so this number must stay honest about anything billed --
-                     including an image we paid for and then could not store.
-    rate_limited  -- fal had no room, so at least one image was not even attempted. The
-                     caller turns this into a deferral; see RateLimited.
+                     an image we paid for and then could not store, and (since the
+                     2026-10-22 second audit) an image fal accepted, charged for and then
+                     never handed over. See fal_images.billed_images.
+    images_lost   -- of those, how many we did NOT get a usable picture for. Money spent
+                     with nothing to show, and nothing in the cache either, so a RETRY OF
+                     THIS PASS WOULD SPEND IT AGAIN. That is why the caller consults this
+                     before deferring; see RateLimited.
+    rate_limited  -- fal had no room, so at least one image was not even attempted. On
+                     its own that is the caller's cue to defer; see RateLimited.
     """
 
     def __init__(self):
@@ -434,6 +466,7 @@ class Plan:
         self.degradations = []
         self.cache = {}
         self.images_paid = 0
+        self.images_lost = 0
         self.rate_limited = False
 
     @property
@@ -442,9 +475,9 @@ class Plan:
 
     def __repr__(self):
         return ("Plan(opening=%s, exterior=%s, rooms=%d of which %d transformable, "
-                "paid=%d)" % (bool(self.opening_url), bool(self.exterior_url),
-                              len(self.rooms), len(self.transformable_rooms),
-                              self.images_paid))
+                "paid=%d, lost=%d)" % (bool(self.opening_url), bool(self.exterior_url),
+                                       len(self.rooms), len(self.transformable_rooms),
+                                       self.images_paid, self.images_lost))
 
 
 def reserve_budget(wanted, images_used_this_month):
@@ -568,33 +601,50 @@ def build_plan(exterior_url, room_urls, cache, generate_image, store_image,
             return None
         try:
             data = generate_image(prompt, source_urls, overall)
-        except fal_images.FalNotConfigured as e:
-            logger.warning("old-to-new: %s", e)
-            return None
-        except fal_images.FalRateLimited as e:
-            # NOT a degradation, and the one failure here the caller must act on rather
-            # than report: the picture is makeable, there is simply no room right now.
-            # Flagged and returned, so the images this pass DID pay for still reach the
-            # cache before the job goes back in the queue.
-            logger.warning("old-to-new: fal is at this account's concurrency limit "
-                           "(%s); the render will wait rather than lose the %s image",
-                           e, role)
-            plan.rate_limited = True
-            return None
-        except fal_images.FalRefused as e:
-            # The expected, designed-for failure. A refusal is not a fault.
-            logger.info("old-to-new: fal declined the %s image (%s)", role, e)
-            return None
         except Exception as e:
-            logger.warning("old-to-new: could not generate the %s image (%s: %s)",
-                           role, type(e).__name__, e)
+            # COUNT WHAT FAL BILLED, NOT WHAT ARRIVED. This single line is the second
+            # audit's most expensive finding. `images_paid` used to rise only after bytes
+            # came back, so five measured everyday shapes -- every collect attempt 502s, a
+            # non-JSON 200, a 200 shape we do not understand, COMPLETED with no picture,
+            # 429 throughout collection -- spent Jane's money and left the per-agent
+            # ceiling reading zero. fal_images.generate now reports the charge on the way
+            # out and billed_images reads it; anything injected here that has never heard
+            # of it reports 0, which is what it meant before.
+            billed = fal_images.billed_images(e)
+            plan.images_paid += billed
+            plan.images_lost += billed
+            if isinstance(e, fal_images.FalNotConfigured):
+                logger.warning("old-to-new: %s", e)
+            elif isinstance(e, fal_images.FalRateLimited):
+                # NOT a degradation, and the one failure here the caller must act on
+                # rather than report: the picture is makeable, there is simply no room
+                # right now. Flagged and returned, so the images this pass DID pay for
+                # still reach the cache before the job goes back in the queue.
+                #
+                # The flag now means "stop asking fal for more this pass" and nothing
+                # more. Whether to DEFER is the caller's decision and it turns on
+                # images_lost, because a 429 that arrives AFTER an accepted submit has
+                # already been paid for and a deferral would pay for it again.
+                logger.warning("old-to-new: fal is at this account's concurrency limit "
+                               "(%s); not asking it for more pictures in this pass", e)
+                plan.rate_limited = True
+            elif isinstance(e, fal_images.FalRefused):
+                # The expected, designed-for failure. A refusal is not a fault -- though
+                # fal's COMPLETED-with-no-picture decline is a refusal we were charged
+                # for, which is why the count above happens before this branching.
+                logger.info("old-to-new: fal declined the %s image (%s)", role, e)
+            else:
+                logger.warning("old-to-new: could not generate the %s image (%s: %s)",
+                               role, type(e).__name__, e)
             return None
         plan.images_paid += 1
         try:
             url = store_image(role, key, data)
         except Exception as e:
             # We paid for this one and cannot keep it. Counted as paid above, so the
-            # accounting is honest even though we got nothing.
+            # accounting is honest even though we got nothing -- and counted as LOST, so
+            # the caller knows a retry of this pass would buy it a second time.
+            plan.images_lost += 1
             logger.warning("old-to-new: generated the %s image but could not store it "
                            "(%s)", role, e)
             return None
@@ -646,7 +696,12 @@ def build_plan(exterior_url, room_urls, cache, generate_image, store_image,
             f"{plain_rooms} room(s) could not be redesigned, so they are shown as they "
             "are today")
 
-    logger.info("old-to-new plan: %r, %d image(s) generated (about US$%.2f)",
+    logger.info("old-to-new plan: %r, %d image(s) billed (about US$%.2f)%s",
                 plan, plan.images_paid,
-                plan.images_paid * fal_images.COST_PER_IMAGE_USD)
+                plan.images_paid * fal_images.COST_PER_IMAGE_USD,
+                ("; %d of them BILLED AND LOST (about US$%.2f spent with nothing to "
+                 "cache, so a retry of this pass would buy them again)"
+                 % (plan.images_lost,
+                    plan.images_lost * fal_images.COST_PER_IMAGE_USD))
+                if plan.images_lost else "")
     return plan

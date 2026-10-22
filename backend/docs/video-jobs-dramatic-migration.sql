@@ -1,6 +1,22 @@
 -- NestList -- let the render queue accept the Dramatic video, and make "one video job
 --             per listing" a rule the database enforces
 -- ============================================================================
+-- RUN old-to-new-images-migration.sql FIRST, THEN THIS ONE.
+--
+--   1. first   old-to-new-images-migration.sql
+--   2. then    THIS FILE   (video-jobs-dramatic-migration.sql)
+--
+-- The order matters for money. The other file is what remembers the AI pictures (so
+-- they are paid for once) and what counts each agent's monthly allowance. This file is
+-- what lets Dramatic videos run on the proper render queue. Run this one first and the
+-- queue starts accepting and retrying Dramatic renders while nothing is remembering the
+-- pictures and nothing is counting the spending -- the worst combination there is.
+--
+-- Run in the order above there is no bad window: until the other file has run, the
+-- backend does not offer the Dramatic style at all.
+--
+-- Both files are safe to run twice, and neither needs a deploy or a restart.
+-- ============================================================================
 -- WHAT THIS IS FOR
 -- Agents can now choose between two video styles, Classic and Dramatic ("From Old to
 -- New"). The render queue table was built when there was only one style, and two things

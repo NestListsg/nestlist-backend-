@@ -508,7 +508,7 @@ check("and it lets the queue accept 'dramatic' at all -- the live check constrai
       "allows only classic and signature",
       "video_jobs_type_check" in _vjmig and "'dramatic'" in _vjmig)
 check("the Dramatic has its own fleet-wide cap, because fal is the constraint",
-      video_jobs.JOB_TYPES[video_jobs.JOB_TYPE_DRAMATIC].account_limit == 2)
+      video_jobs.JOB_TYPES[video_jobs.JOB_TYPE_DRAMATIC].account_limit == 1)
 check("startup registers both renderers",
       "video_jobs.JOB_TYPE_DRAMATIC,\n" in src and "_dramatic_job_run" in src)
 
@@ -525,7 +525,8 @@ LISTING = {"id": "l1", "images": ["https://x/%d.jpg" % i for i in range(6)],
            "video_status": None}
 
 
-def run_endpoint(fal_on=True, active=None, stored=None, **params):
+def run_endpoint(fal_on=True, active=None, stored=None, ceiling_ok=True,
+                 queue_up=True, inprocess_busy=0, **params):
     seen = {}
     listing = dict(LISTING)
     if stored is not None:
@@ -539,7 +540,7 @@ def run_endpoint(fal_on=True, active=None, stored=None, **params):
         # response can never say "rendering" with no queued/running truth in it.
         STATUS_QUEUED = "queued"
         @staticmethod
-        def available(): return True
+        def available(): return queue_up
         @staticmethod
         def enqueue(job_type, listing_id, agent_id, payload):
             seen["job_type"] = job_type
@@ -568,6 +569,14 @@ def run_endpoint(fal_on=True, active=None, stored=None, **params):
              _job_type_for_template=lambda t: {"dramatic": "dramatic"}.get(t, "classic"),
              fal_images=types.SimpleNamespace(is_enabled=lambda: fal_on),
              _video_render_tasks=set(),
+             # The money gate: without the monthly tally columns there is no ceiling and
+             # no cache, so the endpoint declines the Dramatic rather than spending with
+             # no limit. See main._old_to_new_ceiling_enforceable.
+             _old_to_new_ceiling_enforceable=lambda: ceiling_ok,
+             # The in-process fallback's own cap. `inprocess_busy` stands for renders this
+             # process already has in flight on that path.
+             MAX_INPROCESS_DRAMATIC_RENDERS=2,
+             _dramatic_inprocess_tasks=set(range(inprocess_busy)),
              _render_video_job=lambda *a: seen.setdefault("legacy", "classic"),
              _render_dramatic_job=lambda *a: seen.setdefault("legacy", "dramatic"))
     for nm in ("_find_active_video_job", "generate_video"):
@@ -641,6 +650,45 @@ resp, seen = run_endpoint(video_template_id="dramatic",
 check("pressing Generate twice on the SAME style still goes through enqueue, where "
       "the database index is the thing that stops a double render",
       seen.get("job_type") == "dramatic")
+
+# ---------------------------------------------------------------------------
+# THE MONEY GATE. Without the monthly tally columns there is no ceiling AND no picture
+# cache, so every press would pay again and nothing would count it. The second audit
+# found the probe that knows this was read by nothing; it is now the gate.
+resp, seen = run_endpoint(video_template_id="dramatic", ceiling_ok=False)
+check("with no monthly picture tally to count against, a Dramatic request is refused "
+      "NOW rather than spending with no ceiling",
+      isinstance(resp, tuple) and resp[0] == "HTTP" and resp[1] == 400
+      and "not switched on" in resp[2], str(resp))
+check("and nothing was queued", "job_type" not in seen)
+resp, seen = run_endpoint(stored="dramatic", ceiling_ok=False)
+check("a listing that REMEMBERS Dramatic renders the Classic instead, rather than "
+      "refusing an agent their own listing for a reason they cannot see",
+      seen.get("job_type") == "classic", str(seen.get("job_type")))
+resp, seen = run_endpoint(video_template_id="classic", ceiling_ok=False)
+check("and the Classic is untouched by any of it", seen.get("job_type") == "classic")
+
+# ---------------------------------------------------------------------------
+# THE IN-PROCESS FALLBACK'S OWN CAP. Reached only while the video_jobs table is absent,
+# which is every Dramatic render until the queue migration runs. Its only other lock is
+# per LISTING, so one agent with ten listings used to get ten concurrent PAID generation
+# passes onto one agent row.
+resp, seen = run_endpoint(queue_up=False, video_template_id="dramatic")
+check("with no queue table, a Dramatic still renders in-process",
+      seen.get("legacy") == "dramatic", str(seen))
+resp, seen = run_endpoint(queue_up=False, video_template_id="dramatic",
+                          inprocess_busy=2)
+# A tuple when the endpoint raised an HTTPException, a dict when it went ahead. Spelled
+# out rather than indexed, so a version that goes ahead FAILS this check instead of
+# raising a KeyError in the test.
+check("but the third concurrent one is refused with a plain 409, not started",
+      isinstance(resp, tuple) and resp[0] == "HTTP" and resp[1] == 409
+      and "already being prepared" in resp[2], str(resp))
+check("and no render was kicked off for it", "legacy" not in seen)
+resp, seen = run_endpoint(queue_up=False, video_template_id="classic",
+                          inprocess_busy=2)
+check("the cap is on the DRAMATIC only -- a Classic is not blocked by it",
+      seen.get("legacy") == "classic", str(resp))
 
 
 print("\n%d passed, %d failed" % (P, F))
