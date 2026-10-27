@@ -114,8 +114,9 @@ for raw, exp in [
         ("**A *very* rare home**", "A very rare home"),
         ("# Welcome Home", "Welcome Home"), ("## The Living Spaces\nLight-filled.", "The Living Spaces\nLight-filled."),
         ("###### Deep", "Deep"),
-        ("* Pool\n* Gym", "Pool\nGym"), ("- Pool\n- Gym", "Pool\nGym"), ("• Pool", "Pool"),
-        ("  - indented bullet", "  indented bullet"),
+        ("* Pool\n* Gym", "• Pool\n• Gym"), ("- Pool\n- Gym", "• Pool\n• Gym"),
+        ("  - indented bullet", "  • indented bullet"), ("*   wide gap", "• wide gap"),
+        ("* **Pool** view", "• Pool view"),
         ("Intro\n---\nBody", "Intro\n\nBody"), ("Intro\n***\nBody", "Intro\n\nBody"),
         ("*Line one*\n*Line two*", "Line one\nLine two")]:
     check(f"{raw!r} -> {exp!r}", SM(raw) == exp, repr(SM(raw)))
@@ -128,12 +129,13 @@ for keep in ["Rated 5* by residents", "5* and 4* reviews", "3*4 metres", "2 * 3 
              "Your Vision. Your Legacy.", "Your Home. Your Next Chapter.", "a * b * c", "CEA Reg No: R123456A",
              "Janel Chee | 9123 4567\nCEA Reg No: R123456A\nAgency: NL Realty Pte Ltd (Licence No: L3008899K)",
              "Tenure: 99-year leasehold", "2-storey, 4 bedrooms", "**", "*", "_", "", "Pool\nGym\n\nGarden",
-             "Price: 1,200,000 (negotiable)", "co-op_", "_x", "x_"]:
+             "Price: 1,200,000 (negotiable)", "co-op_", "_x", "x_", "• Pool", "• Pool\n• Gym",
+             "  • indented", "-", "- ", "*bold*text"]:
     check(f"untouched: {keep!r}", SM(keep) == keep, repr(SM(keep)))
 check("None / '' safe", SM(None) is None and SM("") == "")
 
 print("\n[4] idempotent")
-for raw in [TESTEC, "**A *very* rare home**", "# H\n* a\n- b\n---\n__x__ _y_"]:
+for raw in [TESTEC, "**A *very* rare home**", "# H\n* a\n- b\n---\n__x__ _y_", "• a\n- b\n* c"]:
     once = SM(raw)
     check(f"twice == once for {raw[:20]!r}", SM(once) == once)
 
@@ -187,7 +189,7 @@ run_nodes("_generate_listing_text_only", "_resolve_writeup_district", "_writeup_
           "generate_listing", "_public_listing_payload", "_pg_export_price", "_pg_export_count", "_pg_export_measure",
           "_build_propertyguru_text_block")
 LR = NS["ListingRequest"]
-EXPECT = "TEST LISTING – please ignore.\n\nLiving\nBright airy spaces\n\nYour Home. Your Next Chapter."
+EXPECT = "TEST LISTING – please ignore.\n\nLiving\n• Bright airy spaces\n\nYour Home. Your Next Chapter."
 for ptype, photos in (("Semi-Detached", []), ("Condominium", []), ("Semi-Detached", ["https://img/1.jpg"]),
                       ("Condominium", ["https://img/1.jpg"])):
     DB.log.clear()

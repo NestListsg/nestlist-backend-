@@ -1819,13 +1819,14 @@ def _strip_price_leaks(text: str, price, built_up) -> tuple:
 #     at a word boundary (not glued to a letter or digit on the outside) and hugs the text
 #     on the inside, all on one line;
 #   * a heading marker ("#".."######" + a space) at the start of a line;
-#   * a bullet marker ("* " / "- " / "• ") at the start of a line;
+#   * a markdown bullet ("* " / "- ") at the start of a line becomes "• " -- the agent's
+#     list keeps its markers; an existing "• " is left exactly as it is;
 #   * a line that is nothing but ---, *** or ___ (a horizontal rule).
 # Left alone: "5*" / "5-star", 3*4, prices, URLs, emails, snake_case, hashtags
 # (#NestListHome -- "#" with no space), "-5%", the CEA block. Idempotent; never raises.
 # ================================
 _MD_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.MULTILINE)
-_MD_BULLET_RE = re.compile(r"^([ \t]*)[*\-•][ \t]+(?=\S)", re.MULTILINE)
+_MD_BULLET_RE = re.compile(r"^([ \t]*)[*\-][ \t]+(?=\S)", re.MULTILINE)
 _MD_RULE_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$", re.MULTILINE)
 _MD_STRONG_RE = re.compile(r"(?<![\w*])(\*\*\*|\*\*|__)(?=[^\s*_])([^\n]*?[^\s*_])\1(?![\w*])")
 _MD_STAR_RE = re.compile(r"(?<![\w*])\*(?=[^\s*])([^\n*]*?[^\s*])\*(?![\w*])")
@@ -1839,7 +1840,7 @@ def _strip_markdown(text):
         out = str(text)
         out = _MD_RULE_RE.sub("", out)
         out = _MD_HEADING_RE.sub("", out)
-        out = _MD_BULLET_RE.sub(r"\1", out)
+        out = _MD_BULLET_RE.sub(r"\1• ", out)
         for _ in range(4):      # nested wrappers ("**a *b* c**") peel layer by layer
             new = _MD_STRONG_RE.sub(r"\2", out)
             new = _MD_STAR_RE.sub(r"\1", new)
