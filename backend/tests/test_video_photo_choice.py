@@ -94,7 +94,15 @@ def install_stubs(mod, unreadable=()):
     mod._generate_room_captions = lambda photos, copy_guard=None: (["cap(%s)" % p for p in photos], None)
     mod._caption_font_size = lambda captions: 1
     def contain(photo, clip_path, workdir, i, **kw):
-        calls.append((photo, i, kw.get("caption"), kw.get("zoom_in"), kw.get("first"), kw.get("last")))
+        # WHICH photo, in which slot, with which caption and which end-of-film flags.
+        # Deliberately NOT the camera move: this file guards photo CHOICE, and the
+        # camera deliberately changed on 2026-10-27 (bolder, varied, 4.0s a shot). The
+        # [no-regression] block below diffs this against the previously committed
+        # renderer, so recording the move here would quietly turn this file into a
+        # second golden for the camera and make it impossible to ever change one
+        # without the other. tests/golden/classic_commands.txt is where the camera is
+        # pinned, deliberately and visibly.
+        calls.append((photo, i, kw.get("caption"), kw.get("first"), kw.get("last")))
         write(clip_path, "[%s|%s|%s|%s]" % (photo, i, kw.get("first"), kw.get("last")))
     mod._contain_clip = contain
     def join(paths, out):
@@ -171,7 +179,7 @@ urls = ["https://x/%d.jpg" % i for i in range(8)]
 r = render(new, urls, 0, video_photos=[urls[5], urls[2], urls[7]])
 check("exactly the chosen photos, in the chosen order", r[0] == "ok" and order(r) == [urls[5], urls[2], urls[7]], str(order(r)))
 check("no degradation on a clean choice", r[2] == [] or r[2] == ["the background music file is missing from the deploy"], str(r[2]))
-check("first chosen opens, last chosen closes (fade flags)", r[4][0][4] is True and r[4][-1][5] is True)
+check("first chosen opens, last chosen closes (fade flags)", r[4][0][3] is True and r[4][-1][4] is True)
 r = render(new, urls, 4, video_photos=[urls[1], urls[0]])
 check("photo_index is ignored when photos are chosen", order(r) == [urls[1], urls[0]])
 check("captions come back for exactly the chosen photos", set(r[3]) == {urls[1], urls[0]})

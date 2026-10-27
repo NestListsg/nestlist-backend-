@@ -11,7 +11,7 @@ WHY -- the motion the Classic is supposed to have -- so that a careless
 2026-10-21. The Signature-only tests went with the tier; the golden guard and the
 Classic checks are what is left, which is what the file was really for.)
 """
-import os, re, subprocess, sys, types
+import io, os, re, subprocess, sys, types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PIL import Image
 import video_renderer as vr
@@ -191,6 +191,12 @@ def matrix():
         CLASSIC_ARGS, video_photos=["https://example.test/c.jpg",
                                     "https://example.test/a.jpg"])
     yield "classic-portrait-sources", dict(PORTRAIT_ARGS)
+    # THE SHAPE PRODUCTION ACTUALLY HAS. Every photo on the live listing is 800x600
+    # (measured 2026-10-27, and none of them has an upscaled twin), which is the size
+    # that decides the per-shot zoom ceiling -- see _motion_zoom_ceiling. Without this
+    # row the whole matrix renders 1600px sources and the golden never pins the ceiling
+    # the agents' own photos are given.
+    yield "classic-production-800x600", dict(CLASSIC_ARGS)
     # A survey that SUCCEEDED: it chose four of the twelve photos and wrote captions
     # for three of them. Pins that the renderer uses the chosen photos in the chosen
     # order, burns in the captions it was handed WITHOUT a second model call, and
@@ -201,10 +207,13 @@ def matrix():
 def render_matrix():
     """{name: [normalised ffmpeg commands]} for the whole matrix."""
     out = {}
-    tall = photo(1000, 2400)          # taller than 9:16 -> the no-drift branch
+    tall = photo(1000, 2400)          # taller than 9:16 -> tilts instead of drifting
+    small = photo(800, 600)           # the size the live listing's photos really are
     for name, kwargs in matrix():
         if name == "classic-portrait-sources":
             kwargs = dict(kwargs, src_photo=tall)
+        if name == "classic-production-800x600":
+            kwargs = dict(kwargs, src_photo=small)
         cmds, _ = capture(vr, **kwargs)
         out[name] = [norm(c) for c in cmds]
     return out
@@ -254,7 +263,73 @@ else:
 
 # The golden pins WHAT is rendered. These pin WHY, so that a careless
 # --update-golden cannot quietly undo the thing the golden was written for.
+#
+# REWRITTEN 2026-10-27, when the golden was regenerated DELIBERATELY. Up to then every
+# shot did one move -- a straight ramp to CONTAIN_ZOOM_MAX, full-width drift, 5.0s --
+# and these checks pinned the four ways its two booleans could be arranged. Identical
+# movement on every frame is what read as a slideshow, so the booleans are gone and
+# what is pinned now is VARIETY: that the shots differ from each other, that one of them
+# holds nearly still, that one of them overshoots and comes back, and that none of them
+# is allowed to go soft. The zoom numbers themselves are the move table's business.
 print("\n[1b] the motion the Classic is supposed to have")
+
+
+def part_of(vf, key):
+    """The z / x / y expression out of one clip's zoompan, quotes stripped."""
+    return re.search(r"[:=]%s='([^']*)'" % key, vf).group(1)
+
+
+def evaluate(expr, frame):
+    """What ffmpeg will compute for this expression at this frame.
+
+    An INDEPENDENT reader of the string the renderer actually emits, rather than a
+    second call into the renderer's own knot arithmetic -- otherwise these checks would
+    only prove the module agrees with itself. The grammar is narrow: nested
+    if(lt(on,N),THEN,ELSE) over leaves of the form a+b*(on-c)/d, or a bare number.
+    """
+    expr = expr.strip()
+    while expr.startswith("(") and expr.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(expr):
+            depth += (ch == "(") - (ch == ")")
+            if depth == 0 and i < len(expr) - 1:
+                break
+        else:
+            expr = expr[1:-1].strip()
+            continue
+        break
+    if expr.startswith("if(lt(on,"):
+        rest = expr[len("if(lt(on,"):]
+        limit, rest = rest.split(")", 1)
+        rest = rest.lstrip(",")
+        depth, cut = 0, None
+        for i, ch in enumerate(rest):
+            depth += (ch == "(") - (ch == ")")
+            if ch == "," and depth == 0:
+                cut = i
+                break
+        then, other = rest[:cut], rest[cut + 1:]
+        if other.endswith(")"):
+            other = other[:-1]
+        return evaluate(then if frame < float(limit) else other, frame)
+    m = re.fullmatch(r"(-?[\d.]+)\+(-?[\d.]+)\*\(on-(\d+)\)/(\d+)", expr)
+    if m:
+        a, b, c, d = (float(g) for g in m.groups())
+        return a + b * (frame - c) / d
+    return float(expr)
+
+
+def shot(vf):
+    """(zooms, x fractions, y fractions) over every frame of one clip."""
+    z, x, y = (part_of(vf, "z"),
+               part_of(vf, "x").replace("*(iw-iw/zoom)", ""),
+               part_of(vf, "y").replace("*(ih-ih/zoom)", ""))
+    frames = range(vr.FRAMES_PER_PHOTO)
+    return ([evaluate(z, f) for f in frames],
+            [evaluate(x, f) for f in frames],
+            [evaluate(y, f) for f in frames])
+
+
 photo_vfs = [vf_of(c) for c in rendered["classic-12-photos-caps-at-10"]
              if "zoompan" in vf_of(c)]
 check("ten photos render ten moving clips (cap raised 6 -> 10)",
@@ -266,30 +341,191 @@ check("no clip uses the feedback zoom form that silently does nothing",
       not any("min(zoom+" in v or "max(zoom-" in v for v in photo_vfs),
       next((v for v in photo_vfs if "min(zoom+" in v), ""))
 check("every clip's zoom is driven by the frame number",
-      all(re.search(r"zoompan=z='[^']*\bon/\d+", v) for v in photo_vfs))
-check("every clip drifts sideways across the photo",
-      all("(iw-iw/zoom)" in v for v in photo_vfs))
-check("the drift is bounded by the zoom's spare width, so it cannot leave the photo",
-      all(re.search(r"x='[0-9.]+\*(\(1-)?on/\d+\)?\*\(iw-iw/zoom\)", v)
-          for v in photo_vfs))
-zoom_in = [("1+%s*on" % round(vr.CONTAIN_ZOOM_MAX - 1.0, 6)) in v for v in photo_vfs]
-drift_right = [("'%s*on/" % vr.CONTAIN_DRIFT_SPAN) in v for v in photo_vfs]
-check("the zoom alternates in and out", zoom_in[:4] == [True, False, True, False],
-      str(zoom_in))
-check("the drift alternates left and right on a different period",
-      drift_right[:4] == [True, True, False, False], str(drift_right))
-check("so ten shots cycle through four moves, not two",
-      len(set(zip(zoom_in, drift_right))) == 4,
-      str(sorted(set(zip(zoom_in, drift_right)))))
-# A source taller than 9:16 does not reach the sides of its own composite, so
-# drifting it would slide the sharp photo around inside blurred margins.
+      all(re.search(r"zoompan=z='[^']*\bon\b", v) for v in photo_vfs))
+check("the pan is a fraction of the zoom's OWN spare on both axes, so no move can "
+      "leave the photo at any zoom and a gentle shot cannot drift far",
+      all(part_of(v, "x").endswith("*(iw-iw/zoom)")
+          and part_of(v, "y").endswith("*(ih-ih/zoom)") for v in photo_vfs))
+
+shots = [shot(v) for v in photo_vfs]
+check("no shot ever zooms below 1.0, which is what would show a black edge",
+      all(min(zs) >= 1.0 - 1e-9 for zs, _x, _y in shots),
+      "%.4f" % min(min(zs) for zs, _x, _y in shots))
+check("every pan fraction stays inside 0..1 on both axes",
+      all(all(0.0 - 1e-9 <= p <= 1.0 + 1e-9 for p in xs + ys)
+          for _z, xs, ys in shots))
+# THE POINT OF THE WHOLE CHANGE. Ten shots used to be four arrangements of one move.
+peaks = [round(max(zs), 3) for zs, _x, _y in shots]
+check("ten shots do NOT all do the same thing (%d different zoompan expressions)"
+      % len(set(photo_vfs)), len(set(photo_vfs)) >= 6, str(peaks))
+check("and no two NEIGHBOURING shots move alike",
+      all(photo_vfs[i] != photo_vfs[i + 1] for i in range(len(photo_vfs) - 1)))
+# Judged against the ceiling rather than against a fixed zoom, because the ceiling is
+# the photograph's and the matrix renders several sizes.
+room = vr._motion_zoom_ceiling((1600, 1067)) - 1.0
+check("at least one shot is near-static -- the contrast that makes the others read "
+      "as movement (quietest peak %.3f)" % min(peaks),
+      min(peaks) <= 1.0 + 0.15 * room, str(peaks))
+check("at least one shot pushes all the way to the photograph's ceiling "
+      "(hardest peak %.3f of %.3f)" % (max(peaks), 1.0 + room),
+      max(peaks) >= 1.0 + 0.95 * room, str(peaks))
+check("at least one shot OVERSHOOTS and settles back -- the move the old straight "
+      "z0->z1 ramp could not make at all",
+      any(max(zs) > zs[-1] + 0.02 and max(zs) > zs[0] + 0.02
+          for zs, _x, _y in shots))
+check("at least one shot PULLS OUT, starting tight and widening",
+      any(zs[0] > zs[-1] + 0.2 for zs, _x, _y in shots))
+check("the pan travels in both senses across a film, not always one way",
+      len({xs[-1] > xs[0] for _z, xs, _y in shots}) == 2)
+drift = [abs(xs[-1] - xs[0]) * (max(zs) - 1.0) for zs, xs, _y in shots]
+check("no shot slides the picture further than %.0f%% of the frame's width -- the "
+      "drift speed Jane approved (worst %.1f%%)"
+      % (vr.CAMERA_DRIFT_MAX_FRAME_FRACTION * 100, max(drift) * 100),
+      max(drift) <= vr.CAMERA_DRIFT_MAX_FRAME_FRACTION + 1e-6, str(drift))
+
+# A source taller than 9:16 does not reach the SIDES of its own composite, so drifting
+# it sideways would slide the sharp photo around inside blurred margins. It does reach
+# the top and bottom, so that is the axis it is allowed to move on -- and it is new:
+# these shots used to be pinned dead centre on both axes.
 tall_vfs = [vf_of(c) for c in rendered["classic-portrait-sources"]
             if "zoompan" in vf_of(c)]
-check("a photo taller than the frame keeps the centred zoom, no drift",
-      tall_vfs and all("iw/2-(iw/zoom/2)" in v for v in tall_vfs), str(tall_vfs[:1]))
-check("and still zooms", all("zoompan=z='1+" in v or "zoompan=z='%s-" % vr.CONTAIN_ZOOM_MAX
-                             in v for v in tall_vfs))
+tall = [shot(v) for v in tall_vfs]
+check("a photo taller than the frame does not drift sideways",
+      tall and all(len(set(round(p, 9) for p in xs)) == 1 and abs(xs[0] - 0.5) < 1e-9
+                   for _z, xs, _y in tall), str(tall_vfs[:1]))
+check("it TILTS vertically instead, which is the axis it has room on",
+      any(len(set(round(p, 6) for p in ys)) > 1 for _z, _x, ys in tall))
+check("and it still zooms", all(max(zs) > min(zs) + 0.005 for zs, _x, _y in tall))
+
+# The softness guard. The live listing's photos are 800x600 and have no upscaled twin,
+# so this is the ceiling the agents' own photos are really given.
+prod_vfs = [vf_of(c) for c in rendered["classic-production-800x600"]
+            if "zoompan" in vf_of(c)]
+prod_peak = max(max(zs) for zs, _x, _y in (shot(v) for v in prod_vfs))
+check("on the 800x600 photos production really has, no shot pushes past %.2f "
+      "(measured: 0.63 of the acutance of the 1.20 frame Jane approved; 2.20 would "
+      "be 0.17) -- hardest shot %.3f" % (vr._motion_zoom_ceiling((800, 600)),
+                                         prod_peak),
+      prod_peak <= vr._motion_zoom_ceiling((800, 600)) + 1e-6)
+check("that ceiling is never BELOW the look Jane already approved",
+      vr._motion_zoom_ceiling((800, 600)) >= vr.CONTAIN_ZOOM_MAX)
 check("delivery CRF is the measured 24", vr.DELIVERY_CRF == "24")
+
+
+# ---------------------------------------------------------------------------
+print("\n[1c] a regenerate is not a lottery, and no move can leave the photograph")
+# ---------------------------------------------------------------------------
+# DETERMINISM. An agent who regenerates a video must get the same film back. The camera
+# plan is seeded from the listing id (main.py passes it as music_seed), so this has to
+# hold across two separate renders in the same process -- which is also where a stray
+# random.seed() or a dict-ordering dependency would show up.
+again, _ = capture(vr, **MANY_ARGS)
+check("TWO RENDERS OF ONE LISTING ARE THE SAME FILM, camera and all",
+      [norm(c) for c in again] == rendered["classic-12-photos-caps-at-10"])
+check("and the camera plan itself is stable",
+      [m["name"] for m in vr._camera_plan(10, "listing-42")]
+      == [m["name"] for m in vr._camera_plan(10, "listing-42")])
+other = capture(vr, **dict(MANY_ARGS, music_seed="listing-77"))[0]
+check("a DIFFERENT listing does not get the same camera, so two agents' films do not "
+      "open with the same shot",
+      [vf_of(c) for c in other if "zoompan" in vf_of(c)] != photo_vfs)
+_SRC = io.open(os.path.join(BACKEND, "video_renderer.py"), encoding="utf-8").read()
+check("nothing here reaches for randomness -- no random module, no unseeded draw",
+      not re.search(r"^\s*(import random|from random import)", _SRC, re.M)
+      and "random.random" not in _SRC and "random.shuffle" not in _SRC
+      and "random.seed" not in _SRC)
+check("the camera plan is seeded by hashing, which has no global state a later render "
+      "in the same worker could inherit",
+      "hashlib.sha256" in _SRC[_SRC.index("def _camera_plan"):
+                               _SRC.index("def _contain_clip")])
+
+# THE PANNABLE AREA, proved rather than asserted. The window zoompan crops must stay
+# inside the SHARP photograph -- not merely inside the composite, because the composite
+# has blurred margins on one axis and sliding the photo around inside those reads as a
+# layout fault. Swept over every move and every source shape that composites
+# differently, evaluating the real expression at every frame.
+print("  (sweeping %d moves x 6 source shapes x %d frames)"
+      % (len(vr.CAMERA_MOVES), vr.FRAMES_PER_PHOTO))
+worst = []
+for size in [(800, 600), (1600, 1067), (1920, 1280), (1080, 1920), (1000, 2400),
+             (1200, 1200)]:
+    fg_w, fg_h = vr._contain_foreground_box(size)
+    full_w, full_h = vr.VW * vr.UPSCALE, vr.VH * vr.UPSCALE
+    for move in vr.CAMERA_MOVES:
+        z, x, y, _k = vr._camera_expressions(move, size, vr.FRAMES_PER_PHOTO)
+        xs = x.replace("*(iw-iw/zoom)", "")
+        ys = y.replace("*(ih-ih/zoom)", "")
+        for frame in range(vr.FRAMES_PER_PHOTO):
+            zoom = evaluate(z, frame)
+            for full, fg, frac in ((full_w, fg_w, evaluate(xs, frame)),
+                                   (full_h, fg_h, evaluate(ys, frame))):
+                window = full / zoom
+                near = frac * (full - window)
+                # The sharp photo's own band inside the composite.
+                lo, hi = (full - fg) / 2.0, (full + fg) / 2.0
+                if window >= fg:
+                    # The window is wider than the photo on this axis, so it MUST show
+                    # blurred margin -- the requirement is that the margin stays EVEN,
+                    # which is the one position that does not read as a layout fault.
+                    # Checked on the realised pixel position, not on the fraction: at
+                    # zoom 1.0 there is no spare at all and every fraction lands here.
+                    ok = abs(near - (full - window) / 2.0) < 1e-6
+                else:
+                    ok = near >= lo - 1e-6 and near + window <= hi + 1e-6
+                if not ok:
+                    worst.append((size, move["name"], frame, round(zoom, 4),
+                                  round(frac, 4)))
+check("no move, on any source shape, at any frame, puts the frame outside the sharp "
+      "photograph", not worst, str(worst[:3]))
+check("and every move really does move something (so the sweep is not vacuous)",
+      all(max(vr._zoom_at(vr._camera_expressions(m, (800, 600),
+                                                 vr.FRAMES_PER_PHOTO)[3], f)
+              for f in range(vr.FRAMES_PER_PHOTO))
+          > 1.0 + 1e-6 for m in vr.CAMERA_MOVES))
+
+# The table's own invariants, checked over the table rather than over one film.
+check("every move names itself, and the names are unique",
+      len({m["name"] for m in vr.CAMERA_MOVES}) == len(vr.CAMERA_MOVES))
+check("every move's zoom amounts are fractions in 0..1, so no move can ask for a zoom "
+      "below 1.0 or above the photograph's own ceiling",
+      all(0.0 <= a <= 1.0 for m in vr.CAMERA_MOVES for _t, a in m["zoom"]))
+check("every move's waypoints run from the start of the shot to its end",
+      all(m["zoom"][0][0] == 0.0 and m["zoom"][-1][0] == 1.0
+          for m in vr.CAMERA_MOVES))
+check("every move's drift is in -1..+1",
+      all(-1.0 <= d <= 1.0 for m in vr.CAMERA_MOVES
+          for key in ("drift", "cross") for _t, d in m.get(key) or ()))
+check("the table covers the six shapes the brief asked for",
+      {m["name"] for m in vr.CAMERA_MOVES} >= {
+          vr.MOVE_SLOW_PUSH, vr.MOVE_HARD_PUSH, vr.MOVE_PUSH_SETTLE,
+          vr.MOVE_PULL_OUT, vr.MOVE_HOLD, vr.MOVE_DIAGONAL})
+check("a film of three or more always contains the near-static shot",
+      all(any(m["name"] == vr.MOVE_HOLD for m in vr._camera_plan(n, "listing-%d" % n))
+          for n in range(3, 13)))
+# These go out as Reels and Stories. Opening on the shot that deliberately holds still
+# wastes the one second that decides whether anybody watches -- which is exactly what
+# the demo listing's seed did on the first real render.
+check("but it NEVER opens the film",
+      all(vr._camera_plan(n, "seed-%d" % s)[0]["name"] != vr.MOVE_HOLD
+          for n in range(1, 13) for s in range(40)))
+check("and no film ever repeats a move back to back",
+      all(all(p[i]["name"] != p[i + 1]["name"] for i in range(len(p) - 1))
+          for p in (vr._camera_plan(n, "seed-%d" % s)
+                    for n in range(1, 13) for s in range(8))))
+# _contain_foreground_box is a third statement of arithmetic two other functions do
+# inline, on purpose (the Classic composite is pinned command-for-command and must not
+# be refactored underneath the golden). The copies must not drift.
+box_ok = []
+for size in [(800, 600), (1600, 1067), (1000, 2400), (1200, 1200), (1080, 1920)]:
+    src = photo(*size)
+    composite, fills = vr._contain_over_blur(src)
+    _bd, dramatic_box, _off = vr._dramatic_backdrop(src)
+    mine = vr._contain_foreground_box(size)
+    box_ok.append((mine == dramatic_box, (mine[0] >= composite.size[0]) == fills))
+check("the camera's idea of where the photo sits agrees with _dramatic_backdrop's",
+      all(a for a, _b in box_ok), str(box_ok))
+check("and with _contain_over_blur's own fills_width answer",
+      all(b for _a, b in box_ok), str(box_ok))
 
 after, _ = capture(vr, **CLASSIC_ARGS)
 

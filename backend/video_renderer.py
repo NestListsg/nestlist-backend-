@@ -60,8 +60,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 VW, VH = 1080, 1920  # 9:16 -- these videos are posted to Reels, Stories and TikTok
 FPS = 24
-SECONDS_PER_PHOTO = 5.0
-FRAMES_PER_PHOTO = int(SECONDS_PER_PHOTO * FPS)  # 120
+# 4.0, down from 5.0 on 2026-10-27. Jane watched a competitor's reel beside ours and
+# ours read as entry-level; the shot lengths were measured at 3.5-4.0s against our flat
+# 5.0. MEASURED CONSEQUENCES, all three of them, because this number is load-bearing in
+# more places than the clip length:
+#   * film length. A ten-photo Classic is 28.75s of photos instead of 38.75s
+#     (n*SECONDS_PER_PHOTO - (n-1)*XFADE_SECONDS), plus the 5.5s closing card.
+#   * music fade. The fade-out is placed at (duration - AUDIO_FADE_OUT_SECONDS), so it
+#     simply moves earlier with the film; the shortest possible film (one photo) is
+#     still 9.8s against a 1.5s + 4.5s fade pair, so the two never collide.
+#   * the queue's ETA. That is a rolling mean of MEASURED render durations
+#     (video_jobs._average_duration), so it self-corrects; only the cold-start
+#     fallback is a constant, and it was re-measured with this change.
+#   * delivery size. Fewer frames, so smaller -- it moves AWAY from the ceiling.
+# THE COST, which is the thing to watch: XFADE_SECONDS did NOT change, so each middle
+# shot now has 1.5s to itself instead of 2.5s, and a caption's fully-opaque window
+# drops from 1.8s to 0.8s. See the note on XFADE_SECONDS.
+SECONDS_PER_PHOTO = 4.0
+FRAMES_PER_PHOTO = int(SECONDS_PER_PHOTO * FPS)  # 96
 
 # Motion works on an upscaled copy of the photo: at native size the per-frame crop
 # rectangle lands on whole pixels and slow motion visibly stair-steps. Upscaling first
@@ -101,6 +117,14 @@ STYLE_A_ID = "driftcut"
 # 1.25s = exactly 30 frames at 24fps. The round frame count matters: the dissolve is
 # assembled by cutting clips on frame boundaries (see _dissolve_segments), and a
 # transition length that isn't a whole number of frames cannot be cut cleanly.
+# DELIBERATELY NOT CHANGED when SECONDS_PER_PHOTO went 5.0 -> 4.0, and it is the open
+# question that change leaves behind. A 1.25s dissolve was 25% of a 5.0s shot and is now
+# 31% of a 4.0s one, so a shot has 1.5s to itself rather than 2.5s and part of every
+# camera move happens underneath a dissolve. Shortening it is not a one-line change: the
+# body segments are stream-copied from XFADE_SECONDS, which has to stay a whole number
+# of frames AND land on a keyframe, and the keyframe interval is -g 30 in _ENCODE_ARGS
+# (1.0s = frame 24 is NOT a keyframe). So it is left alone here and raised with Jane
+# instead of changed quietly.
 XFADE_SECONDS = 1.25
 XFADE_FRAMES = int(XFADE_SECONDS * FPS)  # 30
 # --- the house move: a zoom combined with a horizontal drift ---
@@ -142,18 +166,179 @@ XFADE_FRAMES = int(XFADE_SECONDS * FPS)  # 30
 # is showing the photo whole. Jane signed off 1.20 having watched it; moving it without
 # her watching again would be trading her judgement for mine.
 #
-# SHARPNESS IS NOT THE LIMIT at any of these: at 1.20 the crop window is still
-# 1800x3200 feeding a 1080x1920 output, i.e. downsampling 1.67x, so the frame cannot go
-# soft from the zoom itself. What a strong zoom DOES expose is a weak SOURCE, which is
-# why _fetch_listing_photo prefers the 4x upscaled twin -- that is the headroom this
-# setting spends.
+# THE PARAGRAPH THAT USED TO SIT HERE WAS WRONG, and it was wrong in the expensive
+# direction. It read "SHARPNESS IS NOT THE LIMIT: at 1.20 the crop window is still
+# 1800x3200 feeding a 1080x1920 output, i.e. downsampling 1.67x". That measures the
+# COMPOSITE, which _contain_over_blur has already scaled to 2160 wide whatever the photo
+# was -- so it says nothing at all about the photograph. The real sampling limit sits one
+# step earlier, at the source, and MEASURED on the live listing it is nowhere near as
+# comfortable as that sentence claimed. See _motion_zoom_ceiling.
+#
+# 1.20 survives as the FLOOR of the per-shot ceiling: it is the look Jane watched and
+# approved, so no photo is ever given less room to move than this.
 CONTAIN_ZOOM_MAX = 1.20
-CONTAIN_ZOOM_STEP = round((CONTAIN_ZOOM_MAX - 1.0) / FRAMES_PER_PHOTO, 6)
-# How much of the available spare width a shot actually travels. 1.0 means it runs
-# from one edge of the spare to the other. Kept as a constant rather than inlined
-# because it is the one dial that trades drift against how much of the photo's side
-# is off-frame at the far end of the move.
-CONTAIN_DRIFT_SPAN = 1.0
+
+# ---------------------------------------------------------------------------
+# THE CAMERA MOVE TABLE
+# ---------------------------------------------------------------------------
+# Until 2026-10-27 every shot in every Classic did exactly the same thing: a straight
+# ramp to CONTAIN_ZOOM_MAX, full-width drift, 5.0s, with only the SENSE of each
+# alternating. Identical movement on every frame is what reads as a slideshow, and that
+# is what Jane saw next to the competitor's reel. His was measured shot by shot:
+#
+#     his shot       zoom                       drift            shape
+#     living room    1.06 -> 1.40               small            smooth, accelerating
+#     bedroom        1.56 -> 2.20 -> 2.00       +210, -225px     punch in, pull back out
+#     double height  1.20 -> 1.78 -> 1.66 -> 2.18   +230, +125px breathes in and out
+#     pool           1.22                       small            gentle
+#     bathroom       1.04                       small            almost completely still
+#     terrace        1.36                       -100, -25px      push with sideways drift
+#
+# THE LESSON IS NOT "ZOOM HARDER". It is variety, and in particular the near-static
+# shot: the bathroom holding almost still is what makes the bedroom's punch read as
+# movement at all. So the table below covers six shapes and a film rotates through them.
+#
+# HOW A MOVE IS WRITTEN. Everything is a fraction, nothing is a pixel, because the same
+# table has to work on a 1.04x hold and a 1.40x push without a single pixel value being
+# re-checked:
+#
+#   "zoom"   ((t, amount), ...)  t is 0..1 of the shot. `amount` is 0..1 of the room
+#                                this shot has to move in, i.e. zoom = 1 + amount *
+#                                (ceiling - 1), where the ceiling comes from the
+#                                PHOTOGRAPH (see _motion_zoom_ceiling). amount is never
+#                                negative, so a shot can never zoom below 1.0 and no
+#                                frame can ever show a black edge.
+#                                Three or more waypoints make the move NON-MONOTONIC --
+#                                the old straight ramp from z0 to z1 could not overshoot
+#                                and come back, which is the one shape that reads like a
+#                                real operator rather than an effect.
+#   "ease"   how the zoom moves BETWEEN waypoints (see CAMERA_EASES). The ramp itself is
+#            piecewise linear in the frame number -- easing is expressed by expanding a
+#            waypoint pair into CAMERA_EASE_STEPS sub-knots, so it costs nothing but a
+#            slightly longer expression and reuses the frame-exact ramp the Dramatic
+#            already depends on.
+#   "drift"  ((t, d), ...)  d is -1..+1 of the travel this shot can AFFORD, along
+#            whichever axis the photograph actually has room on.
+#   "cross"  the same, on the other axis. Nearly always zero: see _pan_reach for why a
+#            landscape photo in this style has no vertical room at all.
+#
+# NOTHING HERE IS A PIXEL AND NOTHING HERE IS A SECOND, so this table is the one place
+# to change the look of the Classic's camera.
+CAMERA_EASE_STEPS = 4
+CAMERA_EASES = {
+    "linear": lambda u: u,
+    "accel": lambda u: u * u,                    # eases IN -- his living room
+    "decel": lambda u: u * (2.0 - u),            # eases OUT -- arriving somewhere
+    "smooth": lambda u: u * u * (3.0 - 2.0 * u),  # flat at both ends
+}
+
+MOVE_SLOW_PUSH = "slow-push"
+MOVE_HARD_PUSH = "hard-push"
+MOVE_PUSH_SETTLE = "push-and-settle"
+MOVE_PULL_OUT = "pull-out"
+MOVE_HOLD = "hold"
+MOVE_DIAGONAL = "diagonal-drift"
+
+CAMERA_MOVES = (
+    # A gentle push that builds. The reference shot, and the closest thing in the table
+    # to what every Classic shot used to be -- kept because a film of nothing but
+    # character shots is as monotonous as a film of none.
+    {"name": MOVE_SLOW_PUSH, "ease": "accel",
+     "zoom": ((0.0, 0.00), (1.0, 0.55)),
+     "drift": ((0.0, -0.55), (1.0, 0.25))},
+    # All the way to the ceiling. The one shot in a film that is allowed to be soft,
+    # which is why only one shot in a rotation is allowed to be this.
+    {"name": MOVE_HARD_PUSH, "ease": "accel",
+     "zoom": ((0.0, 0.10), (1.0, 1.00)),
+     "drift": ((0.0, 0.60), (1.0, -0.15))},
+    # In PAST the target and then eased back out of it. The move that reads most like a
+    # real operator, and the reason "zoom" takes more than two waypoints.
+    {"name": MOVE_PUSH_SETTLE, "ease": "smooth",
+     "zoom": ((0.0, 0.00), (0.62, 1.00), (1.0, 0.70)),
+     "drift": ((0.0, -0.70), (0.62, 0.30), (1.0, 0.10))},
+    # Starts tight and widens. The shot that gives a room away rather than hunting
+    # through it, and the only one that ENDS showing the photograph whole.
+    {"name": MOVE_PULL_OUT, "ease": "decel",
+     "zoom": ((0.0, 1.00), (1.0, 0.08)),
+     "drift": ((0.0, 0.55), (1.0, -0.25))},
+    # Nearly nothing. THE MOST IMPORTANT ROW IN THIS TABLE: it is the contrast that
+    # makes its neighbours feel like movement, it is the sharpest frame in the film
+    # (barely any upsampling), and a film is forced to contain one -- see _camera_plan.
+    {"name": MOVE_HOLD, "ease": "linear",
+     "zoom": ((0.0, 0.10), (1.0, 0.02)),
+     "drift": ((0.0, 0.10), (1.0, -0.10))},
+    # Travels on both axes at once. On a landscape photograph the cross axis has no room
+    # and this plays as a plain mid-strength drift with its own zoom shape; on a photo
+    # as tall as the frame or taller it is the real diagonal. Deliberately kept as its
+    # own row rather than folded away, because the geometry that limits it is a property
+    # of THIS style (see _pan_reach) and could change.
+    {"name": MOVE_DIAGONAL, "ease": "linear",
+     "zoom": ((0.0, 0.28), (1.0, 0.62)),
+     "drift": ((0.0, -0.85), (1.0, 0.85)),
+     "cross": ((0.0, -0.85), (1.0, 0.85))},
+)
+
+# How far the picture may slide across the frame over one shot, as a fraction of the
+# frame's width. 0.20 is not a taste: it is what the shipped 1.20 full-width drift
+# already does (a Δ of 1.0 in the pan fraction moves the picture by (zoom-1) frame
+# widths, so 1.0 * 0.20 = 20%), i.e. the speed Jane watched and approved. Without it a
+# full-width drift at the harder zooms would whip -- 45% of the frame in 4 seconds -- so
+# the pan span is scaled down as the zoom rises and the apparent SPEED stays put.
+# His drift reached ~18% of frame width, which is the same place.
+CAMERA_DRIFT_MAX_FRAME_FRACTION = 0.20
+
+# --- the per-shot zoom ceiling, and the measurement behind it -----------------
+# THE THING MOST LIKELY TO BITE on a bolder camera is softness, and the old comment in
+# this file got it wrong by measuring the composite instead of the photograph.
+#
+# WHERE THE REAL LIMIT SITS. _contain_over_blur scales the photo to exactly VW*UPSCALE
+# (2160) wide whatever it was, so the composite tells you nothing. zoompan then crops
+# 2160/zoom of it into a 1080-wide output, which is a window of (source_width / zoom)
+# REAL pixels stretched across 1080. That ratio is the whole story.
+#
+# WHAT IS ACTUALLY IN THE PIPELINE, measured 2026-10-27 rather than assumed:
+#   * main.py thumbnails every uploaded photo to 1920 on its long edge, so 1920 is a
+#     hard ceiling nothing in the system can exceed.
+#   * the live demo listing's thirteen photos are every one of them 800x600, JPEG q80.
+#   * none of them has an upscaled twin: photo_upscale.hires_url_for maps each to a
+#     hires/ path and all thirteen return HTTP 400. So the 4x upscale that
+#     _fetch_listing_photo prefers is NOT present in production, and 800px is what the
+#     renderer is really handed.
+#   * photo_upscale skips any photo whose long edge is already >= 1600
+#     (UPSCALE_SKIP_MIN_EDGE), so a 1920px upload never gets a twin either.
+# At 800px the output is ALREADY upsampling 1.35x at zoom 1.0 and 1.62x at the shipped
+# 1.20. There is no spare resolution to spend; there is only how much softness one shot
+# may be allowed.
+#
+# SO IT WAS MEASURED, real ffmpeg, the real 800x600 photos, variance-of-Laplacian on the
+# sharp band of the finished frame after the real clarity pass and the real CRF 24
+# encode. Detail relative to the 1.20 frame Jane approved:
+#     zoom   1.00  1.10  1.20  1.30  1.40  1.50  1.60  1.78  2.00  2.20  2.40
+#     detail 1.57  1.27  1.00  0.78  0.63  0.51  0.42  0.31  0.23  0.17  0.14
+# A smooth 1/zoom^2 decay with no knee: on a source this size every extra bit of zoom is
+# a straight trade of sharpness for size, so the number has to be chosen, not found.
+# 1.40 keeps a hard shot at 0.63 of the approved frame -- visibly bigger, still reading
+# as a photograph. 2.20, the competitor's hardest shot, would be 0.17: one sixth of the
+# acutance of a film Jane already called acceptable. That is the mush, and it is why
+# matching his zoom numbers would have made ours look worse, not better.
+#
+# TWO CONTROLS, so the rule is about detail and not about arithmetic:
+#   * the same 800px photo Lanczos'd up to 1920 before rendering scores the SAME curve
+#     (1.00 / 0.79 / 0.64 / 0.52 / 0.19). Pixel count buys nothing; only detail does.
+#   * a genuinely detailed 1920px source RISES with zoom instead (1.00 at 1.20 up to
+#     2.02 at zoom 2.00) and only turns over past pixel parity. So the pipeline can
+#     carry a hard push perfectly well -- the ceiling is the photograph, every time.
+# Which is why the ceiling is DERIVED FROM THE SOURCE rather than being a constant: the
+# day agents upload full-size photos, the camera gets bolder on its own.
+#
+# 1.89 = 1.40 * 1080 / 800, i.e. "never upsample the photograph by more than the 1.40
+# point costs on the photos we actually have".
+MOTION_SOURCE_UPSAMPLE_LIMIT = 1.89
+# And a hard stop at pixel parity for the best case the system allows: 1920 / 1080.
+# Beyond parity a frame is showing fewer source pixels than it has output pixels, which
+# is the line this style should not cross however good the photograph is -- and at 9:16
+# a zoom past here is an uncomfortably tight crop of a room regardless of sharpness.
+MOTION_ZOOM_CEILING = 1.78
 # Backdrop tuning. The first cut used radius 28 at quarter scale (~112px at full
 # resolution) plus 42% black, which turned every bright interior into the same flat
 # grey -- the backdrop stopped reading as the photo at all. A moderate blur with only
@@ -1829,22 +2014,269 @@ def _caption_filters(caption, caption_size, workdir, index, alpha_expr=None,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Working the camera move table into one shot's ffmpeg expressions
+# ---------------------------------------------------------------------------
+def _contain_foreground_box(src_size):
+    """(fg_w, fg_h) -- where the SHARP photo sits inside the 2160x3840 composite.
+
+    A third statement of the arithmetic _contain_over_blur and _dramatic_backdrop both
+    do inline. Those two are deliberate duplicates of each other (the Classic composite
+    is pinned command-for-command and must not be refactored underneath the golden), so
+    this takes the same route: a small pure function, with a test asserting it agrees
+    with both rather than a refactor that could silently move the composite.
+
+    The camera needs it because the pannable area is a property of the PHOTO's box, not
+    of the composite -- see _pan_reach.
+    """
+    w, h = VW * UPSCALE, VH * UPSCALE
+    src_w, src_h = src_size
+    fg_w = w
+    fg_h = max(1, round(w * src_h / float(src_w)))
+    if fg_h > h:
+        fg_h = h
+        fg_w = max(1, round(h * src_w / float(src_h)))
+    return fg_w, fg_h
+
+
+def _motion_zoom_ceiling(photo_size):
+    """How far THIS photograph may be pushed, before any move is chosen.
+
+    The whole argument, the measurement behind it and the two controls are at
+    MOTION_SOURCE_UPSAMPLE_LIMIT. In one line: the limit is the photograph's own detail,
+    so the ceiling is derived from the photograph and never from a constant.
+
+    MEASURED THROUGH THE WHOLE CHAIN, not from the photo's width, because there are two
+    scalings and only their product matters. _contain_over_blur first scales the photo by
+    (fg_w / src_w) to fit the composite -- for a landscape photo that is always exactly
+    2160/src_w, for a photo taller than 9:16 it is bounded by height instead and is
+    gentler. zoompan then takes a window of the composite out to a VW-wide frame, which
+    is a second scaling of zoom/UPSCALE. So the photograph is enlarged by
+    (fg_w / src_w) * zoom / UPSCALE by the time it reaches the viewer, and that product
+    is what MOTION_SOURCE_UPSAMPLE_LIMIT caps. For the landscape case this reduces to the
+    arithmetic in that comment: zoom <= LIMIT * src_w / VW.
+
+    Floored at CONTAIN_ZOOM_MAX so no photo is ever given LESS room to move than the
+    look Jane approved, and capped at MOTION_ZOOM_CEILING so a big photo cannot push
+    past pixel parity.
+    """
+    src_w, src_h = (photo_size or (0, 0))[:2]
+    if not src_w or not src_h or src_w <= 0 or src_h <= 0:
+        return CONTAIN_ZOOM_MAX
+    fg_w, _fg_h = _contain_foreground_box((src_w, src_h))
+    contain_scale = fg_w / float(src_w)
+    if contain_scale <= 0:
+        return CONTAIN_ZOOM_MAX
+    cap = MOTION_SOURCE_UPSAMPLE_LIMIT * UPSCALE / contain_scale
+    return round(max(CONTAIN_ZOOM_MAX, min(MOTION_ZOOM_CEILING, cap)), 4)
+
+
+def _camera_knots(waypoints, ease, span, scale):
+    """[(t, value), ...] in fractions -> [(frame, value), ...] for _zoom_ramp.
+
+    `scale` turns a fraction into the thing being ramped: for the zoom it maps 0..1 onto
+    1.0..ceiling; for a pan axis it maps -1..+1 onto the travel that axis can afford.
+
+    Easing is done HERE, by expanding each waypoint pair into CAMERA_EASE_STEPS
+    sub-knots, so the expression that reaches ffmpeg is still piecewise linear in the
+    frame number -- the one form proven not to hit zoompan's previous-frame feedback
+    trap (see _contain_clip).
+    """
+    shape = CAMERA_EASES.get(ease or "linear", CAMERA_EASES["linear"])
+    out = []
+    for (t0, v0), (t1, v1) in zip(waypoints, waypoints[1:]):
+        for step in range(CAMERA_EASE_STEPS):
+            u = step / float(CAMERA_EASE_STEPS)
+            frame = int(round((t0 + (t1 - t0) * u) * span))
+            out.append((frame, scale(v0 + (v1 - v0) * shape(u))))
+    out.append((span, scale(waypoints[-1][1])))
+    # Two knots on the same frame would give _zoom_ramp a zero-length segment, which it
+    # widens to one frame and turns into a jump. Keep the first value at each frame.
+    knots, seen = [], set()
+    for frame, value in out:
+        if frame not in seen:
+            seen.add(frame)
+            knots.append((frame, value))
+    return knots
+
+
+def _pan_reach(full, fg, zoom_min):
+    """The largest symmetric half-range of the pan fraction this axis can afford.
+
+    THE CONSTRAINT THIS ENFORCES, and the reason the brief's "pan vertically too" is
+    only sometimes possible. The crop window must stay inside the SHARP photograph. In
+    this style the photo is contained, not cropped, so one axis of the composite is all
+    photo and the other has blurred margins -- and sliding the sharp photo around inside
+    its own margins reads as a layout mistake, not as a camera move (the same reason
+    _contain_over_blur already refused to drift a tall source sideways).
+
+    `full` is the composite's extent on this axis, `fg` the sharp photo's. zoompan's
+    window is full/zoom, so its near edge sits at p*(full - full/zoom) and the photo
+    occupies [(full-fg)/2, (full+fg)/2]. Both ends of that give the SAME bound, which is
+    worth writing out because it is what makes this one line instead of a special case:
+    with margin = (full-fg)/2 and spare = full - full/zoom, the window fits inside the
+    photo exactly while p is within 0.5 +/- (0.5 - margin/spare).
+
+    Evaluated at the shot's LOWEST zoom, where the window is widest and the bound is
+    tightest; the bound only loosens as the shot pushes in.
+
+    The degenerate case is the common one and it is not an edge case to be guarded, it
+    is the answer: a photo with NO margin on this axis (margin == 0, i.e. the photo
+    reaches both edges of the composite) can use the whole range at every zoom including
+    1.0, where the pan fraction has no effect at all because the spare is zero. A photo
+    that DOES have a margin on this axis and a shot that touches zoom 1.0 gets nothing,
+    which is right: at zoom 1.0 the frame is the whole composite, bars and all, and the
+    only position that keeps those bars even is the middle.
+
+    It falls out that:
+      * a landscape photo (fg == full on x) can use the whole 0..1 range horizontally at
+        any zoom -- and because p is a fraction of the spare, a 1.04x shot still barely
+        moves, which is the bound the brief asked for, by construction;
+      * the same photo gets EXACTLY ZERO vertically: its sharp band is 1440 of 3840 and
+        the window never gets narrower than 3840/1.4, so any vertical move would slide
+        the picture between its blurred bars. The window would have to be inside the
+        band, which needs zoom >= 2.67 -- far past any ceiling this file allows;
+      * a photo as tall as the frame or taller is the mirror image: full vertical
+        travel, none horizontal. That is where the vertical pan actually happens, and it
+        is new -- those shots used to be pinned dead centre.
+    """
+    margin = (full - fg) / 2.0
+    if margin <= 0:
+        return 0.5
+    spare = full - full / float(zoom_min)
+    if spare <= 0:
+        return 0.0
+    return max(0.0, 0.5 - margin / spare)
+
+
+def _camera_expressions(move, photo_size, frames):
+    """One move + one photo -> (z, x, y) zoompan expressions, and the zoom knots.
+
+    The knots come back so a test (and _camera_plan's own guard) can check the move in
+    Python -- _zoom_at is the arithmetic twin of the expression, exactly as it is for
+    the Dramatic's walk-through.
+    """
+    span = max(1, frames - 1)
+    ceiling = _motion_zoom_ceiling(photo_size)
+    reach_room = ceiling - 1.0
+    zoom_knots = _camera_knots(move["zoom"], move.get("ease"), span,
+                               lambda a: 1.0 + reach_room * a)
+    zooms = [z for _f, z in zoom_knots]
+    zoom_min, zoom_max = min(zooms), max(zooms)
+
+    full_w, full_h = VW * UPSCALE, VH * UPSCALE
+    fg_w, fg_h = _contain_foreground_box(photo_size)
+    # Two separate limits, and the smaller wins. The first is geometry: how far the
+    # window can go without leaving the photograph. The second is SPEED: a pan fraction
+    # moves the picture by (zoom-1) frame widths, so without this a full-range drift at
+    # the ceiling would cross 40% of the frame in four seconds. Measured against the
+    # drift Jane already approved -- see CAMERA_DRIFT_MAX_FRAME_FRACTION.
+    budget = 0.5 * CAMERA_DRIFT_MAX_FRAME_FRACTION / max(1e-6, zoom_max - 1.0)
+    reach_x = min(_pan_reach(full_w, fg_w, zoom_min), budget)
+    reach_y = min(_pan_reach(full_h, fg_h, zoom_min), budget)
+    # "drift" travels on whichever axis the photograph has room on, "cross" on the
+    # other, so one table serves a landscape room shot and a tall stairwell alike.
+    if reach_x >= reach_y:
+        x_way, y_way = move.get("drift"), move.get("cross")
+    else:
+        x_way, y_way = move.get("cross"), move.get("drift")
+
+    def axis(waypoints, reach):
+        if not waypoints or reach <= 0:
+            return f"{0.5:.6f}"
+        knots = _camera_knots(waypoints, "linear", span,
+                              lambda d: 0.5 + reach * max(-1.0, min(1.0, d)))
+        if len({round(v, 9) for _f, v in knots}) == 1:
+            return f"{knots[0][1]:.6f}"
+        return f"({_zoom_ramp(knots)})"
+
+    return (_zoom_ramp(zoom_knots),
+            f"{axis(x_way, reach_x)}*(iw-iw/zoom)",
+            f"{axis(y_way, reach_y)}*(ih-ih/zoom)",
+            zoom_knots)
+
+
+def _camera_plan(count, seed):
+    """One move per shot, rotated so neighbours never move alike. DETERMINISTIC.
+
+    SEEDED FROM THE LISTING, never from randomness: a regenerate must give the agent the
+    same film back, not a lottery. The seed main.py passes as `music_seed` IS the listing
+    id, so the same listing with the same photos is the same film every time, on any
+    worker, for ever.
+
+    The rotation is a seeded permutation of the whole table rather than a fixed cycle, so
+    two listings do not open with the same move -- and the permutation is re-drawn for
+    each further block, so an eleven-photo film is not the first six repeated.
+
+    ONE NEAR-STATIC SHOT IS GUARANTEED in any film of three or more, because the hold is
+    what makes the rest read as movement. A one- or two-shot film is left alone: a film
+    whose only shot barely moves is not a style, it is a still.
+
+    AND IT IS NEVER THE FIRST SHOT. These are posted as Reels and Stories, where the
+    opening seconds decide whether anybody watches at all; opening on the one shot that
+    deliberately holds still is the worst use of the best second of the film. Caught on
+    the first real render -- the demo listing's seed put the hold at slide one.
+    """
+    moves = list(CAMERA_MOVES)
+    if count <= 0:
+        return []
+
+    def permutation(salt):
+        """A deterministic shuffle. hashlib rather than `random`: no global state to be
+        left seeded for the next render in the same worker, and the same answer on every
+        Python build."""
+        keyed = []
+        for position, move in enumerate(moves):
+            digest = hashlib.sha256(
+                f"{seed}|{salt}|{position}|{move['name']}".encode("utf-8")).hexdigest()
+            keyed.append((digest, position, move))
+        return [move for _d, _p, move in sorted(keyed)]
+
+    block = permutation(0)
+    # Never first -- see the docstring. Done BEFORE the swap below, so the swap (which
+    # only ever picks a slot from 1 upwards) cannot put it back at the front.
+    if block[0]["name"] == MOVE_HOLD:
+        block = block[1:] + block[:1]
+    if (3 <= count < len(moves)
+            and not any(m["name"] == MOVE_HOLD for m in block[:count])):
+        # The hold fell outside the shots this film will use. Swap it in, at a slot
+        # chosen from the seed so it is not always the same shot that holds still.
+        hold = next(m for m in block if m["name"] == MOVE_HOLD)
+        digest = int(hashlib.sha256(f"{seed}|hold".encode("utf-8")).hexdigest(), 16)
+        slot = 1 + digest % (count - 1)
+        block[block.index(hold)], block[slot] = block[slot], hold
+
+    out = []
+    salt = 0
+    while len(out) < count:
+        if out and block and block[0]["name"] == out[-1]["name"]:
+            # Rotate the block by one so the join between two blocks is not two of the
+            # same move back to back. Within a block they are distinct by construction.
+            block = block[1:] + block[:1]
+        out.extend(block)
+        salt += 1
+        block = permutation(salt)
+    return out[:count]
+
+
 def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=None,
-                  zoom_in=True, drift_right=True, first=True, last=True):
-    """STYLE B: one photo -> one 5s contain-over-blur clip that pushes in (or pulls
-    out) while drifting sideways across the photo.
+                  move=None, first=True, last=True):
+    """STYLE B: one photo -> one SECONDS_PER_PHOTO contain-over-blur clip, moving the
+    way the camera move table says.
 
     Every clip, the first included, opens fully composed -- sharp photo already in
     place over its backdrop. Jane rejected the earlier fade-up-over-backdrop opening
     ("i don't want the video to open with a blur screen"): the video starts cold on
     slide one.
 
-    zoom_in / drift_right are alternated by the caller so a ten-shot film has rhythm
-    instead of ten copies of one effect. Both senses belong to the SAME family of move
-    -- a zoom plus a lateral drift -- which is what makes the sequence read as one
-    camera rather than a bag of tricks.
+    `move` is one row of CAMERA_MOVES, chosen for this shot by _camera_plan so that no
+    two neighbouring shots move alike and every film has one near-static shot. It
+    replaced a pair of booleans (zoom_in / drift_right) that gave four variants of ONE
+    move -- the same ramp to the same zoom over the same seconds, which is what read as
+    a slideshow next to a competitor's reel. Falling back to the first row rather than
+    raising, because a film with a camera is worth more than no film.
     """
-    composite, fills_width = _contain_over_blur(photo)
+    composite, _fills_width = _contain_over_blur(photo)
     comp_path = os.path.join(workdir, f"b_comp_{index:02d}.bmp")
     composite.save(comp_path, format="BMP")
 
@@ -1855,47 +2287,42 @@ def _contain_clip(photo, out_path, workdir, index, caption=None, caption_size=No
     # variable, which holds the zoom of the PREVIOUS OUTPUT FRAME OF THE SAME INPUT
     # FRAME. With d=1 every input frame produces exactly one output frame, so there is
     # no previous output frame to read and `zoom` resets to 1.0 every time: the
-    # expression evaluates to 1+step on all 120 frames and the shot never moves. The
-    # d=120 form in _kenburns_clip does accumulate, which is why style A moved and the
-    # style B that actually ships did not. MEASURED on a ruler frame, shipped
-    # expression, frames 0 / 59 / 119: the crop window was 2158px wide at all three.
-    # Nobody saw it because a 6% zoom that fails is indistinguishable from a 6% zoom.
+    # expression evaluates to 1+step on every frame and the shot never moves. The
+    # d=FRAMES_PER_PHOTO form in _kenburns_clip does accumulate, which is why style A
+    # moved and the style B that actually ships did not. MEASURED on a ruler frame,
+    # shipped expression, three frames apart: the crop window was 2158px wide at all
+    # three. Nobody saw it because a 6% zoom that fails looks like a 6% zoom.
     #
     # `on` is the output frame index and does count 0..FRAMES_PER_PHOTO-1 correctly, so
-    # a linear ramp over it is both frame-exact and immune to the trap above.
-    amplitude = round(CONTAIN_ZOOM_MAX - 1.0, 6)
-    span = FRAMES_PER_PHOTO - 1
-    if zoom_in:
-        z = f"1+{amplitude}*on/{span}"
-    else:
-        z = f"{CONTAIN_ZOOM_MAX}-{amplitude}*on/{span}"
-    # The horizontal drift. `on` is the output frame index (0..FRAMES_PER_PHOTO-1), so
-    # `p` ramps linearly from 0 to 1 across the clip (or 1 to 0 drifting the other way)
-    # and is multiplied by whatever spare width the CURRENT zoom leaves:
+    # a ramp over it is both frame-exact and immune to the trap above. _zoom_ramp turns
+    # the move's knots into exactly that -- piecewise linear in `on` -- which is also
+    # what lets a move OVERSHOOT and come back; the straight z0->z1 ramp this replaced
+    # could not.
+    #
+    # x and y are fractions of whatever spare the CURRENT zoom leaves:
     #
     #     x = p * (iw - iw/zoom)        p in [0,1]
     #
     # p=0 puts the window hard against the left of the composite, p=1 hard against the
-    # right, and at zoom 1.0 the spare is zero so x collapses to 0 -- the whole photo,
-    # centred, with no special case needed. Nothing can leave the composite at any
-    # zoom, so there is no clamp to get wrong and no black edge to guard against.
+    # right, p=0.5 is dead centre AT ANY ZOOM, and at zoom 1.0 the spare is zero so the
+    # whole photo is shown centred with no special case needed. Nothing can leave the
+    # composite at any zoom, so there is no clamp to get wrong and no black edge to
+    # guard against -- and the pan is bounded BY the zoom, which is why a 1.04x hold
+    # barely moves without anyone having to say so. `zoom` IS safe to read inside x and
+    # y: there it is the zoom already computed for THIS frame, not a previous-frame
+    # feedback value. Verified on a ruler frame -- the window lands at composite
+    # x=389.5 with the band at composite 420 appearing at output x=20, to the pixel.
     #
-    # A source taller than 9:16 does not reach the sides of its own composite
-    # (_contain_over_blur says so), and sliding it inside its blurred margins looks
-    # like a mistake, so those shots keep the centred zoom they had.
-    if fills_width and CONTAIN_DRIFT_SPAN > 0:
-        ramp = f"on/{span}" if drift_right else f"(1-on/{span})"
-        # `zoom` IS safe to read here: inside x/y it is the zoom already computed for
-        # THIS frame, not a previous-frame feedback value. Verified on a ruler frame --
-        # at frame 119 the window lands at composite x=389.5 with the band at
-        # composite 420 appearing at output x=20, which is the drift to the pixel.
-        x = f"{CONTAIN_DRIFT_SPAN}*{ramp}*(iw-iw/zoom)"
-    else:
-        x = "iw/2-(iw/zoom/2)"
+    # How far each axis may actually travel is _pan_reach's business, and it is where
+    # the vertical pan lives: on a landscape photo the vertical reach is exactly zero
+    # (the sharp band would slide between its blurred bars), on a photo as tall as the
+    # frame it is the full range.
+    move = move or CAMERA_MOVES[0]
+    z, x, y, _knots = _camera_expressions(move, photo.size, FRAMES_PER_PHOTO)
     # d=1 (one output frame per input frame): the looped still arrives as a frame
-    # stream, so the zoom accumulates per frame rather than inside one d=120 hold.
+    # stream, so the zoom advances per frame rather than inside one long hold.
     zoompan = (f"zoompan=z='{z}':d=1:s={VW}x{VH}:fps={FPS}"
-               f":x='{x}':y='ih/2-(ih/zoom/2)'")
+               f":x='{x}':y='{y}'")
     # The caption lives only inside the part of the clip that is NOT shared with a
     # neighbouring clip. Consecutive clips overlap for the length of the dissolve, so a
     # caption drawn across that region cross-fades through the next one and renders as
@@ -2492,6 +2919,13 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
             # encode, and the captions we return and store have to describe the film
             # the agent can watch, not the one we set out to make.
             rendered_urls = []
+            # The camera. One move per shot, drawn over the WHOLE PLAN rather than per
+            # clip, so a shot's move never depends on whether an earlier clip failed --
+            # and seeded from the listing, so a regenerate gives the agent the same film
+            # back. `music_seed` is the listing id (main.py passes it as such).
+            camera = _camera_plan(len(photos), music_seed)
+            logger.info("camera plan: %s",
+                        ", ".join(m["name"] for m in camera) or "none")
             loop_started = time.monotonic()
             for i, photo in enumerate(photos):
                 elapsed = time.monotonic() - started
@@ -2521,15 +2955,10 @@ def render_property_video(image_urls, property_type=None, district=None, price_t
                             photo, clip_path, workdir, i,
                             caption=captions[i] if i < len(captions) else None,
                             caption_size=caption_size,
-                            # The two senses of the move alternate on DIFFERENT
-                            # periods -- the zoom every clip, the drift every two --
-                            # so the sequence cycles through all four combinations
-                            # (in-right, out-right, in-left, out-left) before it
-                            # repeats. Alternating both on the same period would give
-                            # two shapes taking turns, which at ten shots is a visible
-                            # tick-tock.
-                            zoom_in=(i % 2 == 0),
-                            drift_right=(i // 2 % 2 == 0),
+                            # This shot's camera move. It used to be two booleans
+                            # giving four variants of the SAME move, which at ten
+                            # shots reads as a slideshow however they are arranged.
+                            move=camera[i] if i < len(camera) else None,
                             # `first` means "this clip is not dissolved INTO", which
                             # decides when the caption may appear: the opening clip
                             # fades up from black rather than out of another shot, so
