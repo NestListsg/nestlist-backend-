@@ -426,14 +426,21 @@ check("the job type shares the template's spelling, so there is one word per thi
 check("/api/video-templates offers Classic and Dramatic, with human names",
       '{"id": DEFAULT_VIDEO_TEMPLATE_ID, "name": "Classic"}' in src
       and '{"id": DRAMATIC_VIDEO_TEMPLATE_ID, "name": "Dramatic"}' in src)
-check("ELEGANT IS NAMED BUT NOT OFFERED -- no picker shows it and no job of that type "
-      "can be enqueued",
+# THE ELEGANT SHIPPED ON 2026-10-27, so "named but not declared" is no longer how it is
+# kept out of reach -- it has a renderer now, and it has to be enqueueable when it is
+# switched on. What must still hold from this file's point of view is that it is NOT IN
+# THE STATIC LIST: it is appended to the picker only when every one of its four
+# conditions holds, so a deploy that forgets to switch it on cannot leak it. The gate
+# itself is tested in test_elegant_render.py.
+check("ELEGANT IS NOT IN THE STATIC TEMPLATE LIST -- it is appended only when switched "
+      "on, so the failure mode of forgetting is 'not shown' rather than 'shown'",
       "ELEGANT_VIDEO_TEMPLATE_ID = video_renderer.ELEGANT_STYLE_ID" in src
-      and '"name": "Elegant"' not in src
-      and video_jobs.JOB_TYPE_ELEGANT not in video_jobs.JOB_TYPES)
+      and "elegant" not in src.split("VIDEO_TEMPLATES = [")[1].split("]")[0].lower()
+      and 'if _elegant_available():' in src)
 gv = seg("generate_video")
-check("asking for Elegant is a clear 'not yet', never a silent Classic",
-      "UNRELEASED_VIDEO_TEMPLATE_IDS" in gv and "not available yet" in gv)
+check("asking for Elegant while it is switched off is a clear 'not yet', never a silent "
+      "Classic",
+      "_unreleased_video_template_ids()" in gv and "not available yet" in gv)
 check("the request routes onto the template's own queue",
       "job_type = _job_type_for_template(chosen_video_template_id)" in gv
       and "video_jobs.enqueue,\n" in gv and "                job_type," in gv)
@@ -535,6 +542,7 @@ def run_endpoint(fal_on=True, active=None, stored=None, ceiling_ok=True,
     class FakeJobs:
         JOB_TYPE_CLASSIC = "classic"
         JOB_TYPE_DRAMATIC = "dramatic"
+        JOB_TYPE_ELEGANT = "elegant"
         TABLE = "video_jobs"
         # The endpoint falls back to this when describe() fails, so that a
         # response can never say "rendering" with no queued/running truth in it.
@@ -564,7 +572,18 @@ def run_endpoint(fal_on=True, active=None, stored=None, ceiling_ok=True,
              DEFAULT_VIDEO_TEMPLATE_ID="classic",
              DRAMATIC_VIDEO_TEMPLATE_ID="dramatic",
              UNRELEASED_VIDEO_TEMPLATE_IDS={"elegant"},
-             VIDEO_JOB_TYPES=("classic", "dramatic"),
+             # The Elegant arrived 2026-10-27. Stubbed as SWITCHED OFF here, which is its
+             # default everywhere, so this file keeps asking its own question -- what the
+             # Dramatic does -- rather than becoming a test of the Elegant's gate.
+             # test_elegant_render.py owns that.
+             ELEGANT_VIDEO_TEMPLATE_ID="elegant",
+             _elegant_available=lambda: False,
+             _elegant_switch_on=lambda: False,
+             _elegant_seconds_ceiling_enforceable=lambda: True,
+             _unreleased_video_template_ids=lambda: {"elegant"},
+             old_to_new=old_to_new,
+             fal_video=types.SimpleNamespace(is_enabled=lambda: fal_on),
+             VIDEO_JOB_TYPES=("classic", "dramatic", "elegant"),
              _resolve_video_template_id=lambda t: t if t in ("classic", "dramatic") else None,
              _job_type_for_template=lambda t: {"dramatic": "dramatic"}.get(t, "classic"),
              fal_images=types.SimpleNamespace(is_enabled=lambda: fal_on),

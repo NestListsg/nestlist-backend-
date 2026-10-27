@@ -409,11 +409,46 @@ check("classic has no account-wide cap (CPU bound, per-process)",
       workers[0].JOB_TYPES["classic"].account_limit is None)
 check("the real ceiling is one render per worker process, whatever the type",
       workers[0].PER_PROCESS_RENDER_LIMIT == 1)
-check("the declared render types are the Classic and the Dramatic",
-      list(workers[0].JOB_TYPES) == ["classic", "dramatic"], str(list(workers[0].JOB_TYPES)))
-check("Elegant is named but NOT declared, so no worker can ever claim one",
+check("the declared render types are the Classic, the Dramatic and the Elegant",
+      list(workers[0].JOB_TYPES) == ["classic", "dramatic", "elegant"],
+      str(list(workers[0].JOB_TYPES)))
+# THE ELEGANT'S GATE MOVED, AND IT IS STRONGER THAN IT WAS. It used to be absent from
+# JOB_TYPES, which stopped it being claimed but ALSO stopped it being enqueued -- fine
+# while it did not exist, useless once it does, because enqueue() validates against this
+# table. The gate is now the one the module documents: a type with no REGISTERED RENDERER
+# is never claimed, and main.py registers the Elegant's only when the feature is switched
+# on. So a deploy that has not been switched on declares the type, refuses to enqueue it
+# at the endpoint, and could not run one even if a row appeared by hand.
+check("the Elegant is declared, so a job of that type can be validated and queued",
       workers[0].JOB_TYPE_ELEGANT == "elegant"
-      and workers[0].JOB_TYPE_ELEGANT not in workers[0].JOB_TYPES)
+      and workers[0].JOB_TYPE_ELEGANT in workers[0].JOB_TYPES)
+check("but with no renderer registered for it, no worker will ever claim one",
+      workers[0].JOB_TYPE_ELEGANT not in workers[0]._RENDERERS)
+try:
+    workers[0].register_renderer("elegant-typo", lambda job: (None, []))
+    check("registering a renderer for an undeclared type is refused", False)
+except ValueError:
+    check("registering a renderer for an undeclared type is refused", True)
+elegant_cfg = workers[0].JOB_TYPES["elegant"]
+check("the Elegant does NOT count against this worker's render slot -- it is asleep "
+      "waiting on fal for all but a minute of its quarter hour, and taxing the Classic "
+      "for that would protect a cpu nobody is using",
+      elegant_cfg.counts_toward_render_limit is False
+      and workers[0].JOB_TYPES["classic"].counts_toward_render_limit is True
+      and workers[0].JOB_TYPES["dramatic"].counts_toward_render_limit is True)
+check("it is still capped at one across the whole fleet, because one render already asks "
+      "fal for two clips at once and that is all a new account allows",
+      elegant_cfg.account_limit == 1)
+check("its queue-escape window is sized against its OWN duration, so three agents "
+      "waiting honestly are not told the service is broken",
+      workers[0]._escape_seconds("elegant")
+      > 2 * elegant_cfg.default_seconds
+      and workers[0]._escape_seconds("classic") == workers[0].QUEUED_ESCAPE_SECONDS)
+check("and it is never quoted at less than its floor, however the rolling mean lands",
+      elegant_cfg.min_quoted_seconds >= 420
+      and workers[0].JOB_TYPES["classic"].min_quoted_seconds == 0)
+check("its patience with a rate limit outlasts one of its own renders",
+      elegant_cfg.rate_limit_patience_seconds > elegant_cfg.default_seconds / 2)
 # The Dramatic generates up to six images through fal before a frame is rendered, so it
 # is bound by an EXTERNAL service as well as by this box -- which is exactly the
 # constraint a fleet-wide cap is the right lever for.

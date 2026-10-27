@@ -144,13 +144,58 @@ class JobTypeConfig:
     default_seconds    -- ETA fallback before we have measured any real durations.
     max_attempts       -- how many times a job may be CLAIMED before we give up on it.
                           Deferrals do not count; crashes and genuine errors do.
+
+    AND FOUR THAT EXIST BECAUSE OF THE ELEGANT, whose render is 10-15 minutes where
+    every other type's is one or two. A quarter-hour job breaks three assumptions this
+    module was built on, and each of them needed designing rather than patching:
+
+    counts_toward_render_limit -- whether one of these occupying this process should stop
+                          it taking any other render. TRUE for anything bound by OUR cpu:
+                          a Classic or a Dramatic is ffmpeg running flat out from start to
+                          finish, and two in one process is two ffmpeg trees at 1.6GB each.
+                          FALSE for a type that spends almost all of its life ASLEEP
+                          WAITING ON SOMEBODY ELSE'S API. An Elegant render is 10-15
+                          minutes of which maybe one is ffmpeg; counting it as a render
+                          would take a quarter of this worker's Classic throughput offline
+                          for a quarter of an hour to protect a cpu nobody is using.
+                          IT IS SAFE BECAUSE THE CPU IS GUARDED SOMEWHERE ELSE AS WELL:
+                          video_renderer._RENDER_SLOTS is a per-process semaphore of ONE
+                          that BOTH renderers acquire around their ffmpeg phase, so a
+                          waiting Elegant and a running Classic can coexist but two
+                          ffmpeg phases in one process cannot. The admission control here
+                          stops the queue handing a worker work it cannot do; that
+                          semaphore stops two renders being in ffmpeg at once. The
+                          Elegant needs the second guarantee, not the first.
+    queued_escape_seconds -- how long one of these may sit in 'queued' before the
+                          abandoned-queue sweep concludes nothing is draining the queue.
+                          Must be a large multiple of how long the type takes to RUN,
+                          or a healthy queue of them looks dead. None means the global
+                          QUEUED_ESCAPE_SECONDS.
+    min_quoted_seconds -- never tell an agent less than this. The ETA is a rolling mean
+                          of recent renders, which is honest for a type whose renders are
+                          all about the same length and misleading for one whose cached
+                          regenerate takes a minute and whose cold render takes fifteen.
+                          Under-quoting a long wait is the specific failure that makes an
+                          agent press Generate again, so the floor is a floor and not an
+                          average.
+    rate_limit_patience_seconds -- how long a job may keep going back in the queue because
+                          the external service has no room, before we give the agent the
+                          film we can make instead. Has to be longer than the type's own
+                          render, or the first deferral is already out of patience.
     """
 
-    def __init__(self, per_process_limit, account_limit, default_seconds, max_attempts=3):
+    def __init__(self, per_process_limit, account_limit, default_seconds,
+                 max_attempts=3, counts_toward_render_limit=True,
+                 queued_escape_seconds=None, min_quoted_seconds=0,
+                 rate_limit_patience_seconds=600):
         self.per_process_limit = per_process_limit
         self.account_limit = account_limit
         self.default_seconds = default_seconds
         self.max_attempts = max_attempts
+        self.counts_toward_render_limit = counts_toward_render_limit
+        self.queued_escape_seconds = queued_escape_seconds
+        self.min_quoted_seconds = min_quoted_seconds
+        self.rate_limit_patience_seconds = rate_limit_patience_seconds
 
 
 # MEASURED COST OF ONE CLASSIC RENDER (2026-10-19, real ffmpeg, 3200x1800 sources).
@@ -219,7 +264,57 @@ JOB_TYPES = {
     # A REGENERATE is far quicker -- every image comes from the listing's cache -- so the
     # rolling mean will sit well below this once both kinds have run.
     JOB_TYPE_DRAMATIC: JobTypeConfig(per_process_limit=1, account_limit=1,
-                                     default_seconds=300),
+                                     default_seconds=300,
+                                     rate_limit_patience_seconds=600),
+
+    # Elegant ("From Old to New", the Kling film). EVERY NUMBER HERE DIFFERS FROM THE
+    # OTHER TWO, because this is the first job type that is not a render at all for most
+    # of its life -- it is a quarter of an hour of waiting on somebody else's API with a
+    # minute of ffmpeg on the end. The first reliability audit's wording was right: "a
+    # quarter-hour job breaks the queue's assumptions ... that needs designing, not
+    # patching."
+    #
+    # account_limit=1. Same lever as the Dramatic's and for a sharper version of the same
+    # reason. One Elegant render asks fal for two clips at a time
+    # (old_to_new.ELEGANT_CLIP_CONCURRENCY), which is exactly what fal allows a new
+    # account; a second render would 429 against the first. A 429 here does not cost a
+    # retry -- DeferJob rewinds the attempt counter -- but it costs a deferral cycle, and
+    # a 429 that lands AFTER an accepted submit costs seventy cents. So one at a time
+    # across the fleet, and the agents behind it WAIT VISIBLY, which is what the queue is
+    # for.
+    #
+    # counts_toward_render_limit=False. The change the audit asked for, and the one that
+    # keeps this feature from taxing the other two: see the field's documentation above.
+    # A worker waiting on Kling still renders Classics.
+    #
+    # default_seconds=1020 (17 minutes) against the Dramatic's 300. A cold Elegant render
+    # buys up to six clips two at a time -- three waves of two to six minutes -- then up to
+    # seven stills, then runs ffmpeg over six 1080p shots. Fifteen minutes is the honest
+    # middle of that and seventeen is the honest quote, because an ETA that is late is a
+    # complaint and an ETA that is early is a second press of Generate. It is only the
+    # fallback until real duration_seconds rows exist.
+    #
+    # min_quoted_seconds=420 (7 minutes). The rolling mean WILL mislead here in a way it
+    # does not for the other types: a fully cached regenerate pays for no clips at all and
+    # finishes in about a minute, while a cold render takes fifteen, so a mean over a mix
+    # of the two describes neither. Rather than invent a second statistic, the quote has a
+    # floor: whatever the mean says, an Elegant is never quoted at less than seven minutes.
+    #
+    # rate_limit_patience_seconds=1800. The Dramatic's 600 would be exhausted before a
+    # single Elegant render had finished, so the first 429 would immediately give the
+    # agent the plainer film. Half an hour is two renders' worth of waiting for capacity,
+    # and every clip already bought is cached, so the waiting is free.
+    #
+    # queued_escape_seconds=3600. At one render at a time, three agents queued is 45
+    # minutes of entirely healthy waiting -- past the global 30-minute escape hatch, which
+    # would fail the third agent's job and tell them the rendering service was not picking
+    # up work, which would be false. _queue_is_draining() already guards against that, but
+    # it guards with a question about the whole table and the honest fix is a window sized
+    # to this type's own duration.
+    JOB_TYPE_ELEGANT: JobTypeConfig(
+        per_process_limit=1, account_limit=1, default_seconds=1020,
+        counts_toward_render_limit=False, queued_escape_seconds=3600,
+        min_quoted_seconds=420, rate_limit_patience_seconds=1800),
 }
 
 # How many renders of ANY type one worker process may have in flight at once.
@@ -242,9 +337,38 @@ JOB_TYPES = {
 # Classic or a Dramatic, never one of each.
 PER_PROCESS_RENDER_LIMIT = 1
 
+# How many jobs that are NOT renders -- types with counts_toward_render_limit False, which
+# today means the Elegant -- one worker may have in flight at once.
+#
+# A SEPARATE CEILING, because they are a different resource. A waiting Elegant costs this
+# process one python thread, one heartbeat thread and two sockets to fal for a quarter of
+# an hour; it does not cost the 1.6GB of ffmpeg that PER_PROCESS_RENDER_LIMIT exists to
+# bound. But it is not free either, and "it is only waiting" is exactly the reasoning that
+# would let a worker accumulate twenty of them, so it gets a number rather than no number.
+#
+# ONE, which with four workers is four -- and is therefore not the binding constraint
+# anyway: the Elegant's account_limit of 1 means only one runs across the whole fleet. It
+# is here so that if that fleet-wide cap is ever raised (once fal raises the account's
+# concurrency with spend), the per-worker consequence is a deliberate decision rather
+# than a discovery.
+PER_PROCESS_WAITING_LIMIT = 1
+
 # How often a running job proves it is still alive, and how long silence lasts before
 # another worker may take the job. Six missed beats is deliberately generous: reclaiming
 # a job that is merely slow costs a duplicate render, so the bias is towards patience.
+#
+# UNCHANGED FOR THE ELEGANT, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT. The obvious
+# worry about a quarter-hour job is that a 120-second silence window will reclaim it
+# mid-render. It cannot: the beat comes from its OWN THREAD (_heartbeat_loop), not from
+# the render, and the Elegant's long waits are time.sleep inside the render thread while
+# fal generates -- which is exactly the shape the beater was built for, and the same shape
+# as ffmpeg subprocess time. The beat also keeps ticking through the clip DOWNLOADS, which
+# are read under slow_read's watchdog in the render thread.
+#
+# What the long job does change is volume: 45 beats per Elegant render instead of 5, each
+# a PostgREST write. At one Elegant at a time across the fleet (account_limit=1) that is
+# one write every 20 seconds, which is nothing. If the fleet-wide cap is ever raised, this
+# is the number to look at again.
 HEARTBEAT_SECONDS = 20
 STALE_AFTER_SECONDS = 120
 
@@ -267,6 +391,24 @@ SWEEP_SECONDS = 30.0       # stale-claim sweep cadence
 # product will see -- and guarded further by _queue_is_draining(), so a genuinely deep
 # but healthy queue is never mistaken for a dead one.
 QUEUED_ESCAPE_SECONDS = float(os.environ.get("VIDEO_QUEUE_ESCAPE_SECONDS", "1800"))
+
+
+def _escape_seconds(job_type):
+    """The escape window for one job type.
+
+    PER TYPE SINCE THE ELEGANT, and it had to become per type rather than stay one
+    number. The global 30 minutes was sized against "four concurrent Classic renders of
+    ~100s, roughly 70 jobs deep" -- a window that could not plausibly be filled by honest
+    waiting. One Elegant render at a time at a quarter of an hour each fills it with
+    THREE AGENTS: the third would be failed and told the rendering service was not
+    picking up work, which would be a lie told to an agent whose video was simply third
+    in line. So a type that runs for a quarter of an hour gets a window measured against
+    its own duration.
+    """
+    cfg = JOB_TYPES.get(job_type)
+    if cfg is not None and cfg.queued_escape_seconds:
+        return float(cfg.queued_escape_seconds)
+    return QUEUED_ESCAPE_SECONDS
 
 # A deferred job (no slot, account limit taken) comes back after this, jittered.
 DEFER_BACKOFF_SECONDS = 5.0
@@ -993,7 +1135,11 @@ def sweep_abandoned_queue():
     Failing the job is the right recovery rather than silently deleting it: it clears
     the partial unique index, so the agent's next press of Generate works, and it leaves
     a row explaining what happened."""
-    cutoff = _iso(_now() - timedelta(seconds=QUEUED_ESCAPE_SECONDS))
+    # The SHORTEST window of any registered type decides which rows are worth reading;
+    # each row is then measured against its OWN type's window below. Reading on the
+    # shortest means one query rather than one per type, and no row is acted on early.
+    windows = [_escape_seconds(t) for t in JOB_TYPES] or [QUEUED_ESCAPE_SECONDS]
+    cutoff = _iso(_now() - timedelta(seconds=min(windows)))
     try:
         res = _exec(
             lambda db: db.table(TABLE).select("*")
@@ -1010,12 +1156,21 @@ def sweep_abandoned_queue():
     # One question, asked once, about the whole table: is anything being drained at all?
     # If it is, every one of these rows is waiting rather than abandoned -- including a
     # row of a type that has been waiting behind a busier one.
-    if _queue_is_draining(QUEUED_ESCAPE_SECONDS):
+    #
+    # ASKED OVER THE LONGEST WINDOW, not the shortest. The question is "is this queue
+    # dead", and the slowest type is the one that proves it is alive least often: at a
+    # quarter of an hour an Elegant render finishes four times an hour, so a 30-minute
+    # look-back can legitimately see nothing finish at all while one is in progress.
+    if _queue_is_draining(max(windows)):
         return 0
 
     freed = 0
     for job in rows:
         job_type = job.get("job_type") or JOB_TYPE_CLASSIC
+        waited = _queued_for_seconds(job)
+        if waited is not None and waited < _escape_seconds(job_type):
+            # Not this type's turn to be given up on yet.
+            continue
         attempt = int(job.get("attempts") or 0)
         now = _now()
         patch = {
@@ -1041,9 +1196,30 @@ def sweep_abandoned_queue():
                 "video_jobs: %s job %s sat queued for over %.0f minutes with nothing "
                 "draining the queue -- failed so the listing is not locked out. Check "
                 "that at least one process has VIDEO_QUEUE_CONSUMER enabled.",
-                job_type, job["id"], QUEUED_ESCAPE_SECONDS / 60.0)
+                job_type, job["id"], _escape_seconds(job_type) / 60.0)
             _notify_final_failure(job, patch["error"])
     return freed
+
+
+def _queued_for_seconds(job):
+    """How long this row has sat untouched, or None when the timestamp is unreadable.
+
+    None means "do not use age to decide anything", and every caller treats it as the
+    IMPATIENT answer here on purpose: this function exists to stop a healthy slow job
+    being failed early, and a row whose updated_at we cannot read has already passed the
+    shortest window (that is how the select found it), so falling through to the old
+    behaviour is the conservative choice rather than a new one.
+    """
+    raw = (job or {}).get("updated_at")
+    if not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return max(0.0, (_now() - stamp).total_seconds())
+    except Exception:
+        return None
 
 
 def _reclaim_landed(job_id, attempt, expected_status):
@@ -1115,6 +1291,20 @@ def _average_duration(job_type):
     return average
 
 
+def _quoted_duration(job_type):
+    """What we are willing to TELL an agent one of these takes.
+
+    The rolling mean, with the type's own floor under it. THE FLOOR IS NOT A FUDGE: for a
+    type whose cached regenerate is one minute and whose cold render is fifteen, the mean
+    over recent jobs describes neither of them, and the error that matters is only in one
+    direction. An ETA that is late costs a complaint; an ETA that is early costs a second
+    press of Generate -- which, for a paid feature, costs money as well as patience.
+    Every existing type has a floor of zero, so this is the mean exactly as before.
+    """
+    cfg = JOB_TYPES.get(job_type) or JOB_TYPES[JOB_TYPE_CLASSIC]
+    return max(_average_duration(job_type), float(cfg.min_quoted_seconds or 0))
+
+
 def describe(job):
     """What the agent is shown: where they are, and roughly how long.
 
@@ -1134,7 +1324,7 @@ def describe(job):
     }
     if status == STATUS_RUNNING:
         out["queue_position"] = 0
-        out["eta_seconds"] = int(_average_duration(job_type))
+        out["eta_seconds"] = int(_quoted_duration(job_type))
         return out
     if status != STATUS_QUEUED:
         return out
@@ -1173,7 +1363,7 @@ def describe(job):
 
     concurrency = cfg.account_limit or (cfg.per_process_limit * _worker_count())
     concurrency = max(1, concurrency)
-    average = _average_duration(job_type)
+    average = _quoted_duration(job_type)
     # Rounded up: the honest answer to "when will mine start" is the end of the batch
     # it sits behind, not the average across it.
     waves_ahead = (ahead + concurrency - 1) // concurrency
@@ -1291,6 +1481,54 @@ def execute_job(job):
             _locally_claimed.pop(job_id, None)
 
 
+def claimable_types(order, running):
+    """Which of `order` this process may claim one more of, in the order given.
+
+    TWO CEILINGS, NOT ONE, AND THE SPLIT IS THE ELEGANT'S DOING.
+
+    Admission used to be one check on the SUM of everything in flight, and it stopped
+    looking at any further type as soon as that sum was reached: one render in this
+    process meant this process took no more work of any kind. That was exactly right
+    while every type was ffmpeg from start to finish, because the thing being rationed
+    was 1.6GB of memory and a cpu.
+
+    It is wrong for a type that is asleep waiting on somebody else's API. An Elegant
+    render is 10-15 minutes of which about one is ffmpeg; counting it as a render would
+    take a quarter of this worker's Classic throughput offline for a quarter of an hour
+    to protect a cpu nobody is using -- and, the other way round, a worker rendering a
+    Classic would refuse to even START an Elegant's waiting, which is the work that
+    actually takes the time.
+
+    So renders are counted against renders and waiters against waiters, and a full
+    render slot cannot hide a type that needs no render slot. The memory guarantee the
+    old single check was really providing is still there and is stronger, because it is
+    enforced where the memory is spent: video_renderer._RENDER_SLOTS is a per-process
+    semaphore of ONE that both renderers hold around their ffmpeg phase, so two ffmpeg
+    trees in one process remain impossible however many jobs this worker holds.
+
+    A PURE FUNCTION, deliberately, so the one decision in this module that changed shape
+    for the Elegant can be tested without an event loop, a database or a render.
+    """
+    out = []
+    for job_type in order:
+        cfg = JOB_TYPES.get(job_type)
+        if cfg is None:
+            continue
+        if running.get(job_type, 0) >= cfg.per_process_limit:
+            continue
+        in_flight = sum(
+            count for kind, count in running.items()
+            if kind in JOB_TYPES
+            and JOB_TYPES[kind].counts_toward_render_limit
+            == cfg.counts_toward_render_limit)
+        ceiling = (PER_PROCESS_RENDER_LIMIT if cfg.counts_toward_render_limit
+                   else PER_PROCESS_WAITING_LIMIT)
+        if in_flight >= ceiling:
+            continue
+        out.append(job_type)
+    return out
+
+
 def _poll_delay(has_capacity):
     """Poll briskly while there is somewhere to put work; idle back when there is not."""
     base = POLL_SECONDS if has_capacity else POLL_SECONDS_BUSY
@@ -1373,15 +1611,20 @@ async def run_consumer():
             types = sorted(_RENDERERS)
             rr_start %= max(1, len(types))
             order = types[rr_start:] + types[:rr_start]
+            # Which types this process may take one more of. See claimable_types: a full
+            # render slot no longer stops this worker starting a job that only waits on
+            # somebody else's API, and a waiting job no longer stops it rendering.
+            # Which types this process may take one more of. See claimable_types: a full
+            # render slot no longer stops this worker starting a job that only waits on
+            # somebody else's API, and a waiting job no longer stops it rendering.
+            #
+            # ASKED AGAIN FOR EACH TYPE, against the CURRENT `running`, rather than once
+            # for the whole pass. Claiming a job changes what else this process may take
+            # -- a worker that has just claimed a Classic must not then also claim a
+            # Dramatic -- and a list computed before the first claim would not know that.
             has_capacity = False
             for job_type in order:
-                cfg = JOB_TYPES[job_type]
-                if sum(running.values()) >= PER_PROCESS_RENDER_LIMIT:
-                    # This process is already rendering all it can render. Leaving the
-                    # work in the queue is the honest state: another worker can take it,
-                    # and the agent's position means what it says.
-                    break
-                if running.get(job_type, 0) >= cfg.per_process_limit:
+                if not claimable_types([job_type], running):
                     continue
                 has_capacity = True
                 job = await asyncio.to_thread(claim_next, job_type)

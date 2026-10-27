@@ -49,6 +49,7 @@ import requests
 from PIL import (Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps)
 
 import fal_images
+import fal_video
 import old_to_new
 import photo_upscale
 import slow_read
@@ -3427,6 +3428,51 @@ FLIGHT_LAYER_SCALE = 0.5
 
 TIMEOUT_DRAMATIC_CLIP = 240      # longer than TIMEOUT_CLIP: more inputs, a blend pass
 
+# --- the Elegant's generated clips ----------------------------------------------------
+# An Elegant shot is a VIDEO input rather than a looped still, and twice as long (ten
+# seconds against five), so one shot is roughly twice the frames of a Dramatic room and
+# each of those frames carries a 2160x3840 overlay and a zoompan. Hence its own timeout
+# and its own whole-film budget.
+#
+# MEASURED, on real ffmpeg 7.1, against the Mugliston Road photographs (2026-10-27).
+# A full tear-down body -- the opening still, two exterior clips, the walk-in and four
+# ten-second room clips, 59 seconds of film in all -- encoded in 18.2 seconds:
+#
+#     opening  (still, 4s)    1.1s        room  (clip, 10s)   3.0s
+#     exterior (clip,  5s)    1.7s        room  (clip, 10s)   3.2s
+#     exterior (clip,  5s)    1.6s        room  (clip, 10s)   3.0s
+#     walk-in  (clip,  5s)    1.6s        room  (clip, 10s)   3.0s
+#
+# So ELEGANT_RENDER_BUDGET_SECONDS has about 33x headroom on an Apple Silicon Mac. A
+# Railway worker is slower and shares its cpu, so call it a few times that and the
+# headroom is still large -- which is what a budget should be. The cost is dominated by
+# the 2160x3840 composite and the output encode rather than by the source photographs, so
+# larger originals should not move it much.
+#
+# TIMEOUT_ELEGANT_CLIP is the per-shot ceiling and is generous for the same reason. A
+# budget that is reached degrades the film's later shots rather than failing it.
+TIMEOUT_ELEGANT_CLIP = 420
+ELEGANT_RENDER_BUDGET_SECONDS = 600
+
+# Hard cap on one downloaded clip. Our own bucket serves these (we generated and stored
+# them), so this is a guard against a truncated or runaway body rather than against a
+# hostile one -- but an unbounded read into a Railway worker is an unbounded read whoever
+# is serving it. Matches fal_video.MAX_CLIP_BYTES, which is what we accepted on the way in.
+MAX_CLIP_DOWNLOAD_BYTES = fal_video.MAX_CLIP_BYTES
+CLIP_FETCH_SECONDS = 60
+
+# Ceiling on downloading ALL of a film's clips, SHARED between them.
+#
+# ONE SHARED DEADLINE RATHER THAN ONE EACH, for the reason old_to_new gives for sharing
+# one across a generation pass -- and here there is a second, sharper reason. These
+# downloads happen INSIDE the per-process render slot (render_dramatic_video acquires it
+# before it fetches anything), so a slow bucket does not merely delay this film: it
+# blocks every Classic render on this worker for as long as it takes. Six clips at sixty
+# seconds each would be six minutes of that. Shared, the whole phase is bounded at three
+# minutes, and a bucket slow enough to reach it costs the film some animated shots rather
+# than costing the worker its afternoon.
+ELEGANT_CLIP_FETCH_BUDGET_SECONDS = 180
+
 # --- the disclaimers ------------------------------------------------------------------
 # NOT OPTIONAL, and not interchangeable.
 #
@@ -3451,6 +3497,66 @@ NOTICE_FONT_SIZE = 34
 NOTICE_MARGIN = 44
 NOTICE_BOX_ALPHA = 0.42
 NOTICE_BOX_PAD = 14
+# Drawn as one box however many lines the text has, so a two-line notice reads as one
+# label rather than two stacked ones. Tight, because this is a legal line and not a
+# caption.
+NOTICE_LINE_SPACING = 6
+
+# --- THE ELEGANT'S DISCLAIMERS. JANE'S EXACT WORDING; DO NOT REWORD. ------------------
+#
+# Decided by Jane for the Elegant film, where the claim being made about the image is
+# much larger than the Dramatic's: the Dramatic restyles a room that exists, while the
+# Elegant shows a house that does not exist yet being built on a plot that does.
+#
+#   * ELEGANT_CONCEPT_NOTICE_TEXT goes on every tear-down and rebuild shot. "Rebuild
+#     subject to approval" is the part that matters most and the part a reworded version
+#     would lose: in Singapore a rebuild needs URA and BCA approval, so a film showing a
+#     new house on a plot without that sentence is making a planning claim we are not
+#     entitled to make.
+#   * ELEGANT_INTERIOR_NOTICE_TEXT goes on every redesigned interior.
+#
+# TWO LINES EACH, because they are sentences rather than labels: at NOTICE_FONT_SIZE one
+# line of either would run most of the way across a 1080-wide frame, and a disclosure
+# that is clipped is not a disclosure. The break is written into the constant rather than
+# wrapped at render time so that what is on screen is exactly what is in this file.
+#
+# A NOTE FOR JANE, AND IT IS A REAL DISCREPANCY, NOT A NICETY. The interiors line below
+# was handed to this work as "already shipped". It is not: what ships today on every
+# Dramatic generated frame is AI_NOTICE_TEXT above -- the two words "AI visualisation".
+# The longer sentence is used here, on the Elegant, exactly as Jane wrote it. The
+# Dramatic's shorter line is deliberately LEFT ALONE, because changing it would change
+# what is on screen in a feature that is already live and that is her decision to make,
+# not this one's. If she wants one wording everywhere, AI_NOTICE_TEXT becomes
+# ELEGANT_INTERIOR_NOTICE_TEXT and the Dramatic's own tests follow.
+ELEGANT_CONCEPT_NOTICE_TEXT = ("An AI concept of what could be built here.\n"
+                               "Rebuild subject to approval.")
+ELEGANT_INTERIOR_NOTICE_TEXT = ("AI-generated visualisation,\n"
+                                "not an actual photo of the property")
+# The one shot that has to carry two things at once: a generated clip whose FIRST frame
+# is the real photograph with the neighbours altered, with no separate opening still in
+# front of it to have said so. Reachable in the shot table, so it is answered there
+# rather than left to be noticed later -- a privacy disclosure that can be lost by a
+# missing shot is not a disclosure either.
+ELEGANT_CONCEPT_AND_PRIVACY_NOTICE_TEXT = (ELEGANT_CONCEPT_NOTICE_TEXT + "\n"
+                                           + PRIVACY_NOTICE_TEXT)
+
+# old_to_new's treatment table decides WHICH line each shot carries, as a symbolic kind;
+# this is the one place the kinds become text. Two halves of one rule kept apart on
+# purpose: the table is about the film, and this is about what is legible on a phone.
+NOTICE_TEXTS = {
+    old_to_new.NOTICE_PRIVACY: PRIVACY_NOTICE_TEXT,
+    old_to_new.NOTICE_AI_CONCEPT: ELEGANT_CONCEPT_NOTICE_TEXT,
+    old_to_new.NOTICE_AI_INTERIOR: ELEGANT_INTERIOR_NOTICE_TEXT,
+}
+
+
+def notice_text(kind):
+    """The disclosure line for a notice kind. Unknown kinds get the AI notice rather
+    than nothing: a generated frame with no disclosure is the one failure here that is
+    worse than a wrong-looking one."""
+    if kind is old_to_new.NOTICE_NONE:
+        return None
+    return NOTICE_TEXTS.get(kind, AI_NOTICE_TEXT)
 
 # Room treatments, rotated so the film has rhythm rather than four copies of one effect.
 TREATMENT_SCATTER = "scatter"     # old furniture scatters out, each group on its own path
@@ -3613,6 +3719,12 @@ def _notice_filters(text, workdir, name):
     Read from a file with expansion=none, exactly as the captions are: the text is ours
     rather than model-written, but there is no reason for a second escaping story in one
     module.
+
+    MULTI-LINE IS A REAL CASE, not a courtesy. The Elegant's two disclosures are
+    sentences ("An AI concept of what could be built here. Rebuild subject to approval.")
+    and one line of either would run most of the way across the frame at this font size.
+    A newline in the file is a line break in drawtext, and box=1 draws ONE box around the
+    whole block, so a two-line notice still reads as one label.
     """
     if not text:
         return []
@@ -3623,6 +3735,7 @@ def _notice_filters(text, workdir, name):
         f"drawtext=fontfile={_escape_filter_path(SERIF_REGULAR)}"
         f":textfile={_escape_filter_path(path)}:expansion=none"
         f":fontcolor=white:fontsize={NOTICE_FONT_SIZE}"
+        f":line_spacing={NOTICE_LINE_SPACING}"
         f":x={NOTICE_MARGIN}:y={NOTICE_MARGIN}"
         f":box=1:boxcolor=black@{NOTICE_BOX_ALPHA}:boxborderw={NOTICE_BOX_PAD}"
     ]
@@ -3832,6 +3945,115 @@ def _dramatic_still_clip(photo, out_path, workdir, name, knots, anchor, notice,
         TIMEOUT_DRAMATIC_CLIP)
 
 
+def _fetch_clip_file(url, out_path, deadline=None):
+    """Download one generated clip to `out_path`. Raises on anything at all.
+
+    Bounded three ways, for the same reasons _fetch_image is: a deadline that actually
+    interrupts (through slow_read's watchdog, so a trickling body frees its socket and
+    its thread rather than pinning a worker), a declared-length check before we start,
+    and a running byte cap while we read. A clip we cannot download is not fatal -- the
+    caller degrades that shot -- so the only job here is to fail quickly and cleanly.
+    """
+    # The caller's shared budget, bounded so no single clip can spend all of it.
+    now = time.monotonic()
+    deadline = min(deadline if deadline is not None else now + CLIP_FETCH_SECONDS,
+                   now + CLIP_FETCH_SECONDS)
+    if deadline <= now:
+        raise TimeoutError("out of time before downloading this clip")
+    response = requests.get(url, timeout=(FETCH_ATTEMPT_SECONDS, FETCH_ATTEMPT_SECONDS),
+                            stream=True)
+    try:
+        response.raise_for_status()
+        try:
+            declared = int((response.headers or {}).get("content-length") or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared > MAX_CLIP_DOWNLOAD_BYTES:
+            raise ValueError("the clip is %dMB, over the %dMB limit"
+                             % (declared // 1024 // 1024,
+                                MAX_CLIP_DOWNLOAD_BYTES // 1024 // 1024))
+        written = 0
+        with slow_read.deadline_watchdog(response, deadline):
+            with open(out_path, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=256 * 1024):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("the clip download passed its deadline")
+                    handle.write(chunk)
+                    written += len(chunk)
+                    if written > MAX_CLIP_DOWNLOAD_BYTES:
+                        raise ValueError("the clip is over the size limit")
+        if time.monotonic() > deadline:
+            # An interrupted read can look like a clean end of body, so a download that
+            # ran past its deadline is never trusted to be complete. Half a clip in a
+            # film is worse than a shot shown as a still.
+            raise TimeoutError("the clip download passed its deadline")
+        if written < fal_video.MIN_CLIP_BYTES:
+            raise ValueError("the clip is only %d bytes, too small to be a video"
+                             % written)
+        return out_path
+    finally:
+        slow_read.abandon_response(response)
+
+
+def _dramatic_clip_shot(clip_path, backdrop_source, out_path, workdir, name, knots,
+                        anchor, notice, seconds):
+    """One GENERATED clip -> one shot of the film. The Elegant's only new shot kind.
+
+    THE GEOMETRY IS THE STILLS' GEOMETRY, BY CONSTRUCTION, and that is the point of
+    building it this way. The blurred surround comes from _dramatic_backdrop called on
+    the SAME photograph the shot rests on (the clip's own last keyframe), so the
+    foreground box and its offset are the identical numbers a still of that photograph
+    would use. The clip is scaled into that box and the zoom happens afterwards, in
+    ffmpeg, exactly as it does for a still. That is geometry mistake 1 at the top of this
+    section answered in advance: composing at output size, or cropping without scaling
+    down first, is what makes one shot sit at a different scale from the shots either
+    side so the cut reads as a jump.
+
+    The backdrop is a STILL even though the shot moves, which is deliberate: a blurred
+    surround that changed mid-shot would be the only moving thing nobody asked to move.
+    The same choice _dramatic_room_clip makes, for the same reason.
+
+    `seconds` is the shot's length and bounds the output. eof_action=pass holds the clip's
+    last frame if it came back a little short, and -frames:v cuts it if it came back
+    long, so a model that does not honour its own duration exactly cannot desynchronise
+    the film from the music.
+    """
+    backdrop, (fg_w, fg_h), (ox, oy) = _dramatic_backdrop(backdrop_source)
+    backdrop_path = os.path.join(workdir, f"e_bd_{name}.bmp")
+    backdrop.save(backdrop_path, format="BMP")
+
+    clarity = _clarity_filter()
+    tail = [_zoom_filter(knots, anchor), "setsar=1"]
+    if clarity:
+        tail.append(clarity)
+    tail += _notice_filters(notice, workdir, name)
+    tail.append("format=yuv420p")
+
+    filters = [
+        # fps FIRST: the clip may arrive at 24, 25 or 30, and every frame number in the
+        # zoom ramp is an OUTPUT frame index. Normalising before anything else is what
+        # makes the ramp mean the same thing here as it does over a looped still.
+        f"[1:v]fps={FPS},scale={fg_w}:{fg_h},format=rgb24,setsar=1[fg]",
+        f"[0:v]format=rgb24,setsar=1[bd]",
+        f"[bd][fg]overlay={ox}:{oy}:eof_action=pass:format=rgb[comp]",
+        "[comp]" + ",".join(tail) + "[v]",
+    ]
+    frames = int(round(seconds * FPS))
+    _run_ffmpeg(
+        ["ffmpeg", "-y",
+         "-loop", "1", "-framerate", str(FPS), "-t", f"{seconds:.3f}",
+         "-i", backdrop_path,
+         "-i", clip_path,
+         "-filter_complex", ";".join(filters), "-map", "[v]",
+         # No audio from the clip, ever. generate_audio is pinned off in fal_video, but
+         # the film's own music is added by _finish_film and a second audio stream here
+         # would fight it.
+         "-an",
+         "-frames:v", str(frames)]
+        + _ENCODE_ARGS + [out_path],
+        TIMEOUT_ELEGANT_CLIP)
+
+
 def _dramatic_room_clip(before, after, out_path, workdir, name, treatment, knots,
                         anchor, notice, seconds):
     """One room's transformation. Returns the treatment it ACTUALLY used.
@@ -3945,7 +4167,8 @@ def _dramatic_room_clip(before, after, out_path, workdir, name, treatment, knots
 # ---------------------------------------------------------------------------
 # The film
 # ---------------------------------------------------------------------------
-def dramatic_shots(has_opening, has_exterior, rooms):
+def dramatic_shots(has_opening, has_exterior, rooms, style=DRAMATIC_STYLE_ID,
+                   exterior_clips=(), walkin=None, room_clips=None):
     """The whole film's geometry, as one readable table. Pure; no images, no ffmpeg.
 
     `rooms` is [(has_after, ...)] -- only whether each room can be transformed. Returns
@@ -3954,45 +4177,135 @@ def dramatic_shots(has_opening, has_exterior, rooms):
 
     SEPARATED FROM THE RENDERING ON PURPOSE. This is where the walk-through lives and
     where the disclaimers are decided, and both are things a test should be able to
-    check without ffmpeg, without a network and without a generated image. It is also
-    THE SEAM FOR "ELEGANT": an Elegant room is a generated clip rather than a locally
-    built one, so it becomes another `kind` here and nothing else in the film changes.
+    check without ffmpeg, without a network and without a generated image.
+
+    THIS IS ALSO THE SEAM FOR "ELEGANT", AND IT IS NOW USED. An Elegant shot is a
+    GENERATED CLIP rather than a locally built one, so it is another `kind` here -- the
+    walk-through, the matched cuts and the disclosure rules are shared, which is the
+    whole reason this is one function and not two. Three parameters drive it:
+
+    style          -- DRAMATIC_STYLE_ID (the default, and byte-for-byte the behaviour
+                      that shipped) or ELEGANT_STYLE_ID, which changes only WHICH
+                      disclosure each generated shot carries. See the notice constants.
+    exterior_clips -- [(stage, seconds)] generated exterior clips, in cut order, or ().
+                      The tear-down treatment has two (the house coming down, then the
+                      new one going up); the gentle makeover has none and its exterior
+                      plays as the rebuilt still exactly as the Dramatic's does.
+    walkin         -- (stage, seconds) for the driveway-to-living-room walk-in, or None.
+                      BOTH treatments have one -- it is the effect Jane has praised most
+                      and a hard requirement, not an option -- so None here means it
+                      could not be made. It sits between the outside and the rooms, and
+                      it is the shot that turns a set of room clips into a house tour:
+                      the camera comes up the drive, through the front door, and rests
+                      looking across the living room. Before it existed, that journey
+                      was faked with a hard cut on a matched push and pull (DOOR_PUSH_ZOOM
+                      and PULL_HEAD_SECONDS); with it, the cut is a real move and those
+                      two merely hand it the camera.
+    room_clips     -- {room index: seconds} for rooms that have a generated clip. A room
+                      with an "after" still but NO clip -- its generation was refused,
+                      trimmed by the budget, or lost to a rate limit -- falls back to the
+                      Dramatic's own local, free transformation rather than to a plain
+                      photograph. That degradation is deliberate and it is the best one
+                      available: it costs nothing and it still shows the before and the
+                      after.
     """
+    elegant = style == ELEGANT_STYLE_ID
+    # Which disclosure a generated INTERIOR carries. The Dramatic's own short line is
+    # left exactly as it ships; the Elegant uses Jane's sentence. See the notice block.
+    interior_notice = ELEGANT_INTERIOR_NOTICE_TEXT if elegant else AI_NOTICE_TEXT
+    exterior_clips = list(exterior_clips or ())
+    room_clips = dict(room_clips or {})
+
     shots = []
+    # --- outside the house ------------------------------------------------------------
+    # Built as its own list first, because with the Elegant there can be three exterior
+    # shots rather than two and every one of them has to hand its camera move on to the
+    # next. The old code could write the two pushes out by hand; three cannot be.
+    outside_shots = []
     if has_opening:
         # THE REAL PHOTOGRAPH, neighbours altered. Its own line, and NOT the AI notice:
         # the house in this shot is a photograph and calling it a visualisation would be
         # a false statement about the image.
-        #
-        # Its anchor is always the DOOR, because it is an exterior and the film is on
-        # its way inside. What it pushes TO depends on what follows:
-        #   * a rebuilt exterior -- it hands over its own closing zoom, and the rebuild
-        #     carries the move straight on. The two frames are the same camera on the
-        #     same plot (the rebuild was generated FROM this one), so the cut is a MATCH
-        #     CUT in which the only thing that changes is the house. That is the whole
-        #     reveal, and easing there would make the house appear to leap backwards at
-        #     the moment it changes. See `continuous` in _walkthrough_knots.
-        #   * no rebuilt exterior -- then THIS is the shot we go through the door from,
-        #     so it drives at the door itself and the first room pulls out of it.
-        shots.append({"kind": "still", "role": "opening",
-                      "seconds": OPENING_SECONDS, "notice": PRIVACY_NOTICE_TEXT,
-                      "anchor": DOOR_CENTRE,
-                      "push": CONTAIN_ZOOM_MAX if has_exterior else DOOR_PUSH_ZOOM})
-    if has_exterior:
-        shots.append({"kind": "still", "role": "exterior",
-                      "seconds": EXTERIOR_SECONDS, "notice": AI_NOTICE_TEXT,
-                      "anchor": DOOR_CENTRE, "push": DOOR_PUSH_ZOOM,
-                      "continuous": has_opening})
+        outside_shots.append({"kind": "still", "role": "opening",
+                              "seconds": OPENING_SECONDS,
+                              "notice": PRIVACY_NOTICE_TEXT,
+                              "anchor": DOOR_CENTRE})
+    if exterior_clips:
+        for stage, seconds in exterior_clips:
+            # The tear-down and the rebuild. Both carry the concept line, because both
+            # show a house that does not exist on a plot that does.
+            outside_shots.append({"kind": "clip", "role": "exterior", "stage": stage,
+                                  "seconds": float(seconds),
+                                  "notice": ELEGANT_CONCEPT_NOTICE_TEXT,
+                                  "anchor": DOOR_CENTRE})
+    elif has_exterior:
+        outside_shots.append({"kind": "still", "role": "exterior",
+                              "seconds": EXTERIOR_SECONDS,
+                              "notice": (ELEGANT_CONCEPT_NOTICE_TEXT if elegant
+                                         else AI_NOTICE_TEXT),
+                              "anchor": DOOR_CENTRE})
+    # EVERY EXTERIOR SHOT HANDS ITS MOVE ON, and the LAST one drives at the front door so
+    # the first interior can pull out of it. That matched pair is the walk-through. The
+    # anchor is the DOOR on all of them, because they are exteriors and the film is on its
+    # way inside; and every one after the first is `continuous`, because they are all the
+    # same camera on the same plot (each was generated from the anonymised frame), so the
+    # move must run straight through the cut. Ease it and the house appears to leap
+    # backwards at the moment it changes, which turns the reveal into a glitch.
+    for position, shot in enumerate(outside_shots):
+        shot["push"] = (DOOR_PUSH_ZOOM if position == len(outside_shots) - 1
+                        else CONTAIN_ZOOM_MAX)
+        shot["continuous"] = position > 0
+    if exterior_clips and not has_opening:
+        # A generated clip whose FIRST FRAME is the real photograph with the neighbours
+        # altered, and no opening still in front of it to have said so. It carries both
+        # lines rather than losing one. See
+        # ELEGANT_CONCEPT_AND_PRIVACY_NOTICE_TEXT.
+        outside_shots[0]["notice"] = ELEGANT_CONCEPT_AND_PRIVACY_NOTICE_TEXT
+    shots.extend(outside_shots)
+
+    # --- the walk-in: outside to inside, in one real move -----------------------------
+    #
+    # ITS CAMERA IS THE DOOR PUSH IT REPLACES. The last outside shot still drives at the
+    # front door, and this shot opens at exactly that zoom and CARRIES THE MOVE ON
+    # (continuous), because it is the same camera continuing up the drive -- easing out
+    # here would make the house jump backwards at the moment the real move begins. It
+    # ends on ROOM_PUSH_ZOOM, so the room it has just entered opens there and eases back
+    # out: the camera arrives, and the room opens up around it.
+    walkin_shot = None
+    if walkin:
+        stage, seconds = walkin
+        walkin_shot = {"kind": "clip", "role": "walkin", "stage": stage,
+                       "seconds": float(seconds),
+                       "notice": ELEGANT_CONCEPT_NOTICE_TEXT,
+                       "anchor": DOOR_CENTRE, "push": ROOM_PUSH_ZOOM,
+                       "continuous": True}
+        if outside_shots:
+            shots.append(walkin_shot)
+        else:
+            # No outside shot at all, so there is nothing for it to continue from and
+            # nothing of the exterior on screen before it. It would be a clip that starts
+            # on a house the film never showed, so it is dropped rather than opened on.
+            walkin_shot = None
+
+    # --- inside ------------------------------------------------------------------------
     treatment_no = 0
     for index, has_after in enumerate(rooms):
-        if has_after:
+        if has_after and index in room_clips:
+            shots.append({
+                "kind": "clip", "role": "room", "index": index,
+                "stage": "room:%d" % index,
+                "seconds": float(room_clips[index]), "notice": interior_notice,
+                "anchor": FRAME_CENTRE, "push": ROOM_PUSH_ZOOM,
+            })
+        elif has_after:
             shots.append({
                 "kind": "room", "role": "room", "index": index,
-                "seconds": ROOM_SECONDS, "notice": AI_NOTICE_TEXT,
+                "seconds": ROOM_SECONDS, "notice": interior_notice,
                 "anchor": FRAME_CENTRE, "push": ROOM_PUSH_ZOOM,
-                # Rotated so the film has rhythm. Counted over TRANSFORMED rooms only,
-                # so a room that fell back to a plain photograph does not use up a
-                # treatment and leave the next two looking like the same effect.
+                # Rotated so the film has rhythm. Counted over LOCALLY TRANSFORMED rooms
+                # only, so neither a room that fell back to a plain photograph nor a room
+                # that got a generated clip uses up a treatment and leaves the next two
+                # looking like the same effect.
                 "treatment": DRAMATIC_TREATMENTS[treatment_no % len(DRAMATIC_TREATMENTS)],
             })
             treatment_no += 1
@@ -4012,8 +4325,11 @@ def dramatic_shots(has_opening, has_exterior, rooms):
     # it is why a hard cut here reads as passing through a doorway rather than as an
     # edit. "The last exterior shot" rather than "the exterior", because with no rebuild
     # the opening is the one we come in from.
-    outside = (1 if has_opening else 0) + (1 if has_exterior else 0)
-    if outside and outside < len(shots):
+    # With a walk-in, THIS shot is the one we arrive in, and it already has the door's
+    # anchor; the room after it is an ordinary arrival on the frame's centre. Without
+    # one, the first room keeps the matched push-and-pull that faked the journey.
+    outside = len(outside_shots) + (1 if walkin_shot else 0)
+    if len(outside_shots) and outside < len(shots) and not walkin_shot:
         shots[outside]["anchor"] = DOOR_CENTRE
 
     for position, shot in enumerate(shots):
@@ -4036,8 +4352,16 @@ def dramatic_shots(has_opening, has_exterior, rooms):
 
 def render_dramatic_video(plan, agent_name="", agent_contact_line="",
                           agent_photo_url=None, property_type=None, music_seed=None,
-                          music_track=None, degradations=None):
-    """The "From Old to New" (Dramatic) video. Returns (mp4 bytes, degradations).
+                          music_track=None, degradations=None,
+                          style=DRAMATIC_STYLE_ID):
+    """The "From Old to New" (Dramatic, or Elegant) video. Returns (mp4 bytes, notes).
+
+    `style` picks which of the two films this is. ONE FUNCTION FOR BOTH, deliberately:
+    the walk-through, the matched cuts, the disclosure rules, the budget ladder, the
+    closing card and the music are all shared, and the Elegant differs only in that some
+    of its shots are generated clips rather than locally built ones. A second copy of
+    this function would be a second copy of all of that, and the module's own history
+    (see _dramatic_backdrop) is about what two uncompared copies do.
 
     `plan` is an old_to_new.Plan: the anonymised exterior, the rebuilt exterior, and one
     before/after pair per room, all as urls. Making those is a separate, paid step that
@@ -4076,8 +4400,17 @@ def render_dramatic_video(plan, agent_name="", agent_contact_line="",
         if plan.opening_url and opening is None:
             degradations.append(DRAMATIC_NOTE_NO_EXTERIOR)
         exterior = _fetch(plan.exterior_url) if opening is not None else None
+        # The cleared plot. Only the Elegant's tear-down treatment has one, and it is the
+        # backdrop for the shot that brings the house down.
+        cleared = _fetch(plan.cleared_url) if opening is not None else None
         rooms = []
-        for room in plan.rooms:
+        # WHICH ROOM OF THE PLAN EACH FETCHED ROOM IS. A room whose BEFORE photo cannot
+        # be read is dropped, so position N of `rooms` is not generally room N of the
+        # plan -- and the shot table indexes `rooms` while plan.room_clips is keyed by
+        # the plan. Without this map, one unreadable photo would hand room three's clip
+        # to room two.
+        plan_index_of_fetched = []
+        for plan_index, room in enumerate(plan.rooms):
             before = _fetch(room.get("before_url"))
             if before is None:
                 degradations.append("a room photo could not be read and was left out")
@@ -4088,18 +4421,122 @@ def render_dramatic_video(plan, agent_name="", agent_contact_line="",
                     "a redesigned room image could not be read, so that room is shown "
                     "as it is today")
             rooms.append((before, after))
+            plan_index_of_fetched.append(plan_index)
         if not rooms and opening is None:
             raise RuntimeError("None of this listing's photos could be downloaded")
 
-        shots = dramatic_shots(opening is not None, exterior is not None,
-                               [after is not None for _before, after in rooms])
-
         with tempfile.TemporaryDirectory() as workdir:
+            # --- the generated clips, DOWNLOADED BEFORE THE SHOT TABLE IS BUILT --------
+            #
+            # The order matters. A clip we cannot download has to change the film's
+            # GEOMETRY -- a ten-second generated room becomes a five-second local
+            # transformation -- and the geometry is decided once, by dramatic_shots, from
+            # which every matched cut and the music's fade position are derived. Finding
+            # out mid-loop would mean a shot whose length no longer matches its knots,
+            # which is the drift the Dramatic's own note about clip_seconds is about. So
+            # every clip is on disk, or known to be unavailable, before anything is
+            # planned.
+            clip_files = {}
+            exterior_clips = []
+            walkin = None
+            room_clips = {}
+            # ONE BUDGET FOR ALL OF THEM, because this runs inside the render slot and a
+            # slow bucket would otherwise block every Classic on this worker. See
+            # ELEGANT_CLIP_FETCH_BUDGET_SECONDS.
+            clip_fetch_deadline = time.monotonic() + ELEGANT_CLIP_FETCH_BUDGET_SECONDS
+            if style == ELEGANT_STYLE_ID:
+                backdrops = {}
+                if plan.opening_url:
+                    backdrops[plan.opening_url] = opening
+                if plan.cleared_url:
+                    backdrops[plan.cleared_url] = cleared
+                if plan.exterior_url:
+                    backdrops[plan.exterior_url] = exterior
+                for position, plan_index in enumerate(plan_index_of_fetched):
+                    after_url = plan.rooms[plan_index].get("after_url")
+                    if after_url and rooms[position][1] is not None:
+                        backdrops[after_url] = rooms[position][1]
+                    # The walk-in comes to rest looking across the room AS IT IS TODAY,
+                    # so its backdrop is that room's own real photograph.
+                    before_url = plan.rooms[plan_index].get("before_url")
+                    if before_url:
+                        backdrops[before_url] = rooms[position][0]
+
+                def _take_clip(entry, label):
+                    """Download one clip and find its backdrop, or return None."""
+                    backdrop = backdrops.get(entry.get("backdrop_url"))
+                    if backdrop is None:
+                        # The still this shot rests on could not be read. The plan has
+                        # already reported the missing still; there is nothing to add and
+                        # nothing to rest the clip on.
+                        logger.warning("elegant: no backdrop for the %s clip", label)
+                        return None
+                    path = os.path.join(workdir, "e_src_%s.mp4" % label)
+                    try:
+                        _fetch_clip_file(entry["url"], path, clip_fetch_deadline)
+                    except Exception as e:
+                        logger.warning("elegant: could not download the %s clip (%s)",
+                                       label, e)
+                        degradations.append(
+                            "one animated shot could not be loaded, so it is shown "
+                            "another way")
+                        return None
+                    return {"path": path, "backdrop": backdrop,
+                            "seconds": entry["seconds"]}
+
+                for entry in (plan.exterior_clips or []):
+                    label = re.sub(r"[^A-Za-z0-9_-]", "_", str(entry.get("stage")))
+                    taken = _take_clip(entry, label)
+                    if taken is None:
+                        # THE EXTERIOR STAGES ARE A CHAIN AND HAVE TO BE ALL OR NOTHING.
+                        # The tear-down is two clips that meet on one frame; playing the
+                        # rebuild without the tear-down would show a house rising out of
+                        # a cleared plot the film never cleared. So one missing stage
+                        # drops the whole chain back to the rebuilt still, which is the
+                        # Dramatic's own opening and a perfectly good one.
+                        exterior_clips = []
+                        break
+                    clip_files[entry["stage"]] = taken
+                    exterior_clips.append((entry["stage"], taken["seconds"]))
+                # Keyed by the PLAN's room index on the way in and by the FETCHED room's
+                # index on the way out, because that is what the shot table counts in.
+                # THE WALK-IN, before the rooms, because it is the shot between the
+                # outside and the inside. Taken only when the exterior chain survived:
+                # it opens on the rebuilt exterior and carries that shot's camera on, so
+                # a walk-in with no exterior in front of it would start on a house the
+                # film never showed.
+                if plan.walkin_clip and (exterior_clips or exterior is not None):
+                    taken = _take_clip(plan.walkin_clip, "walkin")
+                    if taken is not None:
+                        clip_files[plan.walkin_clip["stage"]] = taken
+                        walkin = (plan.walkin_clip["stage"], taken["seconds"])
+                    else:
+                        degradations.append(
+                            "the walk-in from the driveway could not be loaded, so the "
+                            "video cuts straight inside instead")
+                for position, plan_index in enumerate(plan_index_of_fetched):
+                    entry = (plan.room_clips or {}).get(plan_index)
+                    if not entry:
+                        continue
+                    taken = _take_clip(entry, "room_%d" % position)
+                    if taken is None:
+                        continue
+                    clip_files["room:%d" % position] = taken
+                    room_clips[position] = taken["seconds"]
+
+            shots = dramatic_shots(
+                opening is not None, exterior is not None,
+                [after is not None for _before, after in rooms],
+                style=style, exterior_clips=exterior_clips, walkin=walkin,
+                room_clips=room_clips)
+
+            budget = (ELEGANT_RENDER_BUDGET_SECONDS if style == ELEGANT_STYLE_ID
+                      else RENDER_BUDGET_SECONDS)
             clip_paths = []
             clip_seconds = []
             fell_back = 0
             for position, shot in enumerate(shots):
-                if clip_paths and time.monotonic() - started > RENDER_BUDGET_SECONDS:
+                if clip_paths and time.monotonic() - started > budget:
                     logger.warning("dramatic: budget reached after %d shots; finishing "
                                    "early", len(clip_paths))
                     degradations.append(
@@ -4109,7 +4546,13 @@ def render_dramatic_video(plan, agent_name="", agent_contact_line="",
                 name = "%02d" % position
                 clip_path = os.path.join(workdir, f"d_clip_{name}.mp4")
                 try:
-                    if shot["kind"] == "room":
+                    if shot["kind"] == "clip":
+                        source = clip_files[shot["stage"]]
+                        _dramatic_clip_shot(
+                            source["path"], source["backdrop"], clip_path, workdir,
+                            name, shot["knots"], shot["anchor"], shot["notice"],
+                            shot["seconds"])
+                    elif shot["kind"] == "room":
                         before, after = rooms[shot["index"]]
                         used = _dramatic_room_clip(
                             before, after, clip_path, workdir, name,
@@ -4164,12 +4607,12 @@ def render_dramatic_video(plan, agent_name="", agent_contact_line="",
                 agent_photo, property_type, music_seed, music_track, degradations)
 
         if degradations:
-            logger.warning("dramatic video rendered with degradations: %s",
-                           "; ".join(degradations))
+            logger.warning("%s video rendered with degradations: %s",
+                           style, "; ".join(degradations))
         logger.info(
-            "dramatic video rendered: %d shot(s), %.1fs, %.1fMB, %.0fs wall clock",
-            len(clip_paths), silent_duration, len(data) / 1024 / 1024,
-            time.monotonic() - started)
+            "%s video rendered: %d shot(s) (%d generated), %.1fs, %.1fMB, %.0fs wall "
+            "clock", style, len(clip_paths), len(clip_files), silent_duration,
+            len(data) / 1024 / 1024, time.monotonic() - started)
         return data, degradations
     finally:
         _RENDER_SLOTS.release()
@@ -4226,7 +4669,8 @@ def _describe_thumbnails(urls):
 
 def plan_old_to_new(image_urls, photo_index=0, video_photos=None, cache=None,
                     store_image=None, images_used_this_month=0,
-                    generate_image=None):
+                    generate_image=None, want_cleared=False, always_describe=False,
+                    order_rooms=None):
     """Everything a Dramatic render needs, as an old_to_new.Plan.
 
     WHICH PHOTO IS WHICH. The first chosen photo is the exterior and the next
@@ -4236,7 +4680,9 @@ def plan_old_to_new(image_urls, photo_index=0, video_photos=None, cache=None,
     deliberate: the agent already has a photo picker and a hero star, so the Dramatic
     needs no new control, and the order they see in My Listings is the order they get.
     A model-labelled space pass could choose better rooms; it would be a second vision
-    call, and it is noted as a follow-up rather than built.
+    call, and for the DRAMATIC it is still noted as a follow-up rather than built. The
+    ELEGANT does run one, because its walk-in has to land on the living room
+    specifically -- see plan_elegant and `order_rooms`.
 
     Raises old_to_new.BudgetExhausted when this agent has no allowance left this month.
     Everything else degrades onto the returned plan.
@@ -4253,6 +4699,15 @@ def plan_old_to_new(image_urls, photo_index=0, video_photos=None, cache=None,
     selected = chosen[:1 + old_to_new.MAX_ROOMS]
     exterior_url = selected[0] if selected else None
     room_urls = [(url, None) for url in selected[1:]]
+    if order_rooms is not None:
+        # The Elegant's living-room-first rule. STYLE ONLY, and never the feature: a
+        # failure here leaves the agent's own order in place, which is exactly what the
+        # Dramatic has always used.
+        try:
+            room_urls = list(order_rooms(exterior_url, room_urls)) or room_urls
+        except Exception as e:
+            logger.warning("old-to-new: could not order the rooms (%s); using the "
+                           "agent's own order", e)
 
     def describe():
         photos = _describe_thumbnails([exterior_url] + [u for u, _ in room_urls])
@@ -4267,7 +4722,194 @@ def plan_old_to_new(image_urls, photo_index=0, video_photos=None, cache=None,
         store_image=store_image,
         describe=describe,
         images_used_this_month=images_used_this_month,
+        want_cleared=want_cleared,
+        always_describe=always_describe,
     )
     if note:
         plan.degradations.insert(0, note)
+    return plan
+
+
+# When a source photograph is too small for the film this builds. The output is
+# 1080x1920 and the composite is assembled at 2160x3840 before the zoom, so a photo
+# whose long edge is under this is being upscaled rather than used, and every generated
+# clip made from it inherits that softness.
+#
+# IT IS A WARNING AND NEVER A REFUSAL. A soft film is still a film, and an agent who
+# only has small photos should get one -- but at US$0.70 a clip they should be told
+# BEFORE they wonder why it looks the way it does, and Jane should be told because her
+# own uploads being thumbnailed is a fixable problem at her end.
+ELEGANT_SOFT_SOURCE_LONG_EDGE = 1280
+
+
+def _warn_about_small_sources(plan):
+    """Tell the agent when this film is being built out of thumbnails.
+
+    CHECKED ON THE PICTURES WE ALREADY HAVE, so it costs nothing: the still-image pass
+    has just fetched every source photograph for its description call, and _fetch_image
+    caches nothing, so this re-reads only the ones already on the plan. A note, never a
+    refusal -- see ELEGANT_SOFT_SOURCE_LONG_EDGE.
+    """
+    urls = [plan.rooms[0]["before_url"]] if plan.rooms else []
+    if plan.opening_url:
+        urls.append(plan.opening_url)
+    # ONE SHARED DEADLINE for a check that is only a courtesy: it must not be able to add
+    # a minute to a render in order to tell the agent their photos are small.
+    deadline = time.monotonic() + SURVEY_FETCH_BUDGET_SECONDS
+    small = 0
+    for url in urls:
+        try:
+            img = _fetch_image(url, attempts=1, deadline=deadline)
+        except Exception:
+            continue
+        if max(img.size) < ELEGANT_SOFT_SOURCE_LONG_EDGE:
+            small += 1
+    if small:
+        logger.warning("elegant: %d source photo(s) are smaller than %dpx on the long "
+                       "edge, so the film is being built out of thumbnails and the "
+                       "generated clips will inherit that softness", small,
+                       ELEGANT_SOFT_SOURCE_LONG_EDGE)
+        plan.degradations.append(
+            "the photos on this listing are small, so the video will look soft -- "
+            "upload larger originals for a sharper film")
+
+
+def _living_room_first(exterior_url, room_urls, copy_guard=None):
+    """`room_urls` reordered so a LIVING ROOM comes first, by the Classic's own labels.
+
+    WHY THIS EXISTS. The Elegant's walk-in comes up the drive, through the front door and
+    rests looking across the first room -- and Jane's requirement is that the first room
+    is the living room: "i want the zoom walk in from driveway living room". Before this,
+    the first room was simply the agent's first chosen photo, which is often a landing or
+    a bedroom.
+
+    IT USES THE CLASSIC'S OWN RANKING, not a second idea of what a good opening is. The
+    Classic already settled this question (SPACE_RANKING: the living room opens the film)
+    and now both styles answer it the same way from the same labels, which is what makes
+    "where does a NestList film begin" one rule rather than two.
+
+    Everything after the first room keeps the agent's own order, because beyond the
+    opening the order they see in My Listings is the order they should get.
+
+    IT COSTS ONE VISION CALL AND NO MONEY AT FAL, and it never raises: an unlabelled set
+    of photos, a missing key or a slow model all leave the agent's order in place, which
+    is what the Dramatic has always used.
+    """
+    if len(room_urls) < 2:
+        return room_urls
+    photos = _describe_thumbnails([url for url, _space in room_urls])
+    surveyed, _note = _survey_photos(photos, copy_guard)
+    spaces = [space for space, _caption in surveyed]
+    # A real "living" label first; failing that, the best-ranked space that is allowed to
+    # open a film at all (SPACE_RANKING's second column), which is the same fallback the
+    # Classic uses. A landing, a bathroom or a staircase is never walked into.
+    best = None
+    for index, space in enumerate(spaces):
+        if space == "living":
+            best = index
+            break
+    if best is None:
+        openers = [(i, s) for i, s in enumerate(spaces) if _space_opens(s)]
+        if openers:
+            best = min(openers, key=lambda pair: (_space_rank(pair[1]), pair[0]))[0]
+    if best is None or best == 0:
+        return [(url, spaces[i] if i < len(spaces) else None)
+                for i, (url, _old) in enumerate(room_urls)]
+    logger.info("elegant: the walk-in lands on photo %d, labelled %r, rather than the "
+                "first chosen room (%r)", best + 1, spaces[best], spaces[0])
+    order = [best] + [i for i in range(len(room_urls)) if i != best]
+    return [(room_urls[i][0], spaces[i] if i < len(spaces) else None) for i in order]
+
+
+def plan_elegant(image_urls, treatment=None, photo_index=0, video_photos=None,
+                 cache=None, clip_cache=None, store_image=None, store_clip=None,
+                 images_used_this_month=0, video_seconds_used_this_month=0,
+                 generate_image=None, generate_clip=None,
+                 on_clip_paid=None, on_clips_cached=None, image_deadline=None,
+                 clip_deadline=None, still_ours=None):
+    """Everything an Elegant render needs: the stills, then the generated clips.
+
+    TWO PASSES IN ONE ORDER, AND THE ORDER IS THE WHOLE DESIGN. The stills come first,
+    beginning with the anonymised exterior, and every clip's two keyframes are stills
+    that pass produced. That is what guarantees the neighbouring homes are altered in
+    every generated frame of the film: there is no path by which a clip can be derived
+    from the agent's original photograph.
+
+    `treatment` is an old_to_new treatment id (or an ElegantTreatment). It decides
+    whether the cleared-plot still is generated, what the exterior clips are, and how
+    each room's prompt is written -- see THE TREATMENT TABLE in old_to_new.
+
+    `on_clip_paid(seconds)` and `on_clips_cached(cache)` are called AS EACH CLIP LANDS
+    rather than at the end. That is not tidiness: this pass takes a quarter of an hour,
+    which is long enough for Railway to redeploy underneath it, and a worker that dies
+    eleven minutes in must leave behind what it bought. Without them the next worker
+    buys the same clips again.
+
+    Raises old_to_new.BudgetExhausted (no picture allowance) or
+    old_to_new.VideoBudgetExhausted (no video allowance). Everything else degrades onto
+    the returned plan.
+    """
+    treatment = treatment if isinstance(treatment, old_to_new.ElegantTreatment) \
+        else old_to_new.resolve_treatment(treatment)
+    clip_cache = dict(clip_cache or {})
+
+    # WHETHER TO PAY FOR A VISION CALL. The clip prompts name the real objects in each
+    # room, so a cold render needs the description pass even when every STILL is already
+    # cached -- which is exactly what happens on a listing that had a Dramatic video made
+    # first. A FULL clip cache needs neither, and that is the common regenerate.
+    chosen, _note = choose_video_photos(video_photos, image_urls)
+    if not chosen:
+        chosen = list(image_urls)
+    room_count = max(0, len(chosen[:1 + old_to_new.MAX_ROOMS]) - 1)
+    # The walk-in counts, or a cache holding every exterior and every room but no walk-in
+    # would read as complete and the description pass would be skipped for a clip that
+    # still has to be bought.
+    expected_clips = (len(treatment.exterior_stages) + room_count
+                      + (1 if treatment.walkin and room_count else 0))
+    prefix = "c%d:%s:" % (old_to_new.CLIP_PROMPT_VERSION, treatment.id)
+    have_clips = sum(1 for key in clip_cache if str(key).startswith(prefix))
+
+    plan = plan_old_to_new(
+        image_urls, photo_index=photo_index, video_photos=video_photos, cache=cache,
+        store_image=store_image, images_used_this_month=images_used_this_month,
+        generate_image=generate_image,
+        want_cleared=treatment.needs_cleared,
+        always_describe=have_clips < expected_clips,
+        # THE WALK-IN HAS TO LAND ON THE LIVING ROOM, ON EVERY RENDER INCLUDING A FULLY
+        # CACHED ONE, and that last part was a money bug before it was written this way.
+        #
+        # The obvious version of this only ordered the rooms when something was going to
+        # be generated, so that a cached regenerate paid for no model call. But the room
+        # ORDER is part of what the walk-in's cache key is built from -- it is keyed on
+        # the first room's own photograph, because that photograph is the clip's last
+        # frame. Skipping the ordering on a regenerate puts the agent's first photo back
+        # in front, which both misses the cached walk-in (US$0.35 to buy again) and lands
+        # the shot on a landing or a bedroom instead of the living room.
+        #
+        # So it runs every time. It costs one vision call -- no money at fal -- against a
+        # render that takes a quarter of an hour cold, which is a trade worth making for
+        # an order that is reproducible.
+        #
+        # THE RESIDUAL, and it is worth knowing: the labels come from a model, so two
+        # renders of one listing can in principle disagree about which room is the living
+        # room. When they do, the walk-in's key misses and that one clip is bought again.
+        # The film is still CORRECT -- the new walk-in lands on the new first room -- and
+        # the new key is cached, so it is a one-off US$0.35 rather than a loop. Making it
+        # impossible would mean persisting the chosen order on the listing; noted as a
+        # follow-up rather than built, because it needs a column and this does not.
+        order_rooms=_living_room_first,
+    )
+    _warn_about_small_sources(plan)
+
+    old_to_new.build_clip_plan(
+        plan, treatment,
+        generate_clip=generate_clip,
+        store_clip=store_clip,
+        clip_cache=clip_cache,
+        seconds_used_this_month=video_seconds_used_this_month,
+        deadline=clip_deadline,
+        on_paid=on_clip_paid,
+        on_cached=on_clips_cached,
+        still_ours=still_ours,
+    )
     return plan

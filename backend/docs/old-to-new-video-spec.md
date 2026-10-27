@@ -16,10 +16,112 @@ and the frontend keys its option list on all three, so none of them may be renam
 |---|---|---|---|
 | Classic | `classic` | today's slideshow, for a property that is already modern | shipped, **unchanged** |
 | Dramatic | `dramatic` | Variation A below — the old furniture flying out | **phase one, built** |
-| Elegant | `elegant` | Variation B below — carried out piece by piece, via Kling | **phase two, not built** |
+| Elegant | `elegant` | real generated motion, via Kling. **Two treatments** — see below | **phase two, built 2026-10-27, switched OFF** |
 
-"Variation B — Makeover (gentle)" below is the **Elegant** video. The word *gentle*
-survives in this file because it describes the effect; *Elegant* is what it is called.
+---
+
+## The Elegant is a TABLE of treatments, not one effect (2026-10-27)
+
+This section supersedes the original reading of Variation B as "the Elegant video".
+
+Jane watched a competitor (Andrew Goh, `drew11luxhome`) and said *"these are the kinds of
+bold videos i am talking about"*. His film is continuous AI video — no scene cuts in 56
+seconds: the old house buckles, folds and throws dust, the modern build rises out of it
+with no cut, and then room by room, camera locked off, the old interior comes apart and
+the new one assembles in the same frame. **That is the headline effect, and it is not
+Variation B.**
+
+So the Elegant takes a **treatment** — one row of `old_to_new.ELEGANT_TREATMENTS` — and
+nothing downstream cares which. Two rows to start:
+
+| Treatment id | What it is | Clips | Cost |
+|---|---|---|---|
+| `tear-down-and-rebuild` | **the headline.** Exterior comes down and the new house rises, with no cut; then each interior comes apart and reassembles | 2 × 5s exterior + **5s walk-in** + 1 × 10s per room | 55s ≈ **US$3.85** + 7 stills ≈ US$0.28 |
+| `gentle-makeover` | Variation B below, verbatim — furniture carried out piece by piece, camera locked off | **5s walk-in** + 1 × 10s per room | 45s ≈ **US$3.15** + 6 stills ≈ US$0.24 |
+
+Jane picks per listing; the id is remembered on the listing because the clip cache is
+keyed on it.
+
+### The walk-in is a hard requirement of both (2026-10-27)
+
+*"i want the zoom walk in from driveway living room."* — the single effect Jane has
+praised most across the whole project, raised again unprompted weeks after she first saw
+it. It is the shot "Shared: the exterior and the tour" below calls the thing that turns a
+set of room clips into a house tour, built in as **standard, not a flag**, with two
+changes to the spec's own version:
+
+1. **It starts at the DRIVEWAY**, not at the facade. The camera begins outside at the
+   gate, low over the drive, goes up the drive, through the front entrance, and comes to
+   rest looking across the living room. One continuous move, no cut.
+2. **It lands on the LIVING ROOM specifically**, chosen by the Classic's own space labels
+   (`SPACE_RANKING` — the living room opens the film) rather than by photo order. The two
+   styles now answer "where does a film begin" the same way, from the same labels. With no
+   living room, it falls back to the best-ranked space that is *allowed* to open a film;
+   a landing, a bathroom or a staircase is never walked into.
+
+Its **end frame is the living room as it is TODAY**, not redesigned — that is the first
+frame of the shot after it, so the two meet exactly and the join is invisible. Landing on
+the redesigned room would cut straight from the new living room to the old one coming
+apart, which reads as a mistake. The one oddity left is a tear-down film walking from a
+conceptual new facade into today's interior: that is the honest version of the arc, and it
+is the creative call in this feature most worth a human's eyes on a real film.
+
+**Five seconds, not ten**, which is a money call on the most-praised shot: ten would give
+the travel more room and take a tear-down listing to US$4.48, the very top of the band
+this feature was costed against. `WALKIN_CLIP_SECONDS` is one constant to change.
+
+With no rebuilt exterior there is **no walk-in** and the film falls back to the Dramatic's
+own hard cut through the door. That is deliberate: starting on the real photograph would
+make the clip's first frame a real picture with altered neighbours, needing a fourth
+disclosure string, for a case that only arises when the exterior has already failed.
+
+**The per-agent ceiling is 165 seconds a calendar month** — US$11.55, exactly three
+tear-down films. It was 150 (three films at 50s) before the walk-in made a tear-down 55
+seconds.
+
+**The tear-down needs one extra still: the CLEARED PLOT.** That is not a nicety, it is
+"The end frame decides what happens" at the bottom of this file applied to the hardest
+shot in the product. Anchored on the finished house the model washes one picture into the
+other — the dissolve Jane's verdict on was *"it is a joke"*. Anchored on a cleared plot it
+has no way there except by bringing the house down. So the tear-down is **two clips that
+meet on that one frame**, which is also what makes them cut together with no visible join.
+
+**The two things that make ours better than his, both non-negotiable:**
+
+1. **The neighbours are anonymised first.** His film leaves the adjacent houses fully
+   recognisable. Every image and every clip of ours derives from the anonymised frame —
+   the first frame of the first clip IS that photograph — so the ordering at the top of
+   `old_to_new.py` is load-bearing and tested, not remembered.
+2. **Nothing is fabricated.** He added a red supercar and a yellow one to the driveway. A
+   generated car is an invented fact about a driveway exactly as an invented bedroom would
+   be. Every prompt pins what stays (*"the driveway and the street stay empty the whole
+   time"*, *"nothing appears that is not named here"*) and
+   `fal_video.NO_FABRICATION_NEGATIVE` excludes what a video model likes to add. Both:
+   the positive pin is what the model follows, the negative is the backstop.
+
+**Written without a single word fal refuses.** A house coming down, described in words
+that get generated rather than refused — see the prompt-safety note below, and
+`teardown_exterior_prompt()` for how. The negative-prompt field is where exclusions live,
+because that is the field for them; the positive prompt carries none, in any polarity.
+
+**The model moved.** The spec names `fal-ai/kling-video/v1.6/pro/image-to-video`, which
+fal has since marked deprecated, and the replacement renamed the keyframe fields
+(`image_url`/`tail_image_url` → `start_image_url`/`end_image_url`). What ships is
+`v2.6/pro`, whose published price with audio **off** is US$0.07 a second — exactly the
+figure measured off Jane's own bill. `generate_audio` defaults to TRUE on that endpoint
+and is pinned off: on, it doubles the bill and adds generated speech.
+`fal_video.MODELS` is one table of endpoint + field names + price, so the next rename is
+an edit rather than a bug hunt.
+
+**Disclaimers for the Elegant, Jane's exact wording:** tear-down and rebuild shots carry
+*"An AI concept of what could be built here. Rebuild subject to approval."*; redesigned
+interiors carry *"AI-generated visualisation, not an actual photo of the property"*. The
+Dramatic's own shorter *"AI visualisation"* is deliberately left as it ships.
+
+---
+
+"Variation B — Makeover (gentle)" below is the **`gentle-makeover` treatment**. The word
+*gentle* survives in this file because it describes the effect.
 
 **Phase one built** (`fal_images.py`, `old_to_new.py`, the Dramatic half of
 `video_renderer.py`, the wiring in `main.py` and `video_jobs.py`):
@@ -34,11 +136,27 @@ survives in this file because it describes the effect; *Elegant* is what it is c
   into the front door and a matched pull-out inside, then a forward push room to room).
 - The disclaimers, enforced per shot rather than per film.
 
-**Phase two, for Elegant**, needs: a Kling client beside `fal_images` (the queue plumbing
-there is model-agnostic), a `JOB_TYPES` entry and one `register_renderer` call in
-`video_jobs`, the template added to `VIDEO_TEMPLATES`, and a `kind` in
-`video_renderer.dramatic_shots` for a room that is a generated clip rather than a locally
-built one. The prompts it needs are below, verbatim.
+**Phase two, for Elegant, BUILT 2026-10-27** and switched off until Jane switches it on
+(`ELEGANT_VIDEO_ENABLED=1` in Railway, plus `docs/old-to-new-elegant-migration.sql`).
+What it turned out to be:
+
+- `fal_video.py`, the Kling client, a **sibling** of `fal_images` rather than a fork of
+  it — the whole HTTP discipline (one absolute deadline that frees the socket and the
+  thread, a body we never quote, the permanent/retryable/rate-limited split) is imported,
+  and only what genuinely differs is new: the unit of money is a SECOND, the time scale is
+  minutes, and the model's field names are data.
+- `old_to_new.ELEGANT_TREATMENTS`, the treatment table, plus the clip plan, the clip cache
+  and a second ceiling in seconds (`MAX_VIDEO_SECONDS_PER_AGENT_PER_MONTH = 150`, about
+  US$10.50 an agent a month, three Elegant films).
+- a `JOB_TYPES` entry and one `register_renderer` call in `video_jobs`, as predicted —
+  but the queue needed more than that, because a quarter-hour job that is mostly asleep
+  broke three of its assumptions. See `JobTypeConfig`'s last four fields.
+- `kind: "clip"` in `video_renderer.dramatic_shots`, as predicted, and
+  `_dramatic_clip_shot` to composite a generated clip at exactly the stills' scale.
+- the template appended to the picker **only when switched on** — it is not in
+  `VIDEO_TEMPLATES`, so the failure mode of forgetting is "not shown" rather than "shown".
+
+The prompts are below, verbatim, and the tear-down treatment's are in `old_to_new.py`.
 
 Both variations need the **same two photographs of each room**: the room as it is, and
 the room redesigned. **The two shots must share a camera position.** That single

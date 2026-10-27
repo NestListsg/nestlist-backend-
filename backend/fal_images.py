@@ -382,8 +382,12 @@ def _body_shape(body_text):
     return f"{size}, JSON {type(parsed).__name__}"
 
 
-def _classify(status_code, body_text):
+def _classify(status_code, body_text, model=None):
     """One HTTP failure -> the exception that says what to do about it.
+
+    `model` names the endpoint that answered, for the 404 message only. It defaults to
+    EDIT_MODEL so every existing caller is unchanged; fal_video passes its own so a 404
+    from the Kling endpoint does not report the image editor's name.
 
     THE BODY IS NEVER QUOTED, in any branch. fal's 4xx bodies echo request detail back,
     and the detail includes the Authorization header we sent; quoting them put the key
@@ -412,7 +416,7 @@ def _classify(status_code, body_text):
             f"fal rejected the request (HTTP {status_code}; {_body_shape(body_text)}; its "
             "reply is not quoted -- it can echo our own request headers)")
     if status_code == 404:
-        return FalPermanent(f"fal does not know the model {EDIT_MODEL!r}")
+        return FalPermanent(f"fal does not know the model {(model or EDIT_MODEL)!r}")
     if status_code >= 500:
         return FalTemporary(f"fal returned {status_code}")
     return FalTemporary(f"fal returned {status_code}")
@@ -424,8 +428,12 @@ def _ambiguous(exc):
     return exc
 
 
-def _request(method, url, deadline, json_body=None):
+def _request(method, url, deadline, json_body=None, model=None):
     """One short HTTP call to fal, under the CALLER'S absolute deadline.
+
+    `model` is passed through to _classify for its 404 message only, so fal_video can
+    reuse this function -- the whole point of it being here -- without a 404 from the
+    Kling endpoint naming the image editor. Omitted, nothing about this changes.
 
     THE DEADLINE NOW FREES THE SOCKET AND THE THREAD, not just the caller, and that is
     the change worth reading. This function used to run the whole call -- connect, send,
@@ -537,28 +545,33 @@ def _request(method, url, deadline, json_body=None):
 
     if status_code >= 400:
         # fal answered, with an error. It did not take the job, so a resubmit is safe.
-        raise _classify(status_code, body)
+        raise _classify(status_code, body, model)
     if payload is None:
         raise _ambiguous(FalTemporary("fal returned something that is not JSON"))
     return payload
 
 
-def _download(url, deadline):
+def _download(url, deadline, max_bytes=None, what="image"):
     """The finished image's bytes, with a hard byte cap and a deadline that interrupts.
 
     THIS one has a socket we can reach, so it gets the real watchdog rather than the
     abandoned thread: a body still arriving at the deadline is cut off by shutting the
     socket down. A tidy close would mean waiting out the trickle -- measured at 80s past
     the deadline in slow_read's own notes.
+
+    `max_bytes` and `what` exist so fal_video can download a Kling mp4 through this
+    exact function rather than growing a second copy of the watchdog discipline. Their
+    defaults reproduce the image behaviour word for word.
     """
+    cap = MAX_IMAGE_BYTES if max_bytes is None else int(max_bytes)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise FalTemporary("ran out of time before downloading the generated image")
+        raise FalTemporary(f"ran out of time before downloading the generated {what}")
     try:
         response = requests.get(url, timeout=(HTTP_CONNECT_SECONDS, HTTP_READ_SECONDS),
                                 stream=True)
     except Exception as e:
-        raise FalTemporary(f"could not download the generated image "
+        raise FalTemporary(f"could not download the generated {what} "
                            f"({type(e).__name__})") from e
     try:
         if response.status_code >= 400:
@@ -568,12 +581,13 @@ def _download(url, deadline):
             with slow_read.deadline_watchdog(response, deadline):
                 for chunk in response.iter_content(chunk_size=64 * 1024):
                     if time.monotonic() > deadline:
-                        raise FalTemporary("the generated image passed its deadline")
+                        raise FalTemporary(
+                            f"the generated {what} passed its deadline")
                     buffer.write(chunk)
-                    if buffer.tell() > MAX_IMAGE_BYTES:
+                    if buffer.tell() > cap:
                         raise FalPermanent(
-                            f"the generated image is over "
-                            f"{MAX_IMAGE_BYTES // 1024 // 1024}MB")
+                            f"the generated {what} is over "
+                            f"{cap // 1024 // 1024}MB")
         except FalError:
             raise
         except Exception as e:
@@ -581,9 +595,9 @@ def _download(url, deadline):
             # Past the deadline, that is what it is.
             if time.monotonic() > deadline:
                 raise FalTemporary(
-                    "the generated image passed its deadline") from e
+                    f"the generated {what} passed its deadline") from e
             raise FalTemporary(
-                f"the generated image download failed ({type(e).__name__})") from e
+                f"the generated {what} download failed ({type(e).__name__})") from e
     finally:
         # Always: this connection is never reused, and the tidy close is the slow one.
         slow_read.abandon_response(response)
@@ -591,10 +605,10 @@ def _download(url, deadline):
         # An interrupted read can look like a clean end of body, so a download that ran
         # past its deadline is never trusted to be complete. Half an image in a video is
         # worse than no transformation at all.
-        raise FalTemporary("the generated image passed its deadline")
+        raise FalTemporary(f"the generated {what} passed its deadline")
     data = buffer.getvalue()
     if not data:
-        raise FalTemporary("fal served an empty image")
+        raise FalTemporary(f"fal served an empty {what}")
     return data
 
 

@@ -36,6 +36,7 @@ import photo_tidy
 import video_renderer
 import video_jobs
 import fal_images
+import fal_video
 import old_to_new
 import ura_market_pulse
 import autoenhance
@@ -372,10 +373,9 @@ async def startup_event():
     # db_execute (so it inherits the retry and poisoned-pool discipline), then the
     # renderers, and only then does it probe and start consuming.
     #
-    # Two render types: 'classic' and 'dramatic' (From Old to New). One JOB_TYPES entry
-    # plus one register_renderer call each is the whole cost of a type -- 'elegant', the
-    # Kling makeover, is phase two and deliberately has neither, so nothing can request
-    # or enqueue it.
+    # Three render types now: 'classic', 'dramatic' and 'elegant' (From Old to New,
+    # phase two -- the Kling film). One JOB_TYPES entry plus one register_renderer call
+    # each is the whole cost of a type, which is the seam video_jobs was built to have.
     video_jobs.configure(db_execute)
     video_jobs.register_renderer(video_jobs.JOB_TYPE_CLASSIC,
                                  _classic_job_run, _classic_job_failed)
@@ -383,6 +383,26 @@ async def startup_event():
                                  _dramatic_job_run, _dramatic_job_failed)
     logger.info("From Old to New (Dramatic) image generation: %s",
                 "ENABLED" if fal_images.is_enabled() else "off (FAL_KEY is not set)")
+    # THE ELEGANT'S RENDERER IS REGISTERED ONLY WHEN THE SWITCH IS ON, and that is the
+    # second half of its gate rather than a nicety. video_jobs never claims a job of a
+    # type with no registered renderer, so on a deploy where the feature is off: the
+    # picker does not offer it, the endpoint refuses it, and even a row inserted by hand
+    # would sit there untouched instead of spending US$3.85. The switch is read ONCE
+    # here, at startup, so turning it on is a restart rather than something that can
+    # change underneath a render.
+    if _elegant_switch_on():
+        video_jobs.register_renderer(video_jobs.JOB_TYPE_ELEGANT,
+                                     _elegant_job_run, _elegant_job_failed)
+        logger.warning(
+            "From Old to New (Elegant) video generation: SWITCHED ON. This is the "
+            "expensive one -- about US$3.85 a listing, capped at %ds of generated video "
+            "per agent per calendar month (about US$%.2f). fal's own billing spend limit "
+            "is the only cap no bug here can outrun.",
+            old_to_new.MAX_VIDEO_SECONDS_PER_AGENT_PER_MONTH,
+            fal_video.clip_cost_usd(old_to_new.MAX_VIDEO_SECONDS_PER_AGENT_PER_MONTH))
+    else:
+        logger.info("From Old to New (Elegant) video generation: off (set %s=1 to "
+                    "switch it on)", ELEGANT_VIDEO_ENABLED_ENV)
     # The per-agent monthly image ceiling lives in two columns on the agents row. If
     # they are missing while the key IS set, we are generating paid images with no
     # ceiling at all -- which is precisely the condition Jane must hear about rather
@@ -408,6 +428,29 @@ async def _check_old_to_new_ceiling():
     except Exception as e:
         logger.warning("could not probe the old-to-new tally columns (%s)", e)
         return
+    # The Elegant's own seconds tally, probed in the same pass. Only worth a message when
+    # the feature is actually switched on: with the switch off nothing can be spent, so a
+    # missing column costs nothing -- and _elegant_available() keeps the style off anyway.
+    try:
+        seconds_present = await asyncio.to_thread(_probe_elegant_seconds_columns)
+    except Exception as e:
+        logger.warning("could not probe the elegant seconds columns (%s)", e)
+        seconds_present = None
+    if _elegant_switch_on() and seconds_present is False:
+        await send_telegram_alert_throttled(
+            "elegant_seconds_ceiling_missing",
+            "⚠️ <b>NestList Warning</b>\n\nThe <b>Elegant</b> video style is switched "
+            "ON, but its monthly video allowance is <b>not being counted</b>: the "
+            "<code>agents.old_to_new_video_month</code> / "
+            "<code>agents.old_to_new_video_seconds</code> columns are missing.\n\nSo "
+            "Elegant is switched off until they exist -- agents are offered Classic and "
+            "Dramatic instead. This is the expensive style (about <b>US$3.85 a "
+            "listing</b>), so it will not generate anything with no spending limit but "
+            "fal's own billing cap.\n\nFix: run "
+            "<code>docs/old-to-new-elegant-migration.sql</code> in the Supabase SQL "
+            "editor.",
+            cooldown_seconds=86400,
+        )
     if present or not fal_images.is_enabled():
         return
     await send_telegram_alert_throttled(
@@ -5342,12 +5385,50 @@ VIDEO_TEMPLATES = [
     {"id": DRAMATIC_VIDEO_TEMPLATE_ID, "name": "Dramatic"},
 ]
 
+# THE ELEGANT'S SWITCH. Deliberately NOT a template in the list above, and deliberately
+# NOT satisfied by FAL_KEY alone.
+#
+# WHY A SWITCH OF ITS OWN. The Dramatic's gate is "is there a key", which was the right
+# gate for it: no key, no feature, and a deploy either has one or it does not. That gate
+# is useless for the Elegant, because the key IS already set in production for the
+# Dramatic -- so if the key were the gate, the moment this code deployed, every agent
+# would be offered a US$3.85-a-press feature that no human has yet watched the output of.
+# ELEGANT_VIDEO_ENABLED is how Jane turns it on, once, when she has seen a real film.
+#
+# Four conditions, and each of them is a thing that would otherwise cost money or
+# credibility:
+#   1. the switch, so a deploy cannot expose a half-built paid feature;
+#   2. a key, because without one there is nothing to generate with;
+#   3. the IMAGE tally columns, because every clip's keyframes are generated stills and
+#      without the tally there is no ceiling and no cache on those;
+#   4. the SECONDS tally columns, same argument in the unit that costs fifteen times more.
+ELEGANT_VIDEO_ENABLED_ENV = "ELEGANT_VIDEO_ENABLED"
+
+
+def _elegant_switch_on() -> bool:
+    return os.environ.get(ELEGANT_VIDEO_ENABLED_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _elegant_available() -> bool:
+    """Can an agent choose the Elegant style on this deploy RIGHT NOW?
+
+    Everything that touches the Elegant asks this one function -- the picker, the
+    template resolver, the endpoint, and the renderer registration at startup -- so there
+    is one answer and it cannot be true in one place and false in another.
+    """
+    return bool(_elegant_switch_on()
+                and fal_video.is_enabled()
+                and _old_to_new_ceiling_enforceable()
+                and _elegant_seconds_ceiling_enforceable())
+
 # Which queue each template renders on. One template, one job type, same spelling, so
 # there is never a mapping table to get out of step -- and the Dramatic's own concurrency
 # and ETA (video_jobs.JOB_TYPES) apply to Dramatic renders only.
 VIDEO_TEMPLATE_JOB_TYPES = {
     DEFAULT_VIDEO_TEMPLATE_ID: video_jobs.JOB_TYPE_CLASSIC,
     DRAMATIC_VIDEO_TEMPLATE_ID: video_jobs.JOB_TYPE_DRAMATIC,
+    ELEGANT_VIDEO_TEMPLATE_ID: video_jobs.JOB_TYPE_ELEGANT,
 }
 
 
@@ -5380,7 +5461,8 @@ def _job_type_for_template(template_id):
 # end up naming the other style. docs/video-jobs-dramatic-migration.sql widens the
 # partial unique index to (listing_id) alone so the database refuses the second row
 # whatever the app does. Until Jane runs it, this check is all there is.
-VIDEO_JOB_TYPES = (video_jobs.JOB_TYPE_CLASSIC, video_jobs.JOB_TYPE_DRAMATIC)
+VIDEO_JOB_TYPES = (video_jobs.JOB_TYPE_CLASSIC, video_jobs.JOB_TYPE_DRAMATIC,
+                   video_jobs.JOB_TYPE_ELEGANT)
 
 
 def _find_active_video_job(listing_id: str):
@@ -5425,16 +5507,37 @@ RETIRED_VIDEO_TEMPLATE_IDS = {"card"}  # "Card Overlay", withdrawn 2026-08-15
 # Named, declared, and not built yet. Kept apart from "unknown" so an agent on a
 # frontend that lists all three is told it is coming rather than told they sent
 # nonsense -- and, more importantly, so it is never silently rendered as a Classic.
+# Named, declared, and not switched on. Kept apart from "unknown" so an agent on a
+# frontend that lists all three is told it is coming rather than told they sent
+# nonsense -- and, more importantly, so it is never silently rendered as a Classic.
+#
+# NOW CONDITIONAL, because the Elegant is built: an id that is unreleased on a deploy
+# where the switch is off is a perfectly good id on a deploy where it is on, and "not
+# available yet" has to be the honest answer in exactly one of those cases.
+def _unreleased_video_template_ids():
+    return set() if _elegant_available() else {ELEGANT_VIDEO_TEMPLATE_ID}
+
+
+# Kept as a module constant for anything that imported it; the live set is the function
+# below, because one of the three is now switched on and off at runtime.
 UNRELEASED_VIDEO_TEMPLATE_IDS = {ELEGANT_VIDEO_TEMPLATE_ID}
 
 _LIVE_VIDEO_TEMPLATE_IDS = {t["id"] for t in VIDEO_TEMPLATES}
+
+
+def _live_video_template_ids():
+    """The ids this deploy can actually render right now."""
+    ids = set(_LIVE_VIDEO_TEMPLATE_IDS)
+    if _elegant_available():
+        ids.add(ELEGANT_VIDEO_TEMPLATE_ID)
+    return ids
 
 
 def _resolve_video_template_id(requested_id):
     """Maps a requested or stored template id onto one we can actually render.
     Returns None for an id we have never shipped, so the caller can reject it as a
     genuine client bug rather than silently papering over a typo."""
-    if requested_id in _LIVE_VIDEO_TEMPLATE_IDS:
+    if requested_id in _live_video_template_ids():
         return requested_id
     if requested_id in RETIRED_VIDEO_TEMPLATE_IDS:
         return DEFAULT_VIDEO_TEMPLATE_ID
@@ -5468,10 +5571,19 @@ def get_video_templates(agent=Depends(get_current_agent)):
     no cache, so every press would pay again and nothing would add up. See
     _old_to_new_ceiling_enforceable.
     """
+    offered = list(VIDEO_TEMPLATES)
     if not fal_images.is_enabled() or not _old_to_new_ceiling_enforceable():
-        return [t for t in VIDEO_TEMPLATES
-                if t["id"] != DRAMATIC_VIDEO_TEMPLATE_ID]
-    return VIDEO_TEMPLATES
+        offered = [t for t in offered if t["id"] != DRAMATIC_VIDEO_TEMPLATE_ID]
+    # THE ELEGANT IS ADDED RATHER THAN FILTERED, which is the shape that keeps it
+    # unreachable by default. The Dramatic is in the static list and taken out when it
+    # cannot work; the Elegant is not in the list at all and put in only when every one of
+    # _elegant_available()'s four conditions holds. A deploy that forgets to switch it on
+    # therefore cannot leak it -- the failure mode of a filter is "shown by mistake", and
+    # the failure mode of an append is "not shown", which is the right way round for a
+    # feature that costs US$3.85 a press.
+    if _elegant_available():
+        offered.append({"id": ELEGANT_VIDEO_TEMPLATE_ID, "name": "Elegant"})
+    return offered
 
 
 @app.get("/api/music-tracks")
@@ -5975,6 +6087,23 @@ OLD_TO_NEW_MONTH_COLUMN = "old_to_new_month"
 OLD_TO_NEW_IMAGES_COLUMN = "old_to_new_images_used"
 # Set by the startup probe. None means "not probed yet".
 _old_to_new_usage_columns_supported = None
+
+# THE ELEGANT'S OWN TALLY, in the unit the Elegant is billed in: SECONDS OF VIDEO.
+#
+# A SECOND PAIR OF COLUMNS RATHER THAN A CONVERSION, and the reason is the whole argument
+# of the ceiling blocks in old_to_new: the tally has to be in the unit that is billed.
+# Kling bills per second of generated video at US$0.07 a second, which is fifteen times
+# what an image costs, so adding seconds into an image counter at some exchange rate would
+# produce a number that is neither a count of images nor a count of seconds and that
+# nobody could check against a bill.
+#
+# Everything else about them is identical to the image pair -- the month lives in its own
+# column so the reset is a comparison rather than a cron job, NULL is kept distinct from
+# zero, and the write is the same compare-and-swap -- which is why the functions below are
+# the SAME FUNCTIONS with different column names rather than a second copy of them.
+ELEGANT_VIDEO_MONTH_COLUMN = "old_to_new_video_month"
+ELEGANT_VIDEO_SECONDS_COLUMN = "old_to_new_video_seconds"
+_elegant_seconds_columns_supported = None
 # Compare-and-swap, the same shape as the photo-array one above and for the same reason:
 # several Dramatic renders may add to one agent's row at once, and a plain
 # read-modify-write would let one of them lose its images from the tally.
@@ -6011,24 +6140,33 @@ def _current_usage_month() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m")
 
 
-def _read_old_to_new_usage(agent_id: str):
+def _read_old_to_new_usage(agent_id: str,
+                           month_column: str = OLD_TO_NEW_MONTH_COLUMN,
+                           value_column: str = OLD_TO_NEW_IMAGES_COLUMN):
     """The tally as the agent row actually stores it, or None if the row is not there.
 
     Returns (month, images) where either may be None. NULL IS KEPT DISTINCT FROM ZERO on
     purpose: a never-counted agent has NULL in both columns, and a compare-and-swap that
     pinned `images = 0` against a NULL column would never match and would quietly lose
     every first write. The same trap the photo-array compare-and-swap documents above.
+
+    THE COLUMN NAMES ARE PARAMETERS so the Elegant's seconds tally is THIS function with
+    two different column names rather than a second copy of it. Every lesson in this
+    block -- NULL is not zero, the month is a comparison, the write is a
+    compare-and-swap, the count is in the unit that is billed -- applies identically to
+    both, and a second copy is a second place for one of them to be forgotten. The
+    defaults are the image columns, so every existing caller is unchanged.
     """
     res = db_execute(
         lambda db: db.table("agents")
-        .select(f"{OLD_TO_NEW_MONTH_COLUMN},{OLD_TO_NEW_IMAGES_COLUMN}")
+        .select(f"{month_column},{value_column}")
         .eq("id", str(agent_id)),
         what="old_to_new usage read")
     if not res.data:
         return None
     row = res.data[0]
-    month = row.get(OLD_TO_NEW_MONTH_COLUMN)
-    raw = row.get(OLD_TO_NEW_IMAGES_COLUMN)
+    month = row.get(month_column)
+    raw = row.get(value_column)
     images = None
     if raw is not None:
         try:
@@ -6070,8 +6208,15 @@ def _old_to_new_images_used(agent_id: str, listing_id: str) -> int:
     return images or 0
 
 
-def _add_old_to_new_images(agent_id: str, images: int) -> bool:
+def _add_old_to_new_images(agent_id: str, images: int,
+                           month_column: str = OLD_TO_NEW_MONTH_COLUMN,
+                           value_column: str = OLD_TO_NEW_IMAGES_COLUMN,
+                           unit: str = "image") -> bool:
     """Add `images` to this agent's month-to-date tally. Returns whether it landed.
+
+    THE COLUMN NAMES AND THE UNIT ARE PARAMETERS, so the Elegant's seconds tally is this
+    function with different columns rather than a second copy of its eight-attempt
+    compare-and-swap. See _read_old_to_new_usage for why one function rather than two.
 
     Called after the generation pass, with the number of images that were actually paid
     for -- including any we paid for and then failed to store, because fal charged for
@@ -6088,32 +6233,37 @@ def _add_old_to_new_images(agent_id: str, images: int) -> bool:
     month = _current_usage_month()
     for attempt in range(_OLD_TO_NEW_CAS_ATTEMPTS):
         try:
-            usage = _read_old_to_new_usage(agent_id)
+            usage = _read_old_to_new_usage(agent_id, month_column, value_column)
             if usage is None:
-                logger.warning("old-to-new: no agent row to record %d image(s) against",
-                               images)
+                logger.warning("old-to-new: no agent row to record %d %s(s) against",
+                               images, unit)
                 return False
             stored_month, stored_images = usage
             previous = (stored_images or 0) if stored_month == month else 0
             update = db_execute(
                 lambda db: _old_to_new_cas(db, agent_id, stored_month, stored_images,
-                                           month, previous + images),
+                                           month, previous + images,
+                                           month_column, value_column),
                 what="old_to_new usage increment")
         except Exception as e:
-            logger.warning("old-to-new: could not record %d image(s) against this "
-                           "agent's monthly tally (%s: %s)", images, type(e).__name__, e)
+            logger.warning("old-to-new: could not record %d %s(s) against this "
+                           "agent's monthly tally (%s: %s)", images, unit,
+                           type(e).__name__, e)
             return False
         if bool(getattr(update, "data", None)):
             return True
         # Zero rows changed means somebody else wrote the tally between our read and our
         # write -- the other concurrent render. Re-read and add to theirs.
         time.sleep(0.05 * (attempt + 1))
-    logger.warning("old-to-new: gave up recording %d image(s) after %d attempts; this "
-                   "month's tally is low by that much", images, _OLD_TO_NEW_CAS_ATTEMPTS)
+    logger.warning("old-to-new: gave up recording %d %s(s) after %d attempts; this "
+                   "month's tally is low by that much", images, unit,
+                   _OLD_TO_NEW_CAS_ATTEMPTS)
     return False
 
 
-def _old_to_new_cas(db, agent_id, stored_month, stored_images, month, total):
+def _old_to_new_cas(db, agent_id, stored_month, stored_images, month, total,
+                    month_column=OLD_TO_NEW_MONTH_COLUMN,
+                    images_column=OLD_TO_NEW_IMAGES_COLUMN):
     """One compare-and-swap on the tally.
 
     Both stored values are pinned in the WHERE clause, so the write only lands if the row
@@ -6125,12 +6275,12 @@ def _old_to_new_cas(db, agent_id, stored_month, stored_images, month, total):
     fallback can actually reach rather than against the queue's limit.
     """
     q = (db.table("agents")
-         .update({OLD_TO_NEW_MONTH_COLUMN: month, OLD_TO_NEW_IMAGES_COLUMN: total})
+         .update({month_column: month, images_column: total})
          .eq("id", str(agent_id)))
-    q = (q.eq(OLD_TO_NEW_IMAGES_COLUMN, stored_images) if stored_images is not None
-         else q.filter(OLD_TO_NEW_IMAGES_COLUMN, "is", "null"))
-    return (q.eq(OLD_TO_NEW_MONTH_COLUMN, stored_month) if stored_month
-            else q.filter(OLD_TO_NEW_MONTH_COLUMN, "is", "null"))
+    q = (q.eq(images_column, stored_images) if stored_images is not None
+         else q.filter(images_column, "is", "null"))
+    return (q.eq(month_column, stored_month) if stored_month
+            else q.filter(month_column, "is", "null"))
 
 
 def _old_to_new_ceiling_enforceable() -> bool:
@@ -6155,6 +6305,81 @@ def _old_to_new_ceiling_enforceable() -> bool:
     fault rather than a protection.
     """
     return _old_to_new_usage_columns_supported is not False
+
+
+def _elegant_seconds_used(agent_id: str) -> int:
+    """How many SECONDS of generated video this agent has been billed for this month.
+
+    The seconds twin of _old_to_new_images_used, and it returns 0 on any failure for
+    exactly the same reason: the authoritative hard cap is fal's own billing spend limit,
+    and a database blip must not stop an agent making a video they are entitled to. The
+    failure is loud rather than silent -- the startup probe tells Jane on Telegram if the
+    columns are missing -- and _elegant_available() refuses the whole style when the probe
+    has actually looked and found them gone, so a read failure here is a blip and not an
+    open tap.
+    """
+    try:
+        usage = _read_old_to_new_usage(agent_id, ELEGANT_VIDEO_MONTH_COLUMN,
+                                      ELEGANT_VIDEO_SECONDS_COLUMN)
+    except Exception as e:
+        logger.warning("elegant: could not read this month's video-seconds tally (%s); "
+                       "allowing the render", e)
+        return 0
+    if not usage:
+        return 0
+    month, seconds = usage
+    if month != _current_usage_month():
+        return 0
+    return seconds or 0
+
+
+def _add_elegant_seconds(agent_id: str, seconds: int) -> bool:
+    """Add `seconds` of billed video to this agent's month-to-date tally.
+
+    CALLED AS EACH CLIP IS CHARGED FOR, not once at the end of the pass, and that is the
+    difference a quarter-hour render makes. The image pass is over in four minutes and
+    one write at the end of it is fine; a clip pass runs for fifteen, which is long
+    enough for Railway to redeploy, for the worker to be killed, and for the stale sweep
+    to hand the job to somebody else. A tally written only at the end would record
+    nothing for a pass that spent US$3.15 and then died, and the next worker would spend
+    it again against a ceiling that had not moved.
+    """
+    return _add_old_to_new_images(agent_id, seconds,
+                                  month_column=ELEGANT_VIDEO_MONTH_COLUMN,
+                                  value_column=ELEGANT_VIDEO_SECONDS_COLUMN,
+                                  unit="second of video")
+
+
+def _elegant_seconds_ceiling_enforceable() -> bool:
+    """Can the per-agent monthly VIDEO allowance actually be enforced right now?
+
+    Same wiring as _old_to_new_ceiling_enforceable and the same argument, with more money
+    behind it: without a tally there is no ceiling, so we decline to generate paid video
+    at all rather than generate it with no limit but fal's own billing cap. False ONLY
+    when the probe has looked and found the columns missing; None (the probe has not
+    finished) reads as enforceable, because a start-up race is our fault rather than a
+    protection.
+    """
+    return _elegant_seconds_columns_supported is not False
+
+
+def _probe_elegant_seconds_columns():
+    """Are the agent-row video-seconds columns there? Sets the flag; never raises."""
+    global _elegant_seconds_columns_supported
+    try:
+        get_db().table("agents").select(
+            f"{ELEGANT_VIDEO_MONTH_COLUMN},{ELEGANT_VIDEO_SECONDS_COLUMN}"
+        ).limit(1).execute()
+        _elegant_seconds_columns_supported = True
+        logger.info("elegant monthly video-seconds tally columns present -- the "
+                    "per-agent ceiling is enforced")
+    except Exception:
+        _elegant_seconds_columns_supported = False
+        logger.warning("elegant monthly video-seconds tally columns are MISSING -- "
+                       "there is nothing to count generated video in, so the Elegant "
+                       "style is DECLINED rather than generated with no ceiling. Run "
+                       "docs/old-to-new-elegant-migration.sql.")
+    return _elegant_seconds_columns_supported
 
 
 def _probe_old_to_new_usage_columns():
@@ -6487,8 +6712,340 @@ def _dramatic_job_failed(job: dict, error_text: str):
                        job["id"], e)
 
 
+# ---------------------------------------------------------------------------
+# "From Old to New" (Elegant): the generated CLIPS, and the render.
+#
+# Everything the Dramatic's section says about ownership still holds -- old_to_new owns
+# the prompts, the treatments, the ceilings and the cache formats; fal_video owns the
+# Kling call; video_renderer owns the film; this file owns storage and what a finished
+# video means for the listing row.
+#
+# WHAT IS DIFFERENT, AND IT IS ONLY EVER THESE THREE THINGS:
+#   1. the money is fifteen times larger (US$3.85 a listing against US$0.24), so there is
+#      a second ceiling in a second unit;
+#   2. the pass takes a quarter of an hour, so what it buys is persisted AS IT LANDS
+#      rather than at the end -- a worker killed eleven minutes in must not cost Jane the
+#      clips it already paid for;
+#   3. it is switched OFF until Jane switches it on, because a key is not consent.
+# ---------------------------------------------------------------------------
+# Generated clips live beside the generated stills, in their own folder, for the same
+# reason: nothing reads this prefix except the Elegant renderer, and listings.images
+# never points into it.
+ELEGANT_CLIP_PREFIX = "old-to-new-clips"
+
+
+def _store_generated_clip(listing_id: str, stage: str, key: str, data: bytes) -> str:
+    """Upload one generated clip and return its public URL.
+
+    Reuses the video upload's retry ladder, and here the retry is worth even more than it
+    is for a finished film: losing this upload means paying fal US$0.70 again for a clip
+    we already have. The path is fixed and derived from the cache key, so retrying is an
+    upsert of the same bytes to the same place.
+    """
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{key}")
+    filename = f"{ELEGANT_CLIP_PREFIX}/{listing_id}/{safe}.mp4"
+    delay = VIDEO_UPLOAD_BACKOFF_SECONDS
+    for attempt in range(1, VIDEO_UPLOAD_ATTEMPTS + 1):
+        try:
+            supabase = get_db()
+            supabase.storage.from_("listings-images").upload(
+                filename, data, {"content-type": "video/mp4", "upsert": "true"})
+            return supabase.storage.from_("listings-images").get_public_url(filename)
+        except Exception as e:
+            logger.warning("elegant: upload of %s failed (attempt %d/%d): %s: %s",
+                           filename, attempt, VIDEO_UPLOAD_ATTEMPTS, type(e).__name__, e)
+            if attempt == VIDEO_UPLOAD_ATTEMPTS:
+                raise
+            if isinstance(e, _DB_TRANSPORT_ERRORS):
+                _reset_db()
+            time.sleep(delay)
+            delay *= 2
+
+
+def _render_elegant_core(listing_id: str, agent: dict, listing: dict,
+                         photo_index: int, treatment_id: str = None,
+                         music_track: str = None, video_photos: list = None,
+                         ownership_check=None, record_degradations=None,
+                         defer_on_rate_limit: bool = True):
+    """Plan, generate, render, store, and write the finished URL onto the listing.
+
+    Shaped like _render_dramatic_core and for the same reasons. Returns
+    (video_url, degradations); raises on failure.
+    """
+    try:
+        fresh = db_execute(
+            lambda db: db.table("listings").select("*").eq("id", listing_id)
+            .eq("agent_id", agent["id"]),
+            what="_render_elegant_core listings select")
+        if fresh.data:
+            listing = fresh.data[0]
+    except Exception as e:
+        logger.warning("elegant job %s: could not re-read listing (%s); using the "
+                       "queued snapshot", listing_id, e)
+
+    images = listing.get("images") or []
+    if not images:
+        raise RuntimeError("This listing has no photos any more -- add a photo and "
+                           "generate the video again.")
+    if photo_index < 0 or photo_index >= len(images):
+        photo_index = 0
+
+    # NO SWITCH, NO SPENDING. The backstop for the same check in generate_video: a job
+    # queued before the switch was turned off, or before a migration was rolled back,
+    # must not reach fal either. Permanent on purpose -- no number of retries creates a
+    # database column or sets an environment variable.
+    if not _elegant_available():
+        raise video_jobs.PermanentJobError(
+            "The Elegant video style is not switched on for this account yet. The "
+            "Classic and Dramatic videos are available in the meantime.")
+
+    # The treatment: what the agent asked for, else what this listing last used, else the
+    # headline. REMEMBERED ON THE LISTING because the clip cache is keyed on it -- a
+    # regenerate that silently changed treatment would pay for a whole new film.
+    treatment = old_to_new.resolve_treatment(
+        treatment_id or listing.get("old_to_new_treatment"))
+
+    def _on_clip_paid(seconds):
+        # Written the instant fal is charged, not at the end of the pass. See
+        # _add_elegant_seconds.
+        _add_elegant_seconds(agent["id"], seconds)
+
+    def _on_clips_cached(clip_cache):
+        if "old_to_new_clips" not in listing:
+            # Pre-migration: the feature cannot be switched on at all in this state
+            # (_elegant_available checks the columns), so this is belt rather than
+            # braces -- but a write to a column that is not there would fail every clip.
+            return
+        db_execute(
+            lambda db: db.table("listings").update({
+                "old_to_new_clips": old_to_new.write_clip_cache(clip_cache)
+            }).eq("id", listing_id).eq("agent_id", agent["id"]),
+            what="_render_elegant_core clip cache update")
+
+    # --- the paid steps. Cached stills and cached clips both cost nothing. ------------
+    plan = video_renderer.plan_elegant(
+        images,
+        treatment=treatment,
+        photo_index=photo_index,
+        video_photos=video_photos,
+        cache=old_to_new.read_cache(listing.get("old_to_new_images")),
+        clip_cache=old_to_new.read_clip_cache(listing.get("old_to_new_clips")),
+        store_image=lambda role, key, data: _store_generated_image(
+            listing_id, role, key, data),
+        store_clip=lambda stage, key, data: _store_generated_clip(
+            listing_id, stage, key, data),
+        images_used_this_month=_old_to_new_images_used(agent["id"], listing_id),
+        video_seconds_used_this_month=_elegant_seconds_used(agent["id"]),
+        on_clip_paid=_on_clip_paid,
+        on_clips_cached=_on_clips_cached,
+        # STOP BUYING IF THIS RENDER IS NO LONGER OURS. The job row is fenced against a
+        # late write, so a superseded worker's film is discarded harmlessly -- but over a
+        # quarter of an hour that discarded film could have cost another US$3.15. The
+        # heartbeat already answers "is this still mine", so this is three extra reads.
+        still_ours=ownership_check,
+    )
+    # The STILLS tally, exactly as the Dramatic records it and for the same reasons. The
+    # CLIP tally has already been written, clip by clip, through the hook above.
+    if plan.images_paid:
+        _add_old_to_new_images(agent["id"], plan.images_paid)
+
+    # STORE THE STILL CACHE BEFORE RENDERING, not after -- the images are already paid
+    # for, and if the render then fails and the job retries, the retry must not pay
+    # again. (The clip cache is already stored: on_clips_cached writes it per clip.)
+    if plan.images_paid and "old_to_new_images" in listing:
+        try:
+            db_execute(
+                lambda db: db.table("listings").update({
+                    "old_to_new_images": old_to_new.write_cache(plan.cache)
+                }).eq("id", listing_id).eq("agent_id", agent["id"]),
+                what="_render_elegant_core cache update")
+        except Exception as e:
+            logger.warning("elegant %s: generated images but could not record them "
+                           "(%s) -- a regenerate will pay again", listing_id, e)
+
+    # ONLY NOW, with the money spent recorded and everything bought saved, is it safe to
+    # stop. Identical rule to the Dramatic's, in a unit fifteen times more expensive:
+    # DEFER ONLY WHEN WAITING IS FREE. clip_seconds_lost counts video fal charged for and
+    # did not hand over; that is in no cache, so a deferral would re-submit and re-pay for
+    # every second of it. If this pass has already lost money, render the film we can make
+    # now -- the rooms that did not animate fall back to the Dramatic's own free
+    # transformation, which is a good film and not a broken one -- and let the ceiling,
+    # which now sees the spending, be the thing that brakes it.
+    if (plan.clips_rate_limited or plan.rate_limited) and defer_on_rate_limit \
+            and not plan.clip_seconds_lost and not plan.images_lost:
+        raise old_to_new.RateLimited(
+            "fal is at this account's concurrency limit; waiting rather than rendering "
+            "a film with its shots left un-animated")
+
+    video_contact_line = _home_video_overlay(listing, agent, "", [])[0]
+
+    video_bytes, degradations = video_renderer.render_dramatic_video(
+        plan,
+        agent_name=agent["name"],
+        agent_contact_line=video_contact_line,
+        agent_photo_url=agent.get("photo_url"),
+        property_type=(listing.get("property_type") or "").upper(),
+        music_seed=listing_id,
+        music_track=music_track,
+        degradations=plan.degradations,
+        style=video_renderer.ELEGANT_STYLE_ID,
+    )
+    if degradations:
+        logger.warning("elegant video %s rendered with degradations: %s",
+                       listing_id, "; ".join(degradations))
+
+    if ownership_check is not None and not ownership_check():
+        raise video_jobs.SupersededError(
+            "this render was reclaimed by another worker before its video was stored")
+    filename = f"videos/{listing_id}.mp4"
+    video_url = _store_rendered_video(filename, video_bytes)
+    if ownership_check is not None and not ownership_check():
+        raise video_jobs.SupersededError(
+            "this render was reclaimed by another worker before the listing was updated")
+
+    if record_degradations is not None:
+        try:
+            record_degradations(list(degradations))
+        except Exception as e:
+            logger.warning("elegant %s: could not record degradations on the job (%s)",
+                           listing_id, e)
+    if "video_degradations" in listing:
+        try:
+            db_execute(
+                lambda db: db.table("listings").update(
+                    {"video_degradations": list(degradations)}
+                ).eq("id", listing_id).eq("agent_id", agent["id"]),
+                what="_render_elegant_core degradations update")
+        except Exception as e:
+            logger.warning("elegant %s: could not store degradations (%s)",
+                           listing_id, e)
+
+    final = {
+        "video_url": video_url, "video_status": "done", "video_error": None,
+        "video_template_id": ELEGANT_VIDEO_TEMPLATE_ID,
+    }
+    if "old_to_new_treatment" in listing:
+        # So a regenerate gets the same treatment, and therefore the same clip cache
+        # keys, and therefore pays nothing.
+        final["old_to_new_treatment"] = treatment.id
+    db_execute(
+        lambda db: db.table("listings").update(final)
+        .eq("id", listing_id).eq("agent_id", agent["id"]),
+        what="_render_elegant_core listings update")
+    return video_url, degradations
+
+
+def _elegant_job_run(job: dict):
+    """Run one queued Elegant render. Returns (video_url, degradations).
+
+    The agent is re-read here rather than carried in the job row, exactly as the other
+    two runners do it: the agent record holds Facebook and Instagram page tokens, which
+    must never be written into a queue table.
+    """
+    listing_id = str(job["listing_id"])
+    agent_id = str(job["agent_id"])
+    payload = job.get("payload") or {}
+
+    agent_res = db_execute(
+        lambda db: db.table("agents").select("*").eq("id", agent_id),
+        what="_elegant_job_run agents select")
+    if not agent_res.data:
+        raise video_jobs.PermanentJobError("This agent account no longer exists.")
+    agent = agent_res.data[0]
+
+    listing_res = db_execute(
+        lambda db: db.table("listings").select("*").eq("id", listing_id)
+        .eq("agent_id", agent_id),
+        what="_elegant_job_run listings select")
+    if not listing_res.data:
+        raise video_jobs.PermanentJobError(
+            "This listing was deleted before its video could be generated.")
+    listing = listing_res.data[0]
+
+    if not (listing.get("images") or []):
+        raise video_jobs.PermanentJobError(
+            "This listing has no photos any more -- add a photo and generate the video "
+            "again.")
+    if not _elegant_available():
+        raise video_jobs.PermanentJobError(
+            "The Elegant video style is not switched on for this account yet. The "
+            "Classic and Dramatic videos are available in the meantime.")
+
+    try:
+        db_execute(
+            lambda db: db.table("listings").update({
+                "video_status": "rendering",
+                "video_render_started_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", listing_id).eq("agent_id", agent_id),
+            what="_elegant_job_run mark rendering")
+    except Exception as e:
+        logger.warning("elegant job %s: could not mirror 'rendering' onto the listing "
+                       "(%s)", job["id"], e)
+
+    # How long this render may keep going back in the queue because fal has no room,
+    # before we give the agent the film we can make instead. PER TYPE rather than the
+    # Dramatic's hardcoded 600, because 600 seconds is shorter than one Elegant render --
+    # the first deferral would already be out of patience. See
+    # video_jobs.JobTypeConfig.rate_limit_patience_seconds.
+    patience = video_jobs.JOB_TYPES[video_jobs.JOB_TYPE_ELEGANT] \
+        .rate_limit_patience_seconds
+
+    def _run(defer_on_rate_limit):
+        return _render_elegant_core(
+            listing_id, agent, listing,
+            int(payload.get("photo_index") or 0),
+            treatment_id=payload.get("treatment"),
+            ownership_check=lambda: video_jobs.heartbeat(job),
+            record_degradations=lambda degs: video_jobs.record_degradations(job, degs),
+            music_track=payload.get("music_track"),
+            video_photos=payload.get("video_photos"),
+            defer_on_rate_limit=defer_on_rate_limit,
+        )
+
+    try:
+        try:
+            return _run(True)
+        except old_to_new.RateLimited as e:
+            # Age measured from when the AGENT pressed Generate, not from this attempt,
+            # so the patience is the agent's wait and not a multiple of it. A deferral
+            # rewinds the attempt counter, so none of this can push the job into
+            # 'failed' -- and every clip already bought is cached, so none of it costs
+            # money either.
+            waited = _job_age_seconds(job)
+            if waited is None or waited < patience:
+                raise video_jobs.DeferJob(str(e))
+            logger.warning("elegant job %s: fal has been at its limit for %.0fs; "
+                           "rendering with whatever we have", job["id"], waited)
+            return _run(False)
+    except old_to_new.VideoBudgetExhausted as e:
+        # Not a fault, and not retryable: the allowance resets next month. Its message is
+        # already written for the agent.
+        raise video_jobs.PermanentJobError(str(e))
+    except old_to_new.BudgetExhausted as e:
+        raise video_jobs.PermanentJobError(str(e))
+    except video_renderer.RenderSlotBusy as e:
+        # The one place a quarter-hour job meets the one-ffmpeg-at-a-time rule. Every
+        # clip is already bought and cached by now, so going back in the queue costs a
+        # wait and nothing else -- the re-run skips straight to the render.
+        raise video_jobs.DeferJob(str(e))
+
+
+def _elegant_job_failed(job: dict, error_text: str):
+    """Called once, only when an Elegant job has genuinely run out of attempts."""
+    try:
+        db_execute(
+            lambda db: db.table("listings").update({
+                "video_status": "failed",
+                "video_error": str(error_text)[:500],
+            }).eq("id", str(job["listing_id"])).eq("agent_id", str(job["agent_id"])),
+            what="_elegant_job_failed listings update")
+    except Exception as e:
+        logger.warning("elegant job %s: could not mark the listing failed (%s)",
+                       job["id"], e)
+
+
 @app.post("/api/listings/{listing_id}/generate-video")
-async def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, music_track: str = None, video_photos: Optional[List[str]] = Query(None), agent=Depends(get_current_agent)):
+async def generate_video(listing_id: str, video_template_id: str = None, photo_index: int = 0, music_track: str = None, video_photos: Optional[List[str]] = Query(None), video_treatment: str = None, agent=Depends(get_current_agent)):
     result = await db_execute_async(lambda db: db.table("listings").select("*").eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_video listings select")
     if not result.data:
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -6501,7 +7058,7 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
     # slideshow instead of failing the request.
     stored_video_template_id = listing.get("video_template_id")
     if video_template_id:
-        if video_template_id in UNRELEASED_VIDEO_TEMPLATE_IDS:
+        if video_template_id in _unreleased_video_template_ids():
             raise HTTPException(
                 status_code=400,
                 detail="That video style is not available yet -- choose Classic or "
@@ -6521,6 +7078,15 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
         # EXPLICIT request for Dramatic still gets the honest 400 below -- being told
         # "not switched on" is right when you chose it and wrong when you did not.
         # persist_video_template_id below then heals the row, so this fires once.
+        # Same healing for a listing that remembers the Elegant on a deploy where it is
+        # switched off (Jane turned it off, or a migration was rolled back). An EXPLICIT
+        # request still gets the honest "not available yet" above.
+        if chosen_video_template_id == ELEGANT_VIDEO_TEMPLATE_ID \
+                and not _elegant_available():
+            logger.info("generate_video: listing %s remembers the Elegant style but it "
+                        "is not switched on here; rendering the Classic instead",
+                        listing_id)
+            chosen_video_template_id = DEFAULT_VIDEO_TEMPLATE_ID
         if chosen_video_template_id == DRAMATIC_VIDEO_TEMPLATE_ID \
                 and not (fal_images.is_enabled()
                          and _old_to_new_ceiling_enforceable()):
@@ -6568,6 +7134,28 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
             status_code=400,
             detail="The Dramatic video style is not switched on for this account yet. "
                    "The Classic video is available in the meantime.")
+    if job_type == video_jobs.JOB_TYPE_ELEGANT and not _elegant_available():
+        # Reachable only through a stored template id that got past the healing above, or
+        # a race with Jane switching the feature off mid-flight. Checked here as well as
+        # in the job so the agent is told now rather than after waiting in a queue.
+        logger.warning("generate_video: refused an Elegant request for listing %s "
+                       "(switch: %s, key: %s, picture tally: %s, video tally: %s)",
+                       listing_id, _elegant_switch_on(), fal_video.is_enabled(),
+                       _old_to_new_ceiling_enforceable(),
+                       _elegant_seconds_ceiling_enforceable())
+        raise HTTPException(
+            status_code=400,
+            detail="The Elegant video style is not switched on for this account yet. "
+                   "The Classic and Dramatic videos are available in the meantime.")
+
+    # Which Elegant treatment: the tear-down or the gentle makeover. An unknown name
+    # falls back to the default rather than erroring, for the same reason an unknown
+    # stored template id does -- see old_to_new.resolve_treatment. Only ever sent to the
+    # queue for an Elegant render; the other two styles ignore it entirely.
+    chosen_treatment = None
+    if job_type == video_jobs.JOB_TYPE_ELEGANT:
+        chosen_treatment = old_to_new.resolve_treatment(
+            video_treatment or listing.get("old_to_new_treatment")).id
 
     # Music: blank / "auto" means the automatic selection exactly as before. Anything
     # else must be a track on the pickable list -- a stale browser tab naming a removed
@@ -6640,6 +7228,11 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                 "video_photos_ignored": ignored_video_photos,
                 "max_video_photos": video_renderer.MAX_VIDEO_PHOTOS,
                 "video_template_id": in_flight,
+                # THE SAME HONESTY RULE AS THE TEMPLATE'S, for the Elegant's treatment:
+                # report the one the render in flight is actually using, which is the one
+                # its clips were bought for, not the one this press asked for.
+                "video_treatment": (existing.get("payload") or {}).get("treatment"),
+                "requested_video_treatment": chosen_treatment,
                 "already_in_flight": True,
                 "requested_video_template_id": chosen_video_template_id,
                 "queued": True,
@@ -6662,6 +7255,9 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                     **({"music_track": chosen_music_track} if chosen_music_track else {}),
                     # Only present when the agent chose; absent == automatic.
                     **({"video_photos": chosen_video_photos} if chosen_video_photos else {}),
+                    # Only present for an Elegant render, so a Classic or Dramatic job
+                    # row is byte-for-byte what it was.
+                    **({"treatment": chosen_treatment} if chosen_treatment else {}),
                 },
             )
         except Exception as e:
@@ -6763,6 +7359,10 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                 "video_photos_ignored": ignored_video_photos,
                 "max_video_photos": video_renderer.MAX_VIDEO_PHOTOS,
                 "video_template_id": in_flight_template,
+                # Same honesty rule for the Elegant's treatment: what the render in
+                # flight is making, and what this press asked for if they differ.
+                "video_treatment": (job.get("payload") or {}).get("treatment"),
+                "requested_video_treatment": chosen_treatment,
                 # Set when this press did NOT start a new render. The template actually
                 # being made is video_template_id above; what this press asked for is
                 # requested_video_template_id. They differ only when the agent changed
@@ -6790,6 +7390,30 @@ async def generate_video(listing_id: str, video_template_id: str = None, photo_i
                 still_fresh = False
         if still_fresh:
             raise HTTPException(status_code=409, detail="A video is already being generated for this listing -- it should be ready in a minute or two.")
+
+    # THE ELEGANT HAS NO IN-PROCESS PATH, DELIBERATELY, and this is the only style for
+    # which that is true.
+    #
+    # The Classic and the Dramatic have one because they shipped before the queue did and
+    # the fallback is what lets a deploy and a migration happen in either order. The
+    # Elegant has never shipped without the queue, and it must not: it is a QUARTER-HOUR
+    # render costing about US$3.85, and the in-process path has no durability (every
+    # Railway deploy kills it), no heartbeat, no ownership fencing and no fleet-wide cap.
+    # Running one there would mean an agent routinely losing a paid film to a deploy, and
+    # two workers both spending US$3.85 on the same listing.
+    #
+    # It cannot normally be reached at all -- _elegant_available() needs the same
+    # migration that makes the queue accept the type -- so this is the backstop for a
+    # half-applied migration, and it says so plainly instead of doing something expensive.
+    if job_type == video_jobs.JOB_TYPE_ELEGANT:
+        logger.error("generate_video: an Elegant request for listing %s reached the "
+                     "in-process path -- the video_jobs table is not usable, so the "
+                     "queue cannot run it. Check the migrations.", listing_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Elegant videos are temporarily unavailable. The Classic and "
+                   "Dramatic videos are working normally -- please try one of those, or "
+                   "try Elegant again shortly.")
 
     # ONE AGENT, TEN LISTINGS, TEN PRESSES. The lock above is per listing, so without this
     # the in-process path would start a paid generation pass for each of them at once. See

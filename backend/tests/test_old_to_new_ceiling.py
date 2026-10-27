@@ -373,7 +373,11 @@ print("\n[5] The picker does not offer what this deploy cannot make")
 node = NODES["get_video_templates"]
 g = {"fal_images": types.SimpleNamespace(is_enabled=lambda: False),
      "_old_to_new_ceiling_enforceable": lambda: True,
+     # The Elegant is switched OFF here, which is its default everywhere. Section [5b]
+     # below is where it is switched on.
+     "_elegant_available": lambda: False,
      "DRAMATIC_VIDEO_TEMPLATE_ID": "dramatic",
+     "ELEGANT_VIDEO_TEMPLATE_ID": "elegant",
      "VIDEO_TEMPLATES": [{"id": "classic", "name": "Classic"},
                          {"id": "dramatic", "name": "Dramatic"}],
      "app": types.SimpleNamespace(get=lambda *a, **k: (lambda f: f)),
@@ -389,6 +393,19 @@ check("with the key set, both styles are offered", offered == ["classic", "drama
       str(offered))
 check("and the full list is unchanged, so nothing else reading it is affected",
       [t["id"] for t in g["VIDEO_TEMPLATES"]] == ["classic", "dramatic"])
+# THE ELEGANT IS APPENDED, NEVER FILTERED, and that is the whole shape of its gate: it is
+# absent from VIDEO_TEMPLATES, so a deploy that forgets to switch it on cannot leak a
+# US$3.50-a-press feature. A filter's failure mode is "shown by mistake"; an append's is
+# "not shown", which is the right way round here.
+check("with the Elegant switched off it is not offered at all, even with a key",
+      "elegant" not in offered, str(offered))
+g["_elegant_available"] = lambda: True
+offered_on = [t["id"] for t in g["get_video_templates"]()]
+check("and when every one of its four conditions holds, it appears",
+      offered_on == ["classic", "dramatic", "elegant"], str(offered_on))
+check("appending it still did not mutate the shared list",
+      [t["id"] for t in g["VIDEO_TEMPLATES"]] == ["classic", "dramatic"],
+      str(g["VIDEO_TEMPLATES"]))
 
 
 # ===========================================================================

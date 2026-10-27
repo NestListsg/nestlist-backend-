@@ -236,6 +236,7 @@ def _run_endpoint(listing, **params):
     captured = {}
     class FakeJobs:
         JOB_TYPE_CLASSIC = "classic"
+        JOB_TYPE_ELEGANT = "elegant"
         JOB_TYPE_DRAMATIC = "dramatic"
         STATUS_QUEUED = "queued"
         @staticmethod
@@ -265,6 +266,15 @@ def _run_endpoint(listing, **params):
              # unchanged -- rather than becoming a test of template routing, which
              # test_dramatic_render.py owns.
              UNRELEASED_VIDEO_TEMPLATE_IDS=set(),
+             # Same reasoning for the Elegant (2026-10-27): stubbed off, because this
+             # file's question is the AUTO Classic path.
+             ELEGANT_VIDEO_TEMPLATE_ID="elegant",
+             _elegant_available=lambda: False,
+             _elegant_switch_on=lambda: False,
+             _elegant_seconds_ceiling_enforceable=lambda: True,
+             _unreleased_video_template_ids=lambda: set(),
+             old_to_new=__import__("old_to_new"),
+             fal_video=types.SimpleNamespace(is_enabled=lambda: True),
              _job_type_for_template=lambda t: "classic",
              _find_active_video_job=lambda listing_id: None,
              fal_images=types.SimpleNamespace(is_enabled=lambda: True),
