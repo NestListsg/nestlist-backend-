@@ -375,7 +375,7 @@ def run_span(first, last):
 run_nodes("_HOUSE_NUMBER_PREFIX_RE", "_UNIT_NUMBER_RE", "_STREET_SUFFIXES", "_ADDRESS_NUMBER_RE",
           "_NON_STREET_WORDS", "_address_number_hits", "_strip_address_numbers", "_to_number",
           "_format_price_millions", "_price_leak_strings", "_strip_price_leaks",
-          "apply_listing_copy_guards", "_STRAY_STREET_RE", "_strip_stray_street_names")
+          "_MD_HEADING_RE", "_MD_BULLET_RE", "_MD_RULE_RE", "_MD_STRONG_RE", "_MD_STAR_RE", "_MD_UNDERSCORE_RE", "_strip_markdown", "apply_listing_copy_guards", "_STRAY_STREET_RE", "_strip_stray_street_names")
 run_span("_fmt_writeup_num", "_build_writeup_facts_block")
 run_nodes("_basic_listing_fallback", "_normalize_district", "_extract_district_token",
           "_listing_match_district", "_buyer_match_districts", "_compute_buyer_listing_match",

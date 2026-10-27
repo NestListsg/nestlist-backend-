@@ -1808,6 +1808,51 @@ def _strip_price_leaks(text: str, price, built_up) -> tuple:
     return cleaned.strip(), found
 
 
+# ================================
+# PLAIN-TEXT GUARD (markdown). The app has no markdown renderer, so a model that wraps
+# words in *asterisks* (seen live: "*TEST LISTING – please ignore.*") shows the raw
+# symbols to buyers. The prompt asks for plain text; this makes it certain. Applied to
+# every generated write-up before it is saved, and to stored content when it is served.
+#
+# Strips ONLY markup shapes:
+#   * emphasis wrappers ***x*** / **x** / *x* / __x__ / _x_ -- only when the wrapper sits
+#     at a word boundary (not glued to a letter or digit on the outside) and hugs the text
+#     on the inside, all on one line;
+#   * a heading marker ("#".."######" + a space) at the start of a line;
+#   * a bullet marker ("* " / "- " / "• ") at the start of a line;
+#   * a line that is nothing but ---, *** or ___ (a horizontal rule).
+# Left alone: "5*" / "5-star", 3*4, prices, URLs, emails, snake_case, hashtags
+# (#NestListHome -- "#" with no space), "-5%", the CEA block. Idempotent; never raises.
+# ================================
+_MD_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.MULTILINE)
+_MD_BULLET_RE = re.compile(r"^([ \t]*)[*\-•][ \t]+(?=\S)", re.MULTILINE)
+_MD_RULE_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$", re.MULTILINE)
+_MD_STRONG_RE = re.compile(r"(?<![\w*])(\*\*\*|\*\*|__)(?=[^\s*_])([^\n]*?[^\s*_])\1(?![\w*])")
+_MD_STAR_RE = re.compile(r"(?<![\w*])\*(?=[^\s*])([^\n*]*?[^\s*])\*(?![\w*])")
+_MD_UNDERSCORE_RE = re.compile(r"(?<![\w_])_(?=[^\s_])([^\n_]*?[^\s_])_(?![\w_])")
+
+
+def _strip_markdown(text):
+    if not text:
+        return text
+    try:
+        out = str(text)
+        out = _MD_RULE_RE.sub("", out)
+        out = _MD_HEADING_RE.sub("", out)
+        out = _MD_BULLET_RE.sub(r"\1", out)
+        for _ in range(4):      # nested wrappers ("**a *b* c**") peel layer by layer
+            new = _MD_STRONG_RE.sub(r"\2", out)
+            new = _MD_STAR_RE.sub(r"\1", new)
+            new = _MD_UNDERSCORE_RE.sub(r"\1", new)
+            if new == out:
+                break
+            out = new
+        return re.sub(r"\n{3,}", "\n\n", out)
+    except Exception as e:
+        logger.error("markdown strip failed (text kept as-is): %s", e)
+        return text
+
+
 def apply_listing_copy_guards(text: str, price=None, built_up=None, context: str = "listing") -> str:
     """Layer 2 + price guard over generated copy. Never raises and never returns
     empty -- if the guard itself breaks, the agent still gets their write-up and
@@ -1880,7 +1925,7 @@ def get_listings(status: str = "active", agent=Depends(get_current_agent)):
     active_video_jobs = video_jobs.describe_active_for_agent(agent["id"])
     for row in rows:
         row["display_location"] = _strip_house_number(row.get("location"))
-        row["content"] = _home_safe_text(row, row.get("content"))
+        row["content"] = _outward_content(row, row.get("content"))
         row["agent_code"] = owner_code
         # Feature #7: always expose a consistent property_types list (falls back to
         # [property_type] before the column exists) so the edit form round-trips cleanly.
@@ -1965,7 +2010,10 @@ Write:
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}]
     )
-    listing_text = response.content[0].text.strip().replace('**', '').replace('---', '').replace('# ', '').strip()
+    # Markup first (so "## Heading" loses its whole marker, not just "# "), then the
+    # long-standing blunt removals, unchanged.
+    listing_text = _strip_markdown(response.content[0].text.strip())
+    listing_text = listing_text.strip().replace('**', '').replace('---', '').replace('# ', '').strip()
     # Layer 2 + price guard: catches anything the model reconstructed on its own.
     listing_text = apply_listing_copy_guards(
         listing_text, price=req.price, built_up=req.built_up, context=f"generate:{agent['id']}"
@@ -2168,6 +2216,9 @@ async def generate_listing(req: ListingRequest, agent=Depends(get_current_agent)
         except Exception as e:
             logger.error("text-only write-up failed for agent %s, using basic template: %s", agent["id"], e)
             listing_text = _basic_listing_fallback(gen_agent, req, district_str)
+
+    # Plain text, whichever path produced it (photo / text-only / fallback template).
+    listing_text = _strip_markdown(listing_text)
 
     # CEA details close a condo-family write-up (Jane: Home only -- Prestige/landed never
     # carries the reg or licence numbers). Missing details: no block, and a warning so the
@@ -2786,6 +2837,12 @@ def _strip_cea_block(text):
     except Exception as e:
         logger.error("CEA block strip failed (text served as-is): %s", e)
         return text
+
+
+def _outward_content(listing, text):
+    """Stored content as served (buyer page, My Listings, PropertyGuru export): plain
+    text (older write-ups may carry markdown) and no CEA block on a non-Home listing."""
+    return _home_safe_text(listing, _strip_markdown(text))
 
 
 def _home_safe_text(listing, text):
@@ -3465,8 +3522,9 @@ async def _generate_writeup_from_photos(agent, req, vision_urls, district_str, c
     writeup = "".join(
         block.text for block in response.content if getattr(block, "type", None) == "text"
     ).strip()
-    # No markdown stripping: content-studio's "Your Vision. Your Legacy." closing
-    # must survive, and the prompt forbids stray headers/bullets.
+    # Markup only (emphasis / heading / bullet markers): the closing words and every
+    # sentence survive -- see _strip_markdown.
+    writeup = _strip_markdown(writeup).strip()
     if not writeup:
         raise RuntimeError("write-up came back empty")
     writeup = apply_listing_copy_guards(writeup, price=price, built_up=req.built_up, context=context)
@@ -7896,7 +7954,7 @@ def _public_listing_payload(listing) -> dict:
         context=f"public:{listing['id']}",
     )
     public_content = _scrub_own_street(public_content, own_location, district_label)
-    public_content = _home_safe_text(listing, public_content)
+    public_content = _outward_content(listing, public_content)
     # Features are agent free text and never went through the copy guard: strip any
     # house/unit number before the street scrub (older rows were saved unguarded).
     public_features = _scrub_own_street(_guard_features(listing.get("features")), own_location, district_label)
@@ -8734,6 +8792,7 @@ Write a replacement for ONLY the highlighted span. Rules, no exceptions:
     rewritten = "".join(
         block.text for block in response.content if getattr(block, "type", None) == "text"
     ).strip()
+    rewritten = _strip_markdown(rewritten)
     rewritten = rewritten.replace("**", "").replace("---", "").replace("# ", "").strip()
     # Models occasionally wrap a short span in quotes despite rule 1; strip them
     # only when they wrap the whole thing, never mid-sentence quotes.
@@ -8894,7 +8953,7 @@ def _build_propertyguru_text_block(listing: dict) -> str:
     if features:
         parts.append("Key Features\n------------\n" + features)
 
-    content = str(_home_safe_text(listing, listing.get("content")) or "").strip()
+    content = str(_outward_content(listing, listing.get("content")) or "").strip()
     if content:
         parts.append("Description\n-----------\n" + content)
 

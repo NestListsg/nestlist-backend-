@@ -84,7 +84,7 @@ def run_span(first, last):
 run_nodes("_HOUSE_NUMBER_PREFIX_RE", "_UNIT_NUMBER_RE", "_STREET_SUFFIXES", "_ADDRESS_NUMBER_RE",
           "_NON_STREET_WORDS", "_address_number_hits", "_strip_address_numbers", "_to_number",
           "_format_price_millions", "_price_leak_strings", "_strip_price_leaks",
-          "apply_listing_copy_guards", "_guard_features")
+          "_MD_HEADING_RE", "_MD_BULLET_RE", "_MD_RULE_RE", "_MD_STRONG_RE", "_MD_STAR_RE", "_MD_UNDERSCORE_RE", "_strip_markdown", "apply_listing_copy_guards", "_guard_features")
 run_span("_fmt_writeup_num", "_build_writeup_facts_block")
 run_nodes("_basic_listing_fallback", "_normalize_district", "_extract_district_token", "_listing_district_label",
           "_clean_property_types", "_listing_property_types", "_resolve_property_types", "MAX_PROPERTY_TYPES",
@@ -567,7 +567,7 @@ check("PropertyGuru export, landed: no CEA", "CEA Reg No" not in pg)
 pg = NS["_build_propertyguru_text_block"]({"property_type": "Condominium", "location": "x", "content": WITH})
 check("PropertyGuru export, condo: CEA kept", "CEA Reg No: R123456A" in pg)
 check("My Listings rows are served through the same strip",
-      'row["content"] = _home_safe_text(row, row.get("content"))' in SRC)
+      'row["content"] = _outward_content(row, row.get("content"))' in SRC)
 
 # ---------------------------------------------------------------------------
 print("\n[8] poster: condo price + CEA footer; landed poster byte-identical")
