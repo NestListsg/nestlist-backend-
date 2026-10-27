@@ -17,6 +17,11 @@ Three things are protected here, in order of how much they would cost if they br
    chose; the renderer then re-fetches those photos and may drop one. Captions are
    keyed by url for exactly that reason -- anything keyed by position would slide a
    caption onto the next photo along, which is a false claim about the property.
+4. THE OPENING SHOT IS CHOSEN (added 2026-10-27). The living room opens the Classic,
+   falling back to the facade and then the next most impressive living space; stairs,
+   bathrooms, the entrance lobby and the carpark never open one and play last. The
+   rule applies to AUTO only -- (2) above still comes first -- and the pecking order
+   lives in ONE table, video_renderer.SPACE_RANKING.
 
 Runs without ffmpeg, without a network and without an API key.
 """
@@ -72,11 +77,16 @@ check("...and the dining room that was dropped is now in", "dining" in got, str(
 many = ["living", "living", "pool", "pool", "dining", "kitchen",
         "bedroom", "bedroom", "bathroom", "pool", "living", "garden"]
 pick = V(many, LIMIT, MIN)
+# CHANGED 2026-10-27 with the opening-shot rule: the bathroom used to sit between the
+# bedroom and the garden, because everything after the hero was in pure upload order.
+# It now plays LAST -- see SPACE_RANKING. The SET of photos is the same seven.
 check("12 photos over 7 spaces -> 7 shots, one each",
       [many[i] for i in pick] == ["living", "pool", "dining", "kitchen", "bedroom",
-                                  "bathroom", "garden"], str([many[i] for i in pick]))
-check("the hero is index 0 and leads", pick[0] == 0)
-check("the rest stay in the agent's upload order", pick[1:] == sorted(pick[1:]))
+                                  "garden", "bathroom"], str([many[i] for i in pick]))
+check("the hero is still in the film", 0 in pick, str(pick))
+check("the rooms after the opener stay in the agent's upload order",
+      [i for i in pick[1:] if vr._space_opens(many[i])]
+      == sorted(i for i in pick[1:] if vr._space_opens(many[i])), str(pick))
 
 print("\n[selection] the top-up, when there is not enough variety to fill the film")
 thin = ["living"] * 4 + ["pool"] * 3 + ["kitchen"] * 2
@@ -107,21 +117,174 @@ for _ in range(4000):
     n = random.randint(1, 15)
     spaces = [random.choice(list(vr._SPACE_VOCABULARY)) for _ in range(n)]
     r = V(spaces, LIMIT, MIN)
-    if r[0] != 0:
-        bad.append(("hero lost", spaces, r))
+    if 0 not in r:
+        bad.append(("hero dropped from the film", spaces, r))
     if len(set(r)) != len(r):
         bad.append(("a photo used twice", spaces, r))
     if len(r) > LIMIT or any(not 0 <= i < n for i in r):
         bad.append(("out of bounds", spaces, r))
-    if r[1:] != sorted(r[1:]):
-        bad.append(("upload order broken", spaces, r))
+    # The opening shot: a space that may open, whenever the chosen set holds one at
+    # all, and the best-ranked such space in it.
+    openable = [i for i in r if vr._space_opens(spaces[i])]
+    if openable and not vr._space_opens(spaces[r[0]]):
+        bad.append(("opened on a space that may not open", spaces, r))
+    if openable and vr._space_rank(spaces[r[0]]) != min(
+            vr._space_rank(spaces[i]) for i in openable):
+        bad.append(("a better-ranked opener was available", spaces, r))
+    # After the opener: rooms in upload order, then circulation in upload order.
+    rooms = [i for i in r[1:] if vr._space_opens(spaces[i])]
+    circ = [i for i in r[1:] if not vr._space_opens(spaces[i])]
+    if rooms != sorted(rooms) or circ != sorted(circ):
+        bad.append(("upload order broken within a band", spaces, r))
+    if r[1:] != rooms + circ:
+        bad.append(("circulation not pushed to the end", spaces, r))
     if len(r) < min(n, MIN):
         bad.append(("shorter than MIN with photos to spare", spaces, r))
+    # THE LENGTH GUARANTEE. Deprioritising a space must never cost a shot: the film
+    # is as long as the old rule's film, which was min(distinct spaces, LIMIT) topped
+    # up to min(LIMIT, MIN).
+    distinct = len({s for s in spaces if s != vr.SPACE_UNKNOWN}) + \
+        sum(1 for s in spaces if s == vr.SPACE_UNKNOWN)
+    if len(r) < min(n, max(min(distinct, LIMIT), min(LIMIT, MIN))):
+        bad.append(("shorter than the old rule's film", spaces, r))
     kept = [spaces[i] for i in r if spaces[i] != vr.SPACE_UNKNOWN]
     if len(r) <= len({s for s in spaces if s != vr.SPACE_UNKNOWN}) and \
             len(kept) != len(set(kept)):
         bad.append(("repeated a space while variety was still available", spaces, r))
 check("no invariant violated in 4000 listings", not bad, str(bad[:2]))
+
+
+# ------------------------------------------------------------ the opening shot
+# ADDED 2026-10-27. Jane, on the comparison films: "i don't want the video to start
+# with the stairs. start it with the living room", and then "the stairs is not an
+# important feature in the house". Before this, NOTHING chose the opening shot --
+# whatever the photo ordering produced landed first, so real films opened on a dining
+# hall, on a bungalow facade and on a stairwell, and one gave a stairwell the SECOND
+# slot and a hero's caption. The first second of a Reel decides whether anyone watches.
+print("\n[opening] the living room opens the Classic, and circulation never does")
+
+
+def opens(spaces):
+    """The space the film would open on."""
+    return spaces[V(spaces, LIMIT, MIN)[0]]
+
+
+def film(spaces):
+    return [spaces[i] for i in V(spaces, LIMIT, MIN)]
+
+
+# The three real openings Jane's own listings had, each with the hero photo FIRST in
+# the candidate list -- which is how each of them came to lead its film.
+stairwell = ["stairs", "living", "dining", "kitchen", "bedroom", "bathroom", "pool"]
+check("the local render's STAIRWELL opening becomes the living room",
+      opens(stairwell) == "living", str(film(stairwell)))
+dining_first = ["dining", "living", "stairs", "kitchen", "bedroom", "garden", "bathroom"]
+check("the production film that opened on the DINING HALL now opens on the living room",
+      opens(dining_first) == "living", str(film(dining_first)))
+facade_first = ["exterior", "living", "stairs", "bathroom", "kitchen", "bedroom", "dining"]
+check("the production film that opened on the BUNGALOW FACADE now opens on the "
+      "living room", opens(facade_first) == "living", str(film(facade_first)))
+
+print("  the fallback chain")
+check("no living room -> the exterior/facade opens",
+      opens(["stairs", "dining", "kitchen", "bedroom", "bathroom", "exterior",
+             "garden"]) == "exterior")
+check("no living room and no exterior -> the next most impressive living space",
+      opens(["stairs", "bathroom", "bedroom", "kitchen", "dining", "study",
+             "garden"]) == "dining")
+check("...and below that, rank order decides, not upload order",
+      opens(["study", "bedroom", "garden", "pool"]) == "pool")
+check("a listing of nothing but unlabelled photos still opens on one of them",
+      opens([vr.SPACE_UNKNOWN] * 8) == vr.SPACE_UNKNOWN)
+check("...and is left in exactly today's order, hero leading",
+      V([vr.SPACE_UNKNOWN] * 8, LIMIT, MIN) == list(range(8)))
+
+print("  never the opening shot: stairs, bathroom, entrance lobby, carpark")
+for bad_opener in ("stairs", "bathroom", "entrance", "carpark"):
+    spaces = [bad_opener, "living"]
+    check("a %s first in the order does not open the film" % bad_opener,
+          opens(spaces) == "living", str(film(spaces)))
+    # ...and not even when it is the only thing before the weakest room there is.
+    spaces = [bad_opener, vr.SPACE_UNKNOWN]
+    check("...nor ahead of a photo nobody could label", opens(spaces) == vr.SPACE_UNKNOWN,
+          str(film(spaces)))
+
+print("  the listing whose ONLY candidate is a staircase")
+only_stairs = ["stairs"] * 7
+r = V(only_stairs, LIMIT, MIN)
+check("it still gets a film rather than nothing", len(r) == MIN, str(r))
+check("...in exactly today's order, hero leading (nothing better exists)",
+      r == list(range(MIN)), str(r))
+stairs_and_baths = ["stairs", "bathroom", "stairs", "entrance", "carpark", "bathroom",
+                    "stairs"]
+r = V(stairs_and_baths, LIMIT, MIN)
+check("a listing of nothing but circulation and bathrooms degrades the same way",
+      r == list(range(MIN)), str(r))
+
+
+# ------------------------------------------- circulation is low value, not banned
+print("\n[low value] stairs lose slots to real rooms, but never shrink a film")
+rich = ["living", "stairs", "bathroom", "entrance", "carpark", "dining", "kitchen",
+        "pool", "garden", "view", "bedroom", "study", "terrace", "balcony", "gym"]
+got = film(rich)
+check("15 photos over 15 spaces -> 10 shots and NOT ONE of them circulation",
+      len(got) == LIMIT and not any(s in ("stairs", "bathroom", "entrance", "carpark")
+                                    for s in got), str(got))
+check("...the ten it kept are the ten best-ranked spaces this listing HAS (the gym "
+      "goes too, 11th of the fifteen -- the cut is rank and nothing else)",
+      set(got) == set(sorted(rich, key=vr._space_rank)[:LIMIT]), str(sorted(got)))
+check("...and they play in the listing's own upload order behind the living room",
+      got == ["living", "dining", "kitchen", "pool", "garden", "view", "bedroom",
+              "study", "terrace", "balcony"], str(got))
+
+short = ["living", "stairs", "dining", "kitchen", "bedroom", "bathroom", "garden"]
+got = film(short)
+check("a listing SHORT of photos keeps its staircase rather than losing a shot",
+      len(got) == len(short) and "stairs" in got, str(got))
+check("...but plays it at the end, not in the second slot it used to get",
+      got.index("stairs") >= len(got) - 2, str(got))
+check("...and the bathroom is at the end too", got[-2:] == ["stairs", "bathroom"]
+      or got[-2:] == ["bathroom", "stairs"], str(got))
+
+# The guarantee Jane asked for in so many words: this rule may never make a film
+# shorter than the one it replaces. Checked against the OLD rule's length directly.
+random.seed(77)
+shrunk = []
+for _ in range(4000):
+    n = random.randint(1, 15)
+    spaces = [random.choice(list(vr._SPACE_VOCABULARY)) for _ in range(n)]
+    # What the old rule produced: one per distinct space in upload order, truncated at
+    # LIMIT, topped up to min(LIMIT, MIN).
+    seen, distinct = set(), 0
+    for i, s in enumerate(spaces):
+        if i == 0 or s == vr.SPACE_UNKNOWN or s not in seen:
+            distinct += 1
+            seen.add(s)
+    was = min(n, max(min(distinct, LIMIT), min(LIMIT, MIN)))
+    if len(V(spaces, LIMIT, MIN)) < was:
+        shrunk.append((spaces, was, V(spaces, LIMIT, MIN)))
+check("over 4000 listings, not one film is shorter than the old rule's",
+      not shrunk, str(shrunk[:2]))
+
+print("\n[table] the pecking order is one table, and it covers the vocabulary")
+check("every space the vision pass can write is ranked",
+      {s for s, _o in vr.SPACE_RANKING} == set(vr._SPACE_VOCABULARY),
+      str({s for s, _o in vr.SPACE_RANKING} ^ set(vr._SPACE_VOCABULARY)))
+check("no space is ranked twice",
+      len({s for s, _o in vr.SPACE_RANKING}) == len(vr.SPACE_RANKING))
+check("the living room is ranked first", vr.SPACE_RANKING[0][0] == "living")
+check("the exterior/facade is the fallback opener", vr.SPACE_RANKING[1][0] == "exterior")
+check("stairs are ranked last", vr.SPACE_RANKING[-1][0] == "stairs")
+check("circulation, bathrooms and the carpark may not open a film",
+      not any(vr._space_opens(s) for s in ("stairs", "bathroom", "entrance", "carpark")))
+check("unlabelled photos MAY open a film -- a listing of them must still get one",
+      vr._space_opens(vr.SPACE_UNKNOWN))
+check("...and are ranked below every real room, above circulation",
+      vr._space_rank(vr.SPACE_UNKNOWN) > vr._space_rank("bedroom")
+      and vr._space_rank(vr.SPACE_UNKNOWN) < vr._space_rank("stairs"))
+check("a label the table forgot ranks last and may not open the film",
+      vr._space_rank("penthouse-helipad") == len(vr.SPACE_RANKING)
+      and not vr._space_opens("penthouse-helipad"))
 
 
 # ------------------------------------------------------------- the survey parsing
@@ -263,7 +426,27 @@ def good_survey(photos, copy_guard=None):
 
 urls, captions, note = run_selection(survey=good_survey)
 check("the happy path returns a varied set", urls is not None and len(urls) == 7, str(urls))
-check("...hero first", urls and urls[0] == URLS[0])
+# good_survey labels the hero "living", so the hero opens -- because the LIVING ROOM
+# opens, not because it is the hero. The run below, where the hero is a stairwell,
+# is the one that tells those two apart.
+check("...the living room opens the film (here, that is also the hero)",
+      urls and urls[0] == URLS[0])
+
+
+def hero_is_a_stairwell(photos, copy_guard=None):
+    spaces = ["stairs", "bathroom", "living", "kitchen", "dining", "bedroom",
+              "pool", "garden", "entrance", "view", "carpark", "terrace"]
+    return ([(spaces[i], "the %s ... where the day begins" % spaces[i])
+             for i in range(len(photos))], None)
+
+
+urls, captions, _n = run_selection(survey=hero_is_a_stairwell)
+check("a listing whose STAR photo is a stairwell opens on the living room instead",
+      urls and urls[0] == URLS[2], str(urls))
+check("...the star photo is still in the film, just not leading it",
+      urls and URLS[0] in urls, str(urls))
+check("...and its caption travelled with it, still keyed to its own url",
+      captions.get(URLS[0], "").startswith("the stairs"), str(captions.get(URLS[0])))
 check("...no space twice", len({u for u in urls}) == len(urls))
 check("...captions keyed by url, one per chosen photo",
       set(captions) == set(urls), str(set(captions) ^ set(urls)))

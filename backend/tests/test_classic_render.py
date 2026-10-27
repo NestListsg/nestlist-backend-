@@ -44,17 +44,24 @@ CLASSIC_ARGS = dict(
     music_seed="listing-42",
 )
 STUBS = ("_run_ffmpeg", "_fetch_listing_photo", "_fetch_image",
-         "_generate_room_captions", "_smart_auto_selection",
+         "_generate_room_captions", "_smart_auto_selection", "_survey_photos",
          "_probe_duration", "_has_ffmpeg_filter")
 
 
-def capture(module, captions=None, ffmpeg=None, src_photo=None, smart=None, **kwargs):
+def capture(module, captions=None, ffmpeg=None, src_photo=None, smart=None,
+            labels=None, **kwargs):
     """Run a render with every external dependency stubbed out.
     Returns (ffmpeg commands it would have run, render result).
 
     src_photo swaps the stand-in listing photo, which is how the matrix below reaches
     the portrait branch: a source taller than 9:16 composites differently and is the
-    one shape that must NOT drift sideways."""
+    one shape that must NOT drift sideways.
+
+    `smart` replaces _smart_auto_selection outright -- "a survey that returned this
+    pick". `labels` goes one level deeper and replaces only the VISION CALL, with a
+    space label per photo, so the real _smart_auto_selection and _varied_order run and
+    the golden pins the order they actually choose. That is the only way the opening-
+    shot rule reaches the golden at all, since `smart` hands the answer over ready-made."""
     commands = []
 
     def fake_run_ffmpeg(cmd, timeout):
@@ -75,8 +82,15 @@ def capture(module, captions=None, ffmpeg=None, src_photo=None, smart=None, **kw
     # available, use upload order". Without this the golden would depend on whether
     # the machine running the tests happens to have an ANTHROPIC_API_KEY set, which
     # would make it pass on one laptop and fail on another. `smart` opts a config in.
-    module._smart_auto_selection = (
-        smart if callable(smart) else (lambda urls, idx, copy_guard=None: (None, None, None)))
+    if labels:
+        # Leave _smart_auto_selection REAL and fake only the vision call it makes, so
+        # the golden records the photo order _varied_order really produces.
+        module._survey_photos = lambda photos, copy_guard=None: (
+            [(labels[i], "the %s ... where the day begins" % labels[i])
+             for i in range(len(photos))], None)
+    else:
+        module._smart_auto_selection = (
+            smart if callable(smart) else (lambda urls, idx, copy_guard=None: (None, None, None)))
     def fake_captions(photos, copy_guard=None):
         return (list(captions) if captions else [None] * len(photos)), None
     module._generate_room_captions = fake_captions
@@ -144,8 +158,17 @@ def norm(cmd):
 #
 # It is deliberately a matrix rather than one render: one photo and ten, portrait and
 # landscape sources, captions and none, an agent photo and none, an explicit photo pick,
-# and a successful smart selection. Those are the shapes where the clip assembly
-# branches, and a change that moves any of them shows up here as an exact command diff.
+# a successful smart selection, and (added 2026-10-27) two runs of the REAL selection
+# with only the vision call faked, which is what pins the opening-shot rule. Those are
+# the shapes where the clip assembly branches, and a change that moves any of them
+# shows up here as an exact command diff.
+#
+# REGENERATED 2026-10-27 for the opening-shot rule. The change was PURELY ADDITIVE:
+# 12 configs/187 commands -> 14 configs/255 commands, and not one byte of an existing
+# row moved. That is not luck, it is what the rule's blast radius is -- every older
+# row either stubs _smart_auto_selection out entirely (so it renders plain upload
+# order, which the rule does not touch) or hands the pick over ready-made (so it never
+# reaches _varied_order). The two new rows are the only ones the rule can move.
 #
 # WHEN THIS FAILS, READ THE DIFF BEFORE REGENERATING. It is telling you a Classic now
 # renders differently, which is either the change you meant or a change you did not.
@@ -172,6 +195,22 @@ def smart_survey(urls, photo_index, copy_guard=None):
     """Stands in for a vision survey that worked: a varied four-photo pick with
     captions keyed BY URL, which is the contract _smart_auto_selection promises."""
     return list(SMART_PICK), dict(SMART_CAPTIONS), None
+
+
+# THE OPENING-SHOT RULE, through the real selection code. These are space labels, one
+# per photo of MANY_ARGS, fed to the real _varied_order via the `labels` hook -- so
+# the golden pins the photo ORDER the rule produces, not a pick handed over ready-made.
+#
+# The first is the shape Jane complained about: the hero photo (My Listings' star) is
+# a STAIRWELL, which is how a real film came to open on one. The rule must move the
+# living room to the front, keep the hero in the film, and push the stairwell and the
+# entrance lobby to the end. The second has no living room, so it pins the fallback.
+STAIRWELL_HERO_LABELS = ["stairs", "living", "dining", "kitchen", "bedroom",
+                         "bathroom", "pool", "garden", "entrance", "view",
+                         "carpark", "terrace"]
+NO_LIVING_LABELS = ["stairs", "exterior", "dining", "kitchen", "bedroom",
+                    "bathroom", "pool", "garden", "entrance", "view",
+                    "carpark", "terrace"]
 
 
 def matrix():
@@ -202,6 +241,11 @@ def matrix():
     # order, burns in the captions it was handed WITHOUT a second model call, and
     # leaves the fourth photo bare rather than shifting a caption onto it.
     yield "classic-smart-selected", dict(MANY_ARGS, smart=smart_survey)
+    # The real selection running end to end, twice: a listing whose star photo is a
+    # stairwell, and a listing with no living room at all. Pins which photos go in,
+    # in which order, and therefore which camera move lands on the opening shot.
+    yield "classic-opens-on-living-room", dict(MANY_ARGS, labels=STAIRWELL_HERO_LABELS)
+    yield "classic-opens-on-facade", dict(MANY_ARGS, labels=NO_LIVING_LABELS)
 
 
 def render_matrix():
@@ -526,6 +570,73 @@ check("the camera's idea of where the photo sits agrees with _dramatic_backdrop'
       all(a for a, _b in box_ok), str(box_ok))
 check("and with _contain_over_blur's own fills_width answer",
       all(b for _a, b in box_ok), str(box_ok))
+
+# ---------------------------------------------------------------------------
+print("\n[1d] the opening shot is chosen, and it still gets a move with life in it")
+# ---------------------------------------------------------------------------
+# Jane: "i don't want the video to start with the stairs. start it with the living
+# room", and "the stairs is not an important feature in the house". The rule itself is
+# proved in test_smart_photo_selection.py; what matters HERE is the join between the
+# rule and the camera -- the opening slot used to be whatever the photo ordering
+# produced, and _camera_plan's "never open on the hold" fix was written when that slot
+# was an accident. Now that it is a deliberate choice, the two have to hold together.
+def selection_with(labels, urls=None, photo_index=0):
+    """The real _smart_auto_selection, with only the vision call faked."""
+    urls = urls or MANY_ARGS["image_urls"]
+    saved = (vr._survey_photos, vr._fetch_image)
+    vr._survey_photos = lambda photos, copy_guard=None: (
+        [(labels[i], "the %s ... where the day begins" % labels[i])
+         for i in range(len(photos))], None)
+    vr._fetch_image = lambda u, attempts=2, deadline=None: photo()
+    try:
+        return vr._smart_auto_selection(urls, photo_index)
+    finally:
+        vr._survey_photos, vr._fetch_image = saved
+
+
+def spaces_of(labels, **kw):
+    picked, _caps, _note = selection_with(labels, **kw)
+    by_url = dict(zip(MANY_ARGS["image_urls"], labels))
+    return [by_url[u] for u in (picked or [])]
+
+
+got = spaces_of(STAIRWELL_HERO_LABELS)
+check("a listing whose STAR PHOTO is a stairwell opens on the living room",
+      got and got[0] == "living", str(got))
+check("...the stairwell is still in the film, at the end, not in slot one or two",
+      "stairs" in got and got.index("stairs") >= len(got) - 2, str(got))
+check("...and the lowest-ranked spaces lost their slots to real rooms",
+      "bathroom" not in got and "carpark" not in got, str(got))
+check("a listing with no living room opens on the exterior/facade",
+      spaces_of(NO_LIVING_LABELS)[:1] == ["exterior"], str(spaces_of(NO_LIVING_LABELS)))
+all_stairs = spaces_of(["stairs"] * 12)
+check("a listing of nothing but staircases still ships a film (and opens on one, "
+      "because there is nothing better)",
+      len(all_stairs) >= vr.MIN_VIDEO_PHOTOS and set(all_stairs) == {"stairs"},
+      str(all_stairs))
+
+# THE JOIN. The opening shot is now the living room on purpose, so it must not be the
+# shot that deliberately holds still -- that would spend the chosen second of the film
+# on the one move with no life in it. Checked on the realised zoom rather than on the
+# move's NAME, so renaming or re-tuning the table cannot quietly make the opener dull.
+room_for = vr._motion_zoom_ceiling((1600, 1067)) - 1.0
+dull = []
+for n in range(1, 13):
+    for s in range(40):
+        opener = vr._camera_plan(n, "seed-%d" % s)[0]
+        z, _x, _y, knots = vr._camera_expressions(opener, (1600, 1067),
+                                                  vr.FRAMES_PER_PHOTO)
+        peak = max(vr._zoom_at(knots, f) for f in range(vr.FRAMES_PER_PHOTO))
+        if peak <= 1.0 + 0.15 * room_for:
+            dull.append((n, s, opener["name"], round(peak, 4)))
+check("over 480 films, the opening shot is never the near-static one -- it always has "
+      "movement a viewer can see", not dull, str(dull[:3]))
+opening_vfs = [vf_of(c) for c in rendered["classic-opens-on-living-room"]
+               if "zoompan" in vf_of(c)]
+first_peak = max(shot(opening_vfs[0])[0]) if opening_vfs else 0
+check("and on the living-room opening this golden pins, the first shot moves "
+      "(peak %.3f of %.3f)" % (first_peak, 1.0 + room_for),
+      first_peak > 1.0 + 0.15 * room_for, "%.4f" % first_peak)
 
 after, _ = capture(vr, **CLASSIC_ARGS)
 

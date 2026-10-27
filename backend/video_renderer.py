@@ -1586,6 +1586,9 @@ def _generate_room_captions(photos, copy_guard=None):
 # space twice while missing a room the buyer cares about is the single most visible
 # quality problem the Classic had after the motion.
 #
+# The same pass later gained a second job: choosing the ORDER, and above all the
+# OPENING SHOT, which nothing used to choose at all (see SPACE_RANKING).
+#
 # The fix reuses a capability we already paid for. Captions already require a batched
 # vision call that works out what each room is; selection needs exactly the same
 # knowledge. So rather than add a second call, the AUTO path makes ONE call over all of
@@ -1679,6 +1682,77 @@ def _normalise_space(value):
     return SPACE_UNKNOWN
 
 
+# ---------------------------------------------------------------------------
+# WHICH SPACES ARE WORTH SHOWING, AND IN WHAT ORDER -- the pecking order
+# ---------------------------------------------------------------------------
+# ONE TABLE, read top to bottom, best first. This is the only place the ranking lives.
+# Moving the pool above the kitchen, or deciding a staircase may open a film after all,
+# is one line moved or one flag flipped here; no function below needs editing.
+#
+# WHY IT EXISTS. Nothing used to choose the opening shot. The first slot went to
+# whatever the photo ordering happened to put there, so real films on real listings
+# opened on a dining hall, on a bungalow facade, and on a STAIRWELL. The first second
+# of a Reel decides whether anybody watches it. Jane's two rulings:
+#   "i don't want the video to start with the stairs. start it with the living room"
+#   "the stairs is not an important feature in the house"
+# So the table does two jobs. It picks the opener, and it treats circulation space --
+# stairs, landings, hallways, the entrance lobby -- as low value: last in the film and
+# first to give up its slot when a photo-rich listing has more spaces than shots.
+#
+# `opens` answers "may this space be the FIRST shot?". Everything with opens=False is
+# also what plays last and loses slot contention first, deliberately on one flag: "not
+# worth the opening second" and "not worth a slot ahead of a real room" are the same
+# judgement about the same photograph. Low value is NOT "drop it" -- a four-shot film
+# is worse than a six-shot one with a staircase in it, so these are still included
+# whenever the film needs them to reach MIN_VIDEO_PHOTOS.
+#
+# "other" (SPACE_UNKNOWN) sits at the BOTTOM OF THE OPENABLE HALF, not with the
+# circulation rows, and that is a compromise worth knowing about. The vocabulary the
+# vision pass writes has no word for a utility room, a laundry or a close-up of a tap,
+# so all three land on "other" -- alongside "the model genuinely could not tell". The
+# two are indistinguishable here, and "other" has to stay openable, because a listing
+# whose photos are ALL unlabelled must still get a film and there would be nothing
+# left to open on. So a utility-room photo can open a Classic, but only on a listing
+# that offers no labelled room at all.
+SPACE_RANKING = (
+    # space          opens    why it sits here
+    ("living",       True),   # the ruling: the living room opens the Classic
+    ("exterior",     True),   # the facade -- the fallback opener for a landed home
+    ("dining",       True),   # ...then the next most impressive living space
+    ("kitchen",      True),
+    ("pool",         True),   # the features a Prestige buyer stops scrolling for
+    ("view",         True),
+    ("garden",       True),
+    ("terrace",      True),
+    ("balcony",      True),
+    ("bedroom",      True),   # a master suite sells, but it is not the hook
+    ("study",        True),
+    ("gym",          True),
+    (SPACE_UNKNOWN,  True),   # unlabelled: keep it, and let it open as a last resort
+    ("entrance",     False),  # circulation: lobby, hallway, landing
+    ("carpark",      False),
+    ("bathroom",     False),  # worth showing, never worth the opening second
+    ("stairs",       False),  # "not an important feature in the house"
+)
+_SPACE_RANK = {space: i for i, (space, _opens) in enumerate(SPACE_RANKING)}
+_SPACE_OPENS = {space: opens for space, opens in SPACE_RANKING}
+# A label the table forgot ranks last and may not open. That cannot happen while the
+# table and the vocabulary agree -- which the tests assert both ways -- but the
+# fail-safe direction matters: an unranked space is not one to bet the first second of
+# a Reel on, and ranking it last can only cost it a slot, never a render.
+_SPACE_RANK_LAST = len(SPACE_RANKING)
+
+
+def _space_rank(space):
+    """Position in SPACE_RANKING; anything unranked sorts last."""
+    return _SPACE_RANK.get(space, _SPACE_RANK_LAST)
+
+
+def _space_opens(space):
+    """May this space be the first shot of the film? Unranked spaces may not."""
+    return _SPACE_OPENS.get(space, False)
+
+
 def _survey_photos(photos, copy_guard=None):
     """One batched vision call: (list of (space, caption), note). Never raises.
 
@@ -1734,58 +1808,103 @@ def _survey_photos(photos, copy_guard=None):
 
 
 def _varied_order(spaces, limit, minimum):
-    """Indices of a varied set of photos, hero (index 0) first and always kept.
+    """Indices of a varied, deliberately ORDERED set of photos. Returns indices INTO
+    `spaces`, which arrives hero (index 0) first, then the listing's own order.
 
-    `spaces` is in the order the photos should be considered -- hero first, then the
-    listing's own order. Returns indices INTO that list.
+    Three rules, applied in this order. All three read SPACE_RANKING and nothing else.
 
-    One photo per distinct space, in the agent's own order, which is the rule Jane
-    asked for. The one place it yields is at the bottom: if being strict would leave a
-    film SHORTER than `minimum` (today's six shots), the spaces already shown are
-    opened up again until it is long enough. That is deliberate -- a listing whose
-    photos only cover three spaces would otherwise drop from a 30-second film to a
-    15-second one, which is a worse product than a second angle on the living room,
-    and it means this change can never make a video shorter than the one it replaces.
+    1. WHICH PHOTOS. One per distinct space, as before. When a listing covers more
+       spaces than the film has slots, the LOWEST-RANKED spaces give their slot up
+       first, so on a photo-rich listing a staircase simply does not make the cut.
+       When being strict would leave the film shorter than `minimum` (today's six
+       shots), already-shown spaces are opened up again, round-robin, best-ranked
+       first. That matters twice over: a three-space listing still gets a 30-second
+       film rather than a 15-second one, and a listing SHORT of photos keeps its
+       staircase instead of losing a shot -- the low-value rule must never shrink a
+       film below the length today's code would have given it.
 
-    The top-up goes round the spaces in turn -- every space's second photo before any
-    space's third -- rather than straight down the list. Taking them in list order
-    re-creates the exact bug this function exists to fix: a listing with four living
-    room shots first would spend its whole top-up on the living room and still never
-    reach the kitchen.
+    2. WHAT OPENS. The best-ranked openable space in the chosen set, and the earliest
+       photo of it. The living room, else the facade, else the next most impressive
+       living space. Never a staircase, a bathroom, a carpark or the entrance lobby.
+
+    3. WHAT FOLLOWS. The rooms in the listing's own order -- agents upload their
+       photos as a walkthrough and a film that jumps around that order reads as
+       shuffled even when every individual photo is a good choice -- and then the
+       circulation and bathroom shots, in their own order, at the very end. Pushing
+       them to the end rather than merely out of slot one is the point: on a real
+       listing a stairwell had the SECOND slot and a hero's caption, which Jane did
+       not think it earned.
+
+    THE HERO (index 0) IS ALWAYS IN THE FILM. It no longer always LEADS it, and that
+    is the deliberate change: My Listings' star photo is the listing's cover photo,
+    not a statement about which second of a Reel should come first, and letting it
+    lead is what opened one real film on a stairwell and another on a dining hall. An
+    agent who wants a specific order has the photo picker, and that path never reaches
+    here -- choose_video_photos decides it before _smart_auto_selection is consulted.
+
+    DEGRADES TO TODAY'S ANSWER. If nothing in the chosen set may open -- a listing
+    whose only candidates are staircases and bathrooms -- the hero leads and the rest
+    keep upload order, exactly as before. Unlabelled photos count as openable (see
+    SPACE_RANKING), so a listing the vision pass could say nothing about still gets a
+    film; the caller drops to plain upload order before that anyway.
     """
-    chosen, seen, held_back = [], set(), []
-    for i, space in enumerate(spaces):
-        if len(chosen) >= limit:
-            held_back.extend(range(i, len(spaces)))
-            break
-        # The hero is never judged against the rule: it is the agent's own pick of the
-        # photo that opens the film (My Listings' star picker) and it always leads.
-        if i == 0:
-            chosen.append(i)
-            seen.add(space)
-            continue
-        if space != SPACE_UNKNOWN and space in seen:
-            held_back.append(i)
-            continue
-        chosen.append(i)
-        seen.add(space)
+    if not spaces:
+        return []
 
-    # Round-robin the leftovers by space, keeping each space's own photos in order.
+    # --- 1. which photos ---------------------------------------------------------
+    # One representative per distinct space, in upload order. SPACE_UNKNOWN is never
+    # deduped: if the model could not tell what a space is, two of them are not
+    # evidence of repetition.
+    representatives, duplicates, seen = [], [], set()
+    for i, space in enumerate(spaces):
+        if i == 0 or space == SPACE_UNKNOWN or space not in seen:
+            representatives.append(i)
+            seen.add(space)
+        else:
+            duplicates.append(i)
+
+    if len(representatives) > limit:
+        # More spaces than slots. Rank decides who loses one -- which is where a
+        # staircase or a bathroom drops out of a photo-rich listing. The hero keeps
+        # its slot unconditionally: it is the agent's own star photo.
+        by_worth = sorted(representatives,
+                          key=lambda i: (i != 0, _space_rank(spaces[i]), i))
+        squeezed_out = set(by_worth[limit:])
+        representatives = [i for i in representatives if i not in squeezed_out]
+        # Not discarded -- back in the queue, so the top-up below can still reach for
+        # them. (It never has to: a squeeze means the film is already at `limit`.)
+        duplicates.extend(squeezed_out)
+
+    chosen = list(representatives)
     by_space = {}
-    for i in held_back:
+    for i in sorted(duplicates):
         by_space.setdefault(spaces[i], []).append(i)
     target = min(limit, minimum)
+    # Round-robin -- every space's second photo before any space's third -- and
+    # best-ranked space first, so a second living-room angle comes before a second
+    # bathroom. Going straight down the list instead would re-create the exact bug
+    # this function exists to fix: four living-room shots first would spend the whole
+    # top-up on the living room and still never reach the kitchen.
     while len(chosen) < target and by_space:
-        for space in list(by_space):
+        for space in sorted(by_space, key=_space_rank):
             if len(chosen) >= target:
                 break
             chosen.append(by_space[space].pop(0))
             if not by_space[space]:
                 del by_space[space]
-    # Back into the agent's own order, with the hero still leading. Agents order their
-    # photos as a walkthrough, and a film that jumps around that order reads as
-    # shuffled even when every individual photo is a good choice.
-    return [0] + sorted(i for i in chosen if i != 0)
+
+    # --- 2. what opens -----------------------------------------------------------
+    openers = [i for i in chosen if _space_opens(spaces[i])]
+    if openers:
+        opener = min(openers, key=lambda i: (_space_rank(spaces[i]), i))
+    else:
+        opener = 0 if 0 in chosen else min(chosen)
+
+    # --- 3. what follows ---------------------------------------------------------
+    rest = sorted(i for i in chosen if i != opener)
+    rooms = [i for i in rest if _space_opens(spaces[i])]
+    circulation = [i for i in rest if not _space_opens(spaces[i])]
+    return [opener] + rooms + circulation
 
 
 def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
@@ -1880,15 +1999,22 @@ def _smart_auto_selection(image_urls, photo_index, copy_guard=None):
 
         # urls[0] is the hero: the candidate list was built with it first, and the
         # fetch loop keeps `urls` and `photos` in step, so index 0 survives a skip.
+        # The hero is always KEPT, but `picked[0]` is now the opener _varied_order
+        # chose by space -- the living room where there is one -- not necessarily the
+        # hero. selected[0] is therefore the first shot of the film, and the log line
+        # names it so that a complaint about an opening shot can be traced from the
+        # render log without re-running the survey.
         picked = _varied_order(spaces, MAX_VIDEO_PHOTOS, MIN_VIDEO_PHOTOS)
         selected = [urls[i] for i in picked]
         # Keyed by URL, not by position. The render re-fetches these photos (at hires)
         # and may drop one it cannot read, which shifts every position after it -- a
         # caption on the wrong photo is a caption that lies about the property.
         captions = {urls[i]: survey[i][1] for i in picked if survey[i][1]}
-        logger.info("photo survey: chose %d of %d photos covering %d distinct spaces",
+        logger.info("photo survey: chose %d of %d photos covering %d distinct spaces; "
+                    "opening on the %s",
                     len(selected), len(urls),
-                    len({spaces[i] for i in picked if spaces[i] != SPACE_UNKNOWN}))
+                    len({spaces[i] for i in picked if spaces[i] != SPACE_UNKNOWN}),
+                    spaces[picked[0]])
         # The note travels with the result. Without it a survey that selected well
         # but had its captions rejected by the copy guards shipped a film of bare
         # photos and an EMPTY degradation list -- a missing caption with no trace,
