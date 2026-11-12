@@ -598,10 +598,13 @@ else:
     OLD_PR.__file__ = os.path.join(BACKEND, "poster_renderer.py")
     exec(compile(old_src, OLD_PR.__file__, "exec"), OLD_PR.__dict__)
     same = True
-    for tid in PR.TEMPLATES:
+    # The golden set is the templates that EXISTED at 7ef82be. Anything added since (the
+    # Bold family) has no counterpart there -- iterating PR.TEMPLATES instead would compare
+    # a new template against the old module's unknown-id fallback and always "fail".
+    for tid in OLD_PR.TEMPLATES:
         if PR.render_poster(**args, template_id=tid).tobytes() != OLD_PR.render_poster(**args, template_id=tid).tobytes():
             same = False
-    check(f"no compliance line: all {len(PR.TEMPLATES)} templates pixel-identical to before", same)
+    check(f"no compliance line: all {len(OLD_PR.TEMPLATES)} templates pixel-identical to before", same)
 band = PR.render_poster(**args, template_id="editorial", compliance_line=NS["_cea_licence_line"](CEA_AGENT))
 check("with the CEA line: still 1200x1500 (Instagram 4:5), differs from the plain poster",
       band.size == (1200, 1500) and band.tobytes() != PR.render_poster(**args, template_id="editorial").tobytes())
@@ -609,8 +612,56 @@ check("band never raises on junk (returns the poster)", PR._add_compliance_band(
       in ((1200, 1500), (10, 10)))
 
 POSTER_CALLS = []
-NS["poster_renderer"] = types.SimpleNamespace(render_poster=lambda **k: (POSTER_CALLS.append(k), Image.new("RGB", (4, 4)))[1])
+# None = mimic a healthy render (the concept is used when one was supplied); False =
+# force the renderer's own fallback, which is what the guards do when the concept cannot
+# be shown honestly. That second case is the one the API used to lie about.
+CONCEPT_RESULT = [None]
+
+
+def _fake_render_report(**k):
+    POSTER_CALLS.append(k)
+    used = (bool(k.get("makeover_photo_url")) if CONCEPT_RESULT[0] is None
+            else CONCEPT_RESULT[0])
+    return PR.PosterResult(Image.new("RGB", (4, 4)), used)
+
+
+NS["poster_renderer"] = types.SimpleNamespace(
+    render_poster=lambda **k: _fake_render_report(**k).image,
+    render_poster_report=_fake_render_report,
+    PosterResult=PR.PosterResult,
+    # The Potential paths use the REAL module functions, so this exercises the actual
+    # budget/cache/billing code rather than a second copy of it.
+    makeover_image=PR.makeover_image,
+    read_makeover_cache=PR.read_makeover_cache,
+    read_makeover_approvals=PR.read_makeover_approvals,
+    write_makeover_cache=PR.write_makeover_cache,
+    potential_cache_key=PR.potential_cache_key,
+    POTENTIAL_BUDGET_SECONDS=PR.POTENTIAL_BUDGET_SECONDS,
+    MAX_POTENTIAL_MAKEOVERS_PER_AGENT_PER_MONTH=PR.MAX_POTENTIAL_MAKEOVERS_PER_AGENT_PER_MONTH,
+)
 NS["POSTER_TEMPLATES"] = [{"id": "editorial"}]
+# The Potential style's module-level dependencies. Off by default, so the three CEA cases
+# below take exactly the path they always did.
+NS["POTENTIAL_TEMPLATE_ID"] = "potential"
+NS["POTENTIAL_MONTH_COLUMN"] = PR.POTENTIAL_USAGE_MONTH_COLUMN
+NS["POTENTIAL_COUNT_COLUMN"] = PR.POTENTIAL_USAGE_COUNT_COLUMN
+NS["POTENTIAL_CACHE_COLUMN"] = "potential_images"
+NS["POTENTIAL_CONCEPT_NOT_MADE_WARNING"] = (
+    "The concept for this photo hasn't been made yet, so this poster uses the real "
+    "photo. Make the concept first and take a look at it.")
+# Mirrors main.py: Potential is only offered when it is available.
+NS["_poster_templates_offered"] = lambda: (
+    [t for t in NS["POSTER_TEMPLATES"] if t["id"] != "potential"]
+    + ([t for t in NS["POSTER_TEMPLATES"] if t["id"] == "potential"]
+       if NS["_potential_available"]() else []))
+RATE_ASKED = []
+NS["_poster_concept_hits"] = {}
+NS["_poster_concept_burst_hits"] = {}
+NS["_rate_limited"] = lambda store, key, limit=5, window_seconds=3600, record=True: (
+    RATE_ASKED.append((limit, window_seconds)), RATE_BLOCK[0])[1]
+RATE_BLOCK = [False]
+NS["_potential_available"] = lambda: False
+NS["_potential_makeovers_used"] = lambda agent_id: 0
 
 
 class _Storage:
@@ -642,6 +693,264 @@ for ptype, agent, expect_line, expect_price in [
           f"footer {'set' if expect_line else 'blank'}",
           k["price_text"] == expect_price and k["compliance_line"] == expect_line
           and (res["cea_missing"] == [] if (expect_line or ptype == "Semi-Detached") else res["warnings"]), (k, res))
+
+# ---------------------------------------------------------------------------
+# The Potential style is the only poster that spends money, and generate_poster cannot be
+# imported (no supabase/anthropic here), so this is the only place its wiring can
+# actually be RUN rather than read. Three things are worth proving: that the style off
+# spends nothing, that the style on forwards the concept and counts what fal charged in
+# the POTENTIAL columns (not the video ones), and that fal failing still yields a poster.
+print("\n[8b] potential poster: generate-poster is a GATE, and never spends")
+
+# Jane's decision of 2026-11-12: a human looks at every AI makeover before any buyer
+# does. So generate-poster cannot generate a concept at all -- it can only use one that
+# is cached AND approved. generate_poster cannot be imported (no supabase/anthropic
+# here), so this is the only place the gate can be RUN rather than read.
+
+TALLY, STORED, MERGED = [], [], []
+NS["_add_old_to_new_images"] = lambda agent_id, n, month_column=None, value_column=None, unit=None: (
+    TALLY.append((agent_id, n, month_column, value_column, unit)), True)[1]
+NS["_store_generated_image"] = lambda lid, role, key, data: (
+    STORED.append((lid, role, key)), "https://cdn/makeover.jpg")[1]
+NS["_merge_potential_cache"] = lambda lid, aid, added=None, approve=None: (
+    MERGED.append((lid, aid, added, approve)), True)[1]
+
+PHOTO = "https://img/1.jpg"
+KEY = PR.potential_cache_key(PHOTO)
+
+
+def _listing(concepts=None, approved=None):
+    return {"id": "L1", "property_type": "Semi-Detached", "price": "1500000",
+            "images": [PHOTO],
+            "potential_images": PR.write_makeover_cache(concepts or {}, approved or [])}
+
+
+def _poster(available=True, listing=None, concept=None, **kw):
+    TALLY.clear(), STORED.clear(), POSTER_CALLS.clear(), MERGED.clear()
+    NS["POSTER_TEMPLATES"] = [{"id": "editorial"}, {"id": "potential"}]
+    NS["_potential_available"] = lambda: available
+    CONCEPT_RESULT[0] = concept
+    _use(_DBS(BARE_AGENT, dict(listing or _listing())))
+    try:
+        return NS["generate_poster"]("L1", template_id="potential", agent=BARE_AGENT, **kw)
+    finally:
+        CONCEPT_RESULT[0] = None
+        NS["POSTER_TEMPLATES"] = [{"id": "editorial"}]
+        NS["_potential_available"] = lambda: False
+
+
+res = _poster()
+check("no concept made yet: real photo, nothing bought, and the agent is told",
+      POSTER_CALLS[-1]["makeover_photo_url"] is None and res["concept_used"] is False
+      and not TALLY and not STORED
+      and any("hasn't been made yet" in w for w in res["warnings"]), res["warnings"])
+
+res = _poster(listing=_listing({KEY: "https://cdn/c.jpg"}))
+check("CONCEPT CACHED BUT NOT APPROVED: still the real photo -- the gate holds",
+      POSTER_CALLS[-1]["makeover_photo_url"] is None and res["concept_used"] is False
+      and any("hasn't been approved" in w for w in res["warnings"]), res["warnings"])
+
+res = _poster(listing=_listing({KEY: "https://cdn/c.jpg"}, [KEY]))
+check("cached AND approved: the concept is used, and nothing is bought",
+      POSTER_CALLS[-1]["makeover_photo_url"] == "https://cdn/c.jpg"
+      and res["concept_used"] is True and not TALLY and not STORED, res)
+
+res = _poster(listing=_listing({KEY: "https://cdn/c.jpg"}), approve_concept_key=KEY)
+check("pressing Use it approves that exact concept and renders it",
+      POSTER_CALLS[-1]["makeover_photo_url"] == "https://cdn/c.jpg"
+      and res["concept_used"] is True
+      and MERGED and MERGED[-1][3] == [KEY], MERGED)
+
+res = _poster(listing=_listing({KEY: "https://cdn/c.jpg"}),
+              approve_concept_key="v1.deadbeef:poster_potential:somethingelse")
+check("an approval for a DIFFERENT concept approves nothing (a reworded prompt)",
+      POSTER_CALLS[-1]["makeover_photo_url"] is None
+      and res["concept_used"] is False and not MERGED, (res, MERGED))
+
+res = _poster(approve_concept_key=KEY)
+check("you cannot approve a concept that does not exist",
+      POSTER_CALLS[-1]["makeover_photo_url"] is None and not MERGED, MERGED)
+
+res = _poster(available=False, listing=_listing({KEY: "https://cdn/c.jpg"}, [KEY]))
+check("the kill switch means off, even for an approved concept",
+      POSTER_CALLS[-1]["makeover_photo_url"] is None and res["concept_used"] is False)
+
+# Finding 5. The switch is the backout, so flipping it off must not break the button.
+check("switched off, asked for by name: falls back instead of 400",
+      res["poster_template_id"] == "editorial"
+      and any("isn't available right now" in w for w in res["warnings"]), res)
+
+off_listing = dict(_listing({KEY: "https://cdn/c.jpg"}, [KEY]))
+off_listing["poster_template_id"] = "potential"
+TALLY.clear(), POSTER_CALLS.clear()
+NS["POSTER_TEMPLATES"] = [{"id": "editorial"}, {"id": "potential"}]
+NS["_potential_available"] = lambda: False
+_use(_DBS(BARE_AGENT, off_listing))
+try:
+    res = NS["generate_poster"]("L1", agent=BARE_AGENT)
+finally:
+    NS["POSTER_TEMPLATES"] = [{"id": "editorial"}]
+check("switched off, stored as the listing default: still renders, still warns",
+      res["poster_url"] and res["poster_template_id"] == "editorial"
+      and any("isn't available right now" in w for w in res["warnings"]), res)
+check("the agent's real choice is not overwritten during a backout",
+      "if template_id and chosen_template_id == template_id:" in SRC)
+
+try:
+    NS["POSTER_TEMPLATES"] = [{"id": "editorial"}]
+    _use(_DBS(BARE_AGENT, dict(_listing())))
+    NS["generate_poster"]("L1", template_id="no-such-style", agent=BARE_AGENT)
+    check("a genuinely unknown style is still refused", False)
+except HTTPException as e:
+    check("a genuinely unknown style is still refused with 400",
+          e.status_code == 400 and "Unknown" in e.detail, e.detail)
+
+# F1 still holds on top of the gate: approved is not the same as drawn.
+res = _poster(listing=_listing({KEY: "https://cdn/c.jpg"}, [KEY]), concept=False)
+check("approved but the guards refused it: concept_used FALSE and the agent is told",
+      res["concept_used"] is False
+      and any("could not be shown" in w for w in res["warnings"]), res["warnings"])
+
+# A TRIPWIRE, NOT A PROOF, and nobody should cite it as one. It scans the source text of
+# generate_poster for a direct call, so it catches someone re-adding the obvious line and
+# would miss a call smuggled through a lambda or a helper. What actually keeps this
+# endpoint free is that it has no path to makeover_image at all; this just makes the
+# obvious regression loud.
+check("tripwire: no direct fal call in generate_poster's own source",
+      "fal_images.generate" not in SRC.split("def generate_poster(")[1].split("\ndef ")[0])
+
+# ---------------------------------------------------------------------------
+print("\n[8c] the concept endpoint: the only place that spends")
+
+NS["_potential_allowance"] = None
+run_nodes("_potential_allowance", "_potential_listing_or_404", "_potential_photo_state",
+          "get_poster_concept_state", "generate_poster_concept")
+
+
+def _ok_generate(prompt, urls, deadline):
+    return b"\xff\xd8jpeg-bytes"
+
+
+def _concept(generate=_ok_generate, used=0, listing=None, available=True, **kw):
+    TALLY.clear(), STORED.clear(), MERGED.clear()
+    NS["_potential_available"] = lambda: available
+    NS["_potential_makeovers_used"] = lambda agent_id: used
+    NS["fal_images"] = types.SimpleNamespace(generate=generate)
+    _use(_DBS(BARE_AGENT, dict(listing or _listing())))
+    os.environ["FAL_KEY"] = "local-injection-not-a-real-key"
+    try:
+        return NS["generate_poster_concept"]("L1", agent=BARE_AGENT, **kw)
+    finally:
+        os.environ.pop("FAL_KEY", None)
+        NS["_potential_available"] = lambda: False
+        NS["_potential_makeovers_used"] = lambda agent_id: 0
+
+
+res = _concept()
+check("a first concept is generated, stored and returned FOR REVIEW -- no poster",
+      res["concept_url"] == "https://cdn/makeover.jpg" and res["photo_url"] == PHOTO
+      and res["concept_key"] == KEY and res["from_cache"] is False
+      and "poster_url" not in res, res)
+check("one image billed to the POTENTIAL columns",
+      TALLY == [(BARE_AGENT["id"], 1, PR.POTENTIAL_USAGE_MONTH_COLUMN,
+                 PR.POTENTIAL_USAGE_COUNT_COLUMN, "concept image")], TALLY)
+check("the concept is cached by MERGE, and is NOT approved by being made",
+      MERGED and MERGED[-1][2] == {KEY: "https://cdn/makeover.jpg"}
+      and MERGED[-1][3] is None, MERGED)
+check("the allowance reported is what is left AFTER this one",
+      res["allowance"] == {"used": 1, "limit": 20, "remaining": 19}, res["allowance"])
+
+res = _concept(listing=_listing({KEY: "https://cdn/c.jpg"}))
+check("a cached concept is free to look at again",
+      res["concept_url"] == "https://cdn/c.jpg" and res["from_cache"] is True
+      and not TALLY and not MERGED, res)
+
+
+class _Billed(PR.fal_images.FalTemporary):
+    images_billed = 1
+
+
+def _incident(prompt, urls, deadline):
+    raise _Billed("every collection attempt failed")
+
+
+res = _concept(generate=_incident)
+check("fal incident: no concept, a reason, and the picture fal CHARGED for is counted",
+      res["concept_url"] is None and res["warnings"] and TALLY[0][1] == 1, (res, TALLY))
+
+
+def _busy(prompt, urls, deadline):
+    raise PR.fal_images.FalRateLimited("at this account's concurrency limit")
+
+
+res = _concept(generate=_busy)
+check("fal busy: nothing billed, a reason the agent can act on",
+      res["concept_url"] is None and not TALLY
+      and any("busy" in w for w in res["warnings"]), res["warnings"])
+
+res = _concept(used=PR.MAX_POTENTIAL_MAKEOVERS_PER_AGENT_PER_MONTH)
+check("over the ceiling: nothing generated, nothing billed, allowance reads zero left",
+      res["concept_url"] is None and not TALLY
+      and res["allowance"]["remaining"] == 0
+      and any("allowance" in w for w in res["warnings"]), res)
+
+res = _concept(used=None)
+check("the tally could not be READ: nothing generated and no number is shown",
+      res["concept_url"] is None and not TALLY and res["allowance"] is None
+      and res["warnings"], res)
+
+try:
+    _concept(available=False)
+    check("the style being off refuses the concept call", False)
+except HTTPException as e:
+    check("the style being off refuses the concept call with 400 and a reason",
+          e.status_code == 400 and "not switched on" in e.detail, e.detail)
+
+# The free state call the app uses to label the button before anything is pressed.
+_use(_DBS(BARE_AGENT, _listing({KEY: "https://cdn/c.jpg"}, [KEY])))
+NS["_potential_available"] = lambda: True
+try:
+    state = NS["get_poster_concept_state"]("L1", agent=BARE_AGENT)
+finally:
+    NS["_potential_available"] = lambda: False
+# Finding 2. The one paid signed-in endpoint now has a short window and an hourly one.
+check("the concept endpoint asks for a burst limit and an hourly limit",
+      (8, 60) in RATE_ASKED and (30, 3600) in RATE_ASKED, RATE_ASKED)
+RATE_BLOCK[0] = True
+try:
+    _concept()
+    check("a rate-limited press is refused", False)
+except HTTPException as e:
+    check("a rate-limited press is refused with 429 and nothing is bought",
+          e.status_code == 429 and not TALLY, (e.status_code, TALLY))
+finally:
+    RATE_BLOCK[0] = False
+
+check("the state call reports per-photo concept and approval, and spends nothing",
+      state["available"] is True
+      and state["photos"] == [{"photo_index": 0, "concept_key": KEY,
+                               "photo_url": PHOTO, "concept_url": "https://cdn/c.jpg",
+                               "has_concept": True, "approved": True}]
+      and state["allowance"] == {"used": 0, "limit": 20, "remaining": 20}, state)
+# The picker's contract with the frontend. `slow`/`slow_seconds` appear on Potential and
+# on nothing else -- it is the only template that waits on a third party, and the app has
+# to be able to warn before the press rather than leave an agent watching a spinner.
+NS["POTENTIAL_POSTER_TEMPLATE"] = {"id": "potential", "name": "Potential",
+                                   "thumbnail_url": "https://t/potential.jpg"}
+NS["POSTER_TEMPLATES"] = [{"id": "editorial", "name": "Editorial",
+                           "thumbnail_url": "https://t/editorial.jpg"}]
+run_nodes("_poster_templates_offered", "get_poster_templates")
+NS["_potential_available"] = lambda: True
+rows = NS["get_poster_templates"](agent=BARE_AGENT)
+check("picker: Potential offered when available, marked slow; others unmarked",
+      [r["id"] for r in rows] == ["editorial", "potential"]
+      and "slow" not in rows[0] and rows[1]["slow"] is True
+      and rows[1]["slow_seconds"] == PR.POTENTIAL_BUDGET_SECONDS + 15, rows)
+NS["_potential_available"] = lambda: False
+check("picker: Potential absent entirely when it is not available",
+      [r["id"] for r in NS["get_poster_templates"](agent=BARE_AGENT)] == ["editorial"])
+check("the thumbnail the picker asks for is derived from the shared base",
+      'f"{POSTER_THUMBNAIL_BASE}/potential.jpg"' in SRC)
 
 # ---------------------------------------------------------------------------
 print("\n[9] video end slate: extra lines drawn; single-line contact pixel-identical")

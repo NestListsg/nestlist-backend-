@@ -403,6 +403,19 @@ async def startup_event():
     else:
         logger.info("From Old to New (Elegant) video generation: off (set %s=1 to "
                     "switch it on)", ELEGANT_VIDEO_ENABLED_ENV)
+    if _potential_switch_on():
+        logger.warning(
+            "Potential poster style: SWITCHED ON. One generated image a listing photo, "
+            "about US$%.2f, cached so a re-render is free, capped at %d concepts per "
+            "agent per calendar month (about US$%.2f). fal's own billing spend limit is "
+            "the only cap no bug here can outrun.",
+            fal_images.COST_PER_IMAGE_USD,
+            poster_renderer.MAX_POTENTIAL_MAKEOVERS_PER_AGENT_PER_MONTH,
+            poster_renderer.MAX_POTENTIAL_MAKEOVERS_PER_AGENT_PER_MONTH
+            * fal_images.COST_PER_IMAGE_USD)
+    else:
+        logger.info("Potential poster style: off (set %s=1 to switch it on)",
+                    POTENTIAL_ENABLED_ENV)
     # The per-agent monthly image ceiling lives in two columns on the agents row. If
     # they are missing while the key IS set, we are generating paid images with no
     # ceiling at all -- which is precisely the condition Jane must hear about rather
@@ -436,6 +449,29 @@ async def _check_old_to_new_ceiling():
     except Exception as e:
         logger.warning("could not probe the elegant seconds columns (%s)", e)
         seconds_present = None
+    # The Potential poster's own columns, probed in the same pass and on the same rule:
+    # only worth a message when the style is actually switched on, because with the
+    # switch off nothing can be spent and _potential_available() keeps it off anyway.
+    try:
+        potential_present = await asyncio.to_thread(_probe_potential_columns)
+    except Exception as e:
+        logger.warning("could not probe the potential poster columns (%s)", e)
+        potential_present = None
+    if _potential_switch_on() and potential_present is False:
+        await send_telegram_alert_throttled(
+            "potential_poster_columns_missing",
+            "⚠️ <b>NestList Warning</b>\n\nThe <b>Potential</b> poster style is switched "
+            "ON, but its columns are missing: "
+            "<code>agents.potential_makeovers_month</code>, "
+            "<code>agents.potential_makeovers_used</code> and "
+            "<code>listings.potential_images</code>.\n\nWithout them nothing counts the "
+            "monthly allowance and nothing remembers a concept image, so every press "
+            "would buy the same picture again. Potential is therefore <b>offered to "
+            "nobody</b> until they exist; the other poster styles are unaffected.\n\n"
+            "Fix: run <code>migrations/004_potential_poster_columns.sql</code> in the "
+            "Supabase SQL editor, then redeploy (the check runs once at startup).",
+            cooldown_seconds=86400,
+        )
     if _elegant_switch_on() and seconds_present is False:
         await send_telegram_alert_throttled(
             "elegant_seconds_ceiling_missing",
@@ -5244,13 +5280,71 @@ POSTER_TEMPLATES = [
     {"id": "asymmetric-column", "name": "Asymmetric Column", "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/asymmetric-column.jpg"},
 ]
 
+# ---------------------------------------------------------------------------
+# POTENTIAL -- the AI makeover concept poster.
+#
+# The only poster template that spends money: one generated image per listing photo,
+# about US$0.04, cached so a re-render is free. See poster_renderer's POTENTIAL block.
+#
+# A SWITCH OF ITS OWN, for exactly the reason the Elegant video has one. FAL_KEY is
+# ALREADY SET in production for the Dramatic video, so "is there a key" is useless as a
+# gate here: the moment this deployed, every agent would be offered a paid feature whose
+# output no human has looked at yet. Nobody has seen a real Potential makeover -- the
+# proofs rendered during the build used a local stand-in image, not fal. This switch is
+# how Jane turns it on, once, after she has seen one.
+#
+# THREE CONDITIONS, and each is something that would otherwise cost money or credibility:
+#   1. the switch, so a deploy cannot expose a paid feature nobody has reviewed;
+#   2. a key, because without one there is nothing to generate with;
+#   3. the tally AND cache columns, because without the tally there is no ceiling and
+#      without the cache every press pays again -- which is the worst combination there
+#      is, and the same argument _old_to_new_ceiling_enforceable() makes.
+POTENTIAL_TEMPLATE_ID = "potential"
+POTENTIAL_ENABLED_ENV = "POTENTIAL_POSTER_ENABLED"
+POTENTIAL_CONCEPT_NOT_MADE_WARNING = (
+    "The concept for this photo hasn't been made yet, so this poster uses the real "
+    "photo. Make the concept first and take a look at it.")
+POTENTIAL_POSTER_TEMPLATE = {
+    "id": POTENTIAL_TEMPLATE_ID, "name": "Potential",
+    "thumbnail_url": f"{POSTER_THUMBNAIL_BASE}/potential.jpg",
+}
+
+
+def _potential_switch_on() -> bool:
+    return os.environ.get(POTENTIAL_ENABLED_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _potential_available() -> bool:
+    """Can an agent choose the Potential style on this deploy RIGHT NOW?
+
+    The picker, the template validator and the render all ask this one function, so
+    there is one answer and it cannot be true in one place and false in another."""
+    return bool(_potential_switch_on()
+                and fal_images.is_enabled()
+                and _potential_columns_supported is not False)
+
+
+def _poster_templates_offered():
+    """The templates an agent may actually pick. Potential only when it is available --
+    an unavailable paid style must never appear in the picker."""
+    return POSTER_TEMPLATES + ([POTENTIAL_POSTER_TEMPLATE] if _potential_available() else [])
+
+
 @app.get("/api/poster-templates")
 def get_poster_templates(agent=Depends(get_current_agent)):
-    return [{"id": t["id"], "name": t["name"], "thumbnail_url": t["thumbnail_url"]} for t in POSTER_TEMPLATES]
+    # `slow` and `slow_seconds` are the frontend's cue to warn before the press: this
+    # template waits on a third-party image generation, where the other ten are local
+    # drawing that returns in a second or two. Absent on every other template.
+    return [{"id": t["id"], "name": t["name"], "thumbnail_url": t["thumbnail_url"],
+             **({"slow": True, "slow_seconds": poster_renderer.POTENTIAL_BUDGET_SECONDS + 15}
+                if t["id"] == POTENTIAL_TEMPLATE_ID else {})}
+            for t in _poster_templates_offered()]
 
 @app.post("/api/listings/{listing_id}/generate-poster")
 def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = None,
                     price_override: str = None, phone_override: str = None,
+                    approve_concept_key: str = None,
                     agent=Depends(get_current_agent)):
     # price_override / phone_override (feature #4): OPTIONAL per-render overrides so the agent
     # can tweak the price and contact number shown ON THE POSTER from My Listings WITHOUT
@@ -5259,6 +5353,9 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     # (these strings are drawn onto the image); an over-long value is rejected as a clean 400.
     price_override = (price_override or "").strip()
     phone_override = (phone_override or "").strip()
+    # Agent-supplied and compared against a key we compute ourselves, so an unexpected
+    # value can only fail to match. Capped anyway, because it is a request parameter.
+    approve_concept_key = (approve_concept_key or "").strip()[:128]
     if len(price_override) > 40:
         raise HTTPException(status_code=400, detail="Price is too long for the poster")
     if len(phone_override) > 60:
@@ -5269,11 +5366,30 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
         raise HTTPException(status_code=404, detail="Listing not found")
     listing = result.data[0]
 
-    if template_id and template_id not in {t["id"] for t in POSTER_TEMPLATES}:
+    offered = {t["id"] for t in _poster_templates_offered()}
+    if template_id and template_id not in offered and template_id != POTENTIAL_TEMPLATE_ID:
         raise HTTPException(status_code=400, detail="Unknown poster template")
-    # Explicit choice wins and is remembered on the listing; otherwise fall back to
-    # whatever this listing last used, then the agent's profile default.
-    chosen_template_id = template_id or listing.get("poster_template_id") or agent.get("poster_template_id") or "editorial"
+
+    # THE KILL SWITCH MUST NOT BREAK THE STYLES IT IS PROTECTING. generate-poster writes
+    # `poster_template_id: "potential"` onto the listing, so once an agent has used the
+    # style it becomes that listing's default and the app keeps asking for it by name.
+    # Refusing that request with a 400 would mean: the moment Jane switches Potential off
+    # because the makeovers look wrong -- the exact moment agents most need the other ten
+    # styles to keep working -- their poster button starts failing instead. A backout that
+    # breaks the thing it is backing out of is not a backout.
+    #
+    # So an unavailable Potential is SKIPPED rather than refused, and the next style down
+    # the chain is used. Genuinely unknown ids still 400 above: this is about a style the
+    # agent really did choose and which really did exist when they chose it.
+    chosen_template_id = "editorial"
+    for candidate in (template_id, listing.get("poster_template_id"),
+                      agent.get("poster_template_id")):
+        if candidate and candidate in offered:
+            chosen_template_id = candidate
+            break
+    potential_skipped = (POTENTIAL_TEMPLATE_ID not in offered
+                         and POTENTIAL_TEMPLATE_ID in (template_id,
+                                                       listing.get("poster_template_id")))
 
     images = listing.get("images") or []
     if not images:
@@ -5318,6 +5434,12 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     # NestList Home (condo family ONLY): price shown openly with the agent's label, and the
     # CEA line drawn as a footer. Landed / Prestige: nothing here changes.
     compliance_line, poster_warnings, cea_missing = "", [], []
+    if potential_skipped:
+        # Said plainly, because the agent asked for one style and got another and the
+        # reason is not their doing.
+        poster_warnings.append(
+            "The Potential style isn't available right now, so this poster uses your "
+            "usual style instead.")
     if _home_listing_needs_cea(listing.get("property_type"), _listing_property_types(listing)):
         price_text = _condo_price_text(price_source, _listing_strata_fields(listing)["price_label"])
         cea_missing = _cea_missing(agent)
@@ -5325,8 +5447,63 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
         if cea_missing:
             poster_warnings.append(_cea_warning(agent))
 
+    # THE ONLY PART OF A POSTER RENDER THAT SPENDS MONEY, and it is reached only by the
+    # Potential style with every one of its switches on. Everything that can go wrong
+    # here -- no key, no allowance left, fal refusing, fal busy, fal slow, an upload that
+    # fails -- comes back as url=None plus a plain-English note, and the poster is then
+    # rendered from the real photograph. There is no failure path that denies the agent
+    # a poster, which is why none of this is inside the try/except below.
+    # THE PREVIEW GATE. This call NEVER generates a concept and never spends anything:
+    # it can only use one that is already cached AND that a human has approved through
+    # /poster-concept. That is what makes the preview a gate rather than a suggestion --
+    # there is no route to a published concept that nobody has looked at, including this
+    # endpoint being called directly, by an old frontend, or by a retry.
+    #
+    # Jane's decision of 2026-11-12, and it is a strengthening of the no-fabrication
+    # guardrail rather than a UX nicety: the model will sometimes produce a bald patch
+    # where the lorry was, or a house that reads as a different house, and nothing but a
+    # human eye can tell. So a human looks at every makeover before any buyer does.
+    makeover_photo_url, had_makeover = None, False
+    if chosen_template_id == POTENTIAL_TEMPLATE_ID and _potential_available():
+        stored_concepts = listing.get(POTENTIAL_CACHE_COLUMN)
+        concepts = poster_renderer.read_makeover_cache(stored_concepts)
+        approved = poster_renderer.read_makeover_approvals(stored_concepts)
+        concept_key = poster_renderer.potential_cache_key(images[photo_index])
+
+        # The agent pressed "Use it" on the preview. The key they send back is the one
+        # the preview returned, so the approval is bound to the EXACT image they looked
+        # at: if the prompt has been reworded since, every key changed, this one no
+        # longer matches, and they are sent back to review the new concept instead of
+        # publishing an old one on the strength of an old yes.
+        #
+        # THE CONVENTION HERE IS LOAD-BEARING, AND IT IS ONLY A CONVENTION. This
+        # parameter is proof that a client POSSESSED the key, not proof that a human
+        # looked at the picture -- and the key is derivable from the photo url, which
+        # GET /poster-concept hands out for every photo whether a concept exists or not.
+        # Today nothing abuses that: the only caller that sends a key is the Use-it
+        # button inside the review panel. If you are adding a batch flow, a "regenerate
+        # all", or passing this through for convenience from somewhere that has not shown
+        # the agent the image, STOP -- you would be publishing unreviewed AI concepts and
+        # no test would catch it. The real fix is a one-time review token minted by
+        # POST /poster-concept and consumed here; it is deliberately deferred, not
+        # forgotten. See the matching note on that endpoint.
+        if approve_concept_key and approve_concept_key == concept_key \
+                and concept_key in concepts:
+            approved = approved | {concept_key}
+            _merge_potential_cache(listing_id, agent["id"], approve=[concept_key])
+
+        if concept_key in concepts and concept_key in approved:
+            makeover_photo_url = concepts[concept_key]
+            had_makeover = True
+        elif concept_key in concepts:
+            poster_warnings.append(
+                "This concept hasn't been approved yet, so this poster uses the real "
+                "photo. Open the concept, look at it, and choose Use it.")
+        else:
+            poster_warnings.append(POTENTIAL_CONCEPT_NOT_MADE_WARNING)
+
     try:
-        poster_image = poster_renderer.render_poster(
+        rendered = poster_renderer.render_poster_report(
             property_type=property_type_text,
             district=district_text,
             price_text=price_text,
@@ -5337,9 +5514,25 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
             agent_photo_url=agent.get("photo_url"),
             template_id=chosen_template_id,
             compliance_line=compliance_line,
+            makeover_photo_url=makeover_photo_url,
         )
+        poster_image = rendered.image
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Poster rendering failed: {e}")
+
+    # WHAT IS ACTUALLY IN THE PIXELS, asked of the renderer rather than assumed from
+    # having had a makeover image. The image can fail to download, and any of the four
+    # disclosure guards can fire; the poster then correctly falls back to the real
+    # photograph. Claiming "AI concept" there would be the same false statement the
+    # guards exist to prevent, moved out of the picture and into the response -- and the
+    # agent would have paid four cents to be told nothing.
+    concept_used = rendered.concept_used
+    if had_makeover and not concept_used:
+        logger.warning("potential %s: a concept image was available but the poster fell "
+                       "back to the real photograph", listing_id)
+        poster_warnings.append(
+            "The concept image could not be shown on this poster, so it uses the real "
+            "photo. The concept is saved, so trying again costs nothing.")
 
     buffer = io.BytesIO()
     poster_image.save(buffer, format="JPEG", quality=92)
@@ -5358,12 +5551,184 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
     # hero shot survives a page reload instead of silently reverting to photo 0
     # the next time the poster is (re)generated.
     update_payload = {"poster_url": poster_url, "poster_photo_url": images[photo_index]}
-    if template_id:
+    # Remembered only when the style the agent ASKED for is the style they GOT. If
+    # Potential was skipped because it is switched off, the listing keeps pointing at it
+    # so the agent's real choice comes back by itself when Jane switches it on again --
+    # overwriting it here would quietly discard a preference during a backout.
+    if template_id and chosen_template_id == template_id:
         update_payload["poster_template_id"] = template_id
     db_execute(lambda db: db.table("listings").update(update_payload).eq("id", listing_id).eq("agent_id", agent["id"]), what="generate_poster listings update")
 
+    # `concept_used` tells the frontend which picture it is looking at on a Potential
+    # poster: true = the AI concept with the BEFORE inset and the disclosure band, false
+    # = the ordinary poster from the real photograph. Always false for the other ten
+    # templates. Any reason the concept was not used is already a sentence in `warnings`.
     return {"poster_url": poster_url, "poster_template_id": chosen_template_id,
-            "warnings": poster_warnings, "cea_missing": cea_missing}
+            "warnings": poster_warnings, "cea_missing": cea_missing,
+            "concept_used": concept_used}
+
+
+def _potential_listing_or_404(listing_id: str, agent):
+    result = db_execute(
+        lambda db: db.table("listings").select("*").eq("id", listing_id)
+        .eq("agent_id", agent["id"]),
+        what="poster_concept listings select")
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    return result.data[0]
+
+
+def _potential_photo_state(listing, images):
+    """Per photo: is there a concept for it, and has it been approved?"""
+    stored = listing.get(POTENTIAL_CACHE_COLUMN)
+    concepts = poster_renderer.read_makeover_cache(stored)
+    approved = poster_renderer.read_makeover_approvals(stored)
+    photos = []
+    for index, url in enumerate(images):
+        key = poster_renderer.potential_cache_key(url)
+        photos.append({"photo_index": index, "concept_key": key,
+                       "photo_url": url,
+                       "concept_url": concepts.get(key),
+                       "has_concept": key in concepts,
+                       "approved": key in approved})
+    return photos
+
+
+@app.get("/api/listings/{listing_id}/poster-concept")
+def get_poster_concept_state(listing_id: str, agent=Depends(get_current_agent)):
+    """What the Potential style can do for this listing right now. FREE, spends nothing.
+
+    This is what lets the app say "uses 1 of your 17 remaining" BEFORE the agent presses
+    anything, and "already made, free to look at again" on a photo that has a concept.
+    An agent spending four cents should know it in advance, not discover it in a tally."""
+    listing = _potential_listing_or_404(listing_id, agent)
+    images = listing.get("images") or []
+    return {"available": _potential_available(),
+            "allowance": _potential_allowance(_potential_makeovers_used(agent["id"])),
+            "photos": _potential_photo_state(listing, images)}
+
+
+# Two windows on the one paid signed-in endpoint in the app, because they answer two
+# different things.
+#
+#   THE MINUTE is the one that matters here. The ceiling is read-check-spend with no
+#   reservation, so simultaneous presses by one agent all read the same tally before any
+#   of them writes, and the monthly 20 can be stepped over. fal's own concurrency limit
+#   already blunts most of it -- it admits about two at once and the third press raises
+#   FalRateLimited having been billed nothing -- and a short window closes the rest.
+#   EIGHT a minute is far faster than anyone can look at a picture and decide, so it
+#   cannot fight a real agent reviewing concepts.
+#
+#   THE HOUR bounds sustained use, matching /rewrite-selection (60) and the chatbot (40).
+#   Thirty is comfortably above a long session of making and re-opening concepts -- and
+#   re-opening a cached one comes through here too, which is why it is not tighter.
+#
+# NEITHER IS THE CEILING, and neither is a reservation. They bound a burst; the per-agent
+# monthly allowance and fal's prepaid balance are what bound the money.
+_poster_concept_hits = {}
+_poster_concept_burst_hits = {}
+
+
+@app.post("/api/listings/{listing_id}/poster-concept")
+def generate_poster_concept(listing_id: str, photo_index: int = 0,
+                            agent=Depends(get_current_agent)):
+    """Make (or return) the AI concept FOR REVIEW. The slow, paid call.
+
+    NO POSTER IS RENDERED HERE, and that separation is the feature. The agent sees their
+    real photograph and the concept side by side and decides; only then does
+    generate-poster use it, and only because this call recorded that it exists for them
+    to have looked at. Every piece of spending machinery lives here and nowhere else:
+    the ceiling, the refuse-rather-than-guess behaviour when the tally cannot be read,
+    the count of what fal CHARGED for rather than what arrived, and the merge-don't-
+    overwrite cache write.
+
+    Never raises on a generation failure. A busy fal, an exhausted allowance or a refused
+    prompt all return concept_url: null with a plain-English reason, because the agent's
+    next step (pick another style, try another photo, come back later) is the same in
+    every case and an error page helps with none of them.
+
+    THE `concept_key` THIS RETURNS IS NOT A CAPABILITY, and that is a known gap rather
+    than a design. generate-poster accepts it back as `approve_concept_key` and treats
+    that as "a human looked at this and chose it" -- but the key is derived from the
+    photo url, and GET /poster-concept hands one out for every photo whether a concept
+    exists or not, so possession proves only that a client asked. What actually holds the
+    gate shut today is that the single caller sending a key is the Use-it button inside
+    the review panel. Minting a one-time review token here and consuming it there would
+    make it structural; that is deliberately deferred until Jane has seen her first real
+    makeover. Until then, do not hand this key to anything that has not put the picture
+    in front of a person.
+    """
+    if not _potential_available():
+        raise HTTPException(
+            status_code=400,
+            detail="The Potential style is not switched on for this account yet.")
+    if _rate_limited(_poster_concept_burst_hits, agent["id"], limit=8, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="That's a lot of concepts at once -- give it a minute and try again.")
+    if _rate_limited(_poster_concept_hits, agent["id"], limit=30, window_seconds=3600):
+        raise HTTPException(
+            status_code=429,
+            detail="You've hit the hourly limit for concepts -- please try again in a bit.")
+    listing = _potential_listing_or_404(listing_id, agent)
+    images = listing.get("images") or []
+    if not images:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload at least one photo before making a concept")
+    if photo_index < 0 or photo_index >= len(images):
+        photo_index = 0
+    source = images[photo_index]
+
+    warnings, spent = [], 0
+    # THE CEILING IS CHECKED BEFORE ANYTHING IS SPENT, and a tally we could not READ is
+    # not a tally of zero. None means the read raised -- a dropped column, a changed
+    # grant, an RLS surprise -- and treating that as "nothing used yet" would remove the
+    # per-agent ceiling entirely for as long as the fault lasted, because every later
+    # press would read zero again. The fal balance is shared with the video features, so
+    # an unbounded poster spend does not merely overspend: it stops the Dramatic and
+    # Elegant films too. Declined PER PRESS rather than latched off, so a transient fault
+    # heals on the next press without a redeploy.
+    used = _potential_makeovers_used(agent["id"])
+    makeover = None
+    if used is None:
+        logger.warning("potential %s: could not read the concept-image tally, so "
+                       "nothing was generated for this press", listing_id)
+        warnings.append("The concept couldn't be made just now, so nothing was used from "
+                        "your allowance. Please try again in a moment.")
+    else:
+        makeover = poster_renderer.makeover_image(
+            source_photo_url=source,
+            cache=poster_renderer.read_makeover_cache(listing.get(POTENTIAL_CACHE_COLUMN)),
+            generate_image=fal_images.generate,
+            store_image=lambda role, key, data: _store_generated_image(
+                listing_id, role, key, data),
+            makeovers_used_this_month=used,
+        )
+        spent = makeover.images_paid
+        # COUNT WHAT FAL CHARGED FOR, not what arrived -- images_paid already includes
+        # anything billed and then lost (see fal_images.billed_images).
+        if spent:
+            _add_old_to_new_images(agent["id"], spent,
+                                   month_column=POTENTIAL_MONTH_COLUMN,
+                                   value_column=POTENTIAL_COUNT_COLUMN,
+                                   unit="concept image")
+        if makeover.added and POTENTIAL_CACHE_COLUMN in listing:
+            _merge_potential_cache(listing_id, agent["id"], added=makeover.added)
+        if makeover.note:
+            warnings.append(makeover.note)
+
+    # Reported AFTER the spend, so the number the agent reads is the one they have left.
+    allowance = _potential_allowance(None if used is None else used + spent)
+    return {
+        "photo_index": photo_index,
+        "photo_url": source,
+        "concept_url": makeover.url if makeover else None,
+        "concept_key": poster_renderer.potential_cache_key(source),
+        "from_cache": bool(makeover and makeover.from_cache),
+        "allowance": allowance,
+        "warnings": warnings,
+    }
 
 DEFAULT_VIDEO_TEMPLATE_ID = "classic"
 
@@ -6088,6 +6453,25 @@ OLD_TO_NEW_IMAGES_COLUMN = "old_to_new_images_used"
 # Set by the startup probe. None means "not probed yet".
 _old_to_new_usage_columns_supported = None
 
+# THE POTENTIAL POSTER'S OWN TALLY, in the same unit (generated images) but in its own
+# pair of columns.
+#
+# SEPARATE COLUMNS RATHER THAN SHARING THE ONES ABOVE, and this is Jane's decision
+# relayed through the orchestrator rather than a technical one: sharing would work, since
+# both count the same four-cent fal still, but a poster press would then quietly consume
+# an agent's video allowance. An agent who could not make their video because of posters
+# they made last week would have no way to find that out from anything the product shows
+# them. Two allowances that each mean what their name says is worth one migration.
+#
+# The column NAMES live in poster_renderer beside the ceiling they enforce, so this file
+# and the migration cannot drift apart from the module that spends the money.
+POTENTIAL_MONTH_COLUMN = poster_renderer.POTENTIAL_USAGE_MONTH_COLUMN
+POTENTIAL_COUNT_COLUMN = poster_renderer.POTENTIAL_USAGE_COUNT_COLUMN
+# The listing-row cache of generated concepts. Without it every press pays again.
+POTENTIAL_CACHE_COLUMN = "potential_images"
+# Set by the startup probe. None means "not probed yet".
+_potential_columns_supported = None
+
 # THE ELEGANT'S OWN TALLY, in the unit the Elegant is billed in: SECONDS OF VIDEO.
 #
 # A SECOND PAIR OF COLUMNS RATHER THAN A CONVERSION, and the reason is the whole argument
@@ -6380,6 +6764,127 @@ def _probe_elegant_seconds_columns():
                        "style is DECLINED rather than generated with no ceiling. Run "
                        "docs/old-to-new-elegant-migration.sql.")
     return _elegant_seconds_columns_supported
+
+
+def _potential_makeovers_used(agent_id: str):
+    """Concept images this agent has been billed for this calendar month, or None.
+
+    NONE MEANS "THE READ FAILED", AND THAT IS NOT THE SAME AS ZERO. The two were
+    conflated here and the difference is the whole ceiling: on a narrow fault -- the
+    listings table reading fine while the agents read raises, from a dropped column, a
+    changed grant or an RLS surprise -- returning 0 would let EVERY press through, every
+    one of them reading 0 again, with no per-agent limit at all for as long as the fault
+    lasted. _probe_potential_columns runs once at startup and never again, so nothing
+    else would notice. And because the fal balance is shared with the video features, the
+    damage is not a poster overspend: it is the Dramatic and Elegant films stopping too.
+
+    Zero is still returned for the ordinary "nothing counted yet" cases -- no row, null
+    columns, or a tally belonging to a past month -- because those are real answers.
+    """
+    try:
+        usage = _read_old_to_new_usage(agent_id, POTENTIAL_MONTH_COLUMN,
+                                       POTENTIAL_COUNT_COLUMN)
+    except Exception as e:
+        logger.warning("potential: could not read this month's concept-image tally "
+                       "(%s); declining to generate rather than spending uncounted", e)
+        return None
+    if not usage:
+        return 0
+    month, used = usage
+    if month != _current_usage_month():
+        # Last month's tally, or none at all. The next write replaces both columns.
+        return 0
+    return used or 0
+
+
+# How many times to re-read and merge the concept cache when another press is writing it
+# at the same moment. Small: losing the race costs one re-bought picture (four cents),
+# never correctness, so this protects money rather than data.
+_POTENTIAL_CACHE_MERGE_ATTEMPTS = 3
+
+
+def _potential_allowance(used):
+    """The agent's concept allowance as the API reports it, or None.
+
+    None means the tally could not be read, and the frontend must show no number rather
+    than a wrong one -- the same distinction _potential_makeovers_used() draws."""
+    if used is None:
+        return None
+    limit = poster_renderer.MAX_POTENTIAL_MAKEOVERS_PER_AGENT_PER_MONTH
+    used = max(0, int(used))
+    return {"used": used, "limit": limit, "remaining": max(0, limit - used)}
+
+
+def _merge_potential_cache(listing_id: str, agent_id: str, added: dict = None,
+                           approve=None) -> bool:
+    """Merge newly generated concepts into the listing row. Never raises.
+
+    MERGE, NOT OVERWRITE. The cache handed to makeover_image is a snapshot taken when the
+    request started, and a Potential render can take most of a minute -- so writing that
+    snapshot back would erase any entry another press added meanwhile, and the erased
+    picture would simply be bought again. Only the entries this press created are
+    written, over whatever the row holds NOW.
+
+    Re-read and merge rather than a compare-and-swap like the tally's: PostgREST has no
+    usable equality filter on a jsonb column to pin the old value with. The window is
+    narrowed from the whole request to the few milliseconds between this read and this
+    write, and the cost of still losing it is four cents, not a wrong poster.
+    """
+    for attempt in range(_POTENTIAL_CACHE_MERGE_ATTEMPTS):
+        try:
+            res = db_execute(
+                lambda db: db.table("listings").select(POTENTIAL_CACHE_COLUMN)
+                .eq("id", listing_id).eq("agent_id", agent_id),
+                what="generate_poster potential cache read")
+            stored = (res.data or [{}])[0].get(POTENTIAL_CACHE_COLUMN)
+            current = poster_renderer.read_makeover_cache(stored)
+            current_ok = poster_renderer.read_makeover_approvals(stored)
+            merged = dict(current)
+            merged.update(added or {})
+            merged_ok = current_ok | {k for k in (approve or ()) if k in merged}
+            if merged == current and merged_ok == current_ok:
+                return True
+            db_execute(
+                lambda db: db.table("listings").update({
+                    POTENTIAL_CACHE_COLUMN: poster_renderer.write_makeover_cache(
+                        merged, merged_ok)
+                }).eq("id", listing_id).eq("agent_id", agent_id),
+                what="generate_poster potential cache update")
+            return True
+        except Exception as e:
+            if attempt + 1 >= _POTENTIAL_CACHE_MERGE_ATTEMPTS:
+                logger.warning("potential %s: generated a concept image but could not "
+                               "record it (%s) -- a regenerate will pay again",
+                               listing_id, e)
+                return False
+    return False
+
+
+def _probe_potential_columns():
+    """Are the Potential tally and cache columns there? Sets the module flag; never raises.
+
+    BOTH are required, and the cache is not the lesser of the two: without the tally
+    there is no ceiling, and without the cache every press of Generate buys the same
+    picture again. Either one missing makes the style unavailable rather than merely
+    degraded -- a paid feature with no ceiling and no cache is the one shape of this
+    that could run Jane's prepaid fal balance down without anybody noticing.
+    """
+    global _potential_columns_supported
+    try:
+        get_db().table("agents").select(
+            f"{POTENTIAL_MONTH_COLUMN},{POTENTIAL_COUNT_COLUMN}").limit(1).execute()
+        get_db().table("listings").select(POTENTIAL_CACHE_COLUMN).limit(1).execute()
+        _potential_columns_supported = True
+        logger.info("potential poster: tally and cache columns present -- the per-agent "
+                    "ceiling (%d concepts a month) is enforced and re-renders are free",
+                    poster_renderer.MAX_POTENTIAL_MAKEOVERS_PER_AGENT_PER_MONTH)
+    except Exception:
+        _potential_columns_supported = False
+        logger.warning("potential poster: tally/cache columns are MISSING -- the style "
+                       "is OFFERED TO NOBODY rather than generating paid images with no "
+                       "ceiling and no cache. Run "
+                       "migrations/004_potential_poster_columns.sql.")
+    return _potential_columns_supported
 
 
 def _probe_old_to_new_usage_columns():
