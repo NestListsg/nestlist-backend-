@@ -88,13 +88,56 @@ attempts counter, so a deferral never burns a retry. Only genuine errors -- unre
 photos, ffmpeg crashing, a listing that no longer has photos -- can fail a job, and
 those still travel through video_renderer's degradation ladder untouched.
 
-WHY POLLING
-PostgREST gives us no way to be woken (no LISTEN/NOTIFY over REST). Workers poll. The
-interval is deliberately short -- POLL_SECONDS below -- because a Classic render is ~50s,
-so up to two seconds of pickup latency is under 4% of the wait and invisible to an agent,
-while four workers at roughly one query every two seconds is negligible load on
-PostgREST. The interval is jittered so four workers restarting together after a deploy do
-not synchronise into a thundering herd.
+WHY POLLING -- AND WHAT THE OLD CADENCE ACTUALLY COST (CORRECTED 2026-11-17)
+PostgREST gives us no way to be woken (no LISTEN/NOTIFY over REST), so workers poll.
+
+The paragraph that used to sit here said "four workers at roughly one query every two
+seconds is negligible load on PostgREST". As a judgement about LOAD that was right, and
+it still is: PostgREST never noticed. It was wrong about the two things that are METERED
+on Jane's plan, and it undercounted the queries by about a factor of five.
+
+The undercount: it was one query PER REGISTERED TYPE per cycle, not one per cycle, plus
+a separate running-count query for every type that has an account_limit (dramatic,
+elegant). main.py registers the Classic and the Dramatic unconditionally and the Elegant
+only when ELEGANT_VIDEO_ENABLED is set, so that is THREE requests per worker per two
+seconds today and FIVE with the Elegant switched on -- times four uvicorn workers, which
+is where ~7-8 a second comes from rather than the "one every two seconds" above.
+
+What was measured in Supabase's Edge Logs on 2026-11-17, with essentially nobody using
+the platform:
+  * ALL of the 100 most recent requests were GET /rest/v1/video_jobs. Nothing else
+    appeared at all.
+  * ~7-8 requests a second, continuously, on a dead-flat hourly chart -- it ran around
+    the clock whether or not anyone was using the app. About 600,000 requests a day,
+    ~18 million a month, against a queue that is almost always empty.
+  * Egress 0.91 GB in the first two days of a cycle that allows 5 GB, and log ingestion
+    already at 133% of the monthly allowance after two days.
+
+So the cost that bites is not CPU. It is BYTES AND LOG LINES. Every poll is an HTTPS
+round trip with headers both ways -- about 750 bytes of egress and about 950 bytes of log
+ingestion each, from dividing those totals by the request count -- and both are metered
+monthly whether the response carries a job or an empty array. An idle poll is not free;
+it is only not slow.
+
+What the loop does now, and why each piece is there:
+  * ONE query per cycle covering every type this worker may take (`job_type=in.(...)`)
+    instead of one per type, reading only the four columns a claim actually needs. The
+    round-robin that stopped one type starving another is kept: it now orders the
+    CANDIDATES of a single read rather than the reads themselves.
+  * The account_limit running-count is asked LAZILY, only when a candidate of that type
+    actually turned up. An empty queue costs zero count queries.
+  * The interval RAMPS while the queue keeps coming back empty -- POLL_IDLE_LADDER,
+    2s up to 30s -- and snaps back to POLL_SECONDS the moment anything is claimed.
+  * TWO DOORBELLS keep that ramp from costing an agent anything, because half a minute
+    of dead air before a ~100s render even starts would be a real regression. enqueue()
+    sets an in-process asyncio event -- the worker that served the request is usually
+    the one with a free render slot -- and it also replaces a tiny file in a private
+    /tmp directory that the sibling workers in the same container read once a second.
+    Reading a file is not a request: no egress, no log line. If that file cannot be used
+    (read-only disk, or workers spread over more than one container) nothing breaks; the
+    ramp is then the only thing left and the worst case is one rung of it.
+  * The jitter is unchanged, so four workers restarting together after a deploy still do
+    not synchronise into a thundering herd.
 
 NO CREDENTIALS IN JOB ROWS
 The payload column carries render OPTIONS only -- template id, photo index, music track, chosen video photos (URLs). The agent is
@@ -372,11 +415,47 @@ PER_PROCESS_WAITING_LIMIT = 1
 HEARTBEAT_SECONDS = 20
 STALE_AFTER_SECONDS = 120
 
-# Poll cadence. See "WHY POLLING" above for why this number.
+# Poll cadence. See "WHY POLLING" above for why these numbers, and for what the old
+# flat two seconds cost on a metered plan.
 POLL_SECONDS = 2.0
 POLL_JITTER = 0.4          # +/- fraction, so restarting workers do not synchronise
 POLL_SECONDS_BUSY = 5.0    # slower poll when this process has no free slots anyway
-SWEEP_SECONDS = 30.0       # stale-claim sweep cadence
+
+# How the interval ramps while the queue keeps coming back empty: (how many consecutive
+# empty polls this rung covers, the interval to use on it). The last rung's count is
+# None, meaning "and thereafter". Any claim, and any doorbell, puts us back on rung one.
+#
+# The shape is deliberate rather than a plain doubling. The first rung keeps the brisk
+# two seconds for a few polls, so the moment just after a render finishes is still
+# brisk; the middle rungs cover an agent working through a few listings in one sitting;
+# the ceiling is only reached after about six minutes in which nothing at all happened,
+# which is the state this app is in for most of the day. At the ceiling one worker asks
+# twice a minute, so four workers ask eight times a minute.
+POLL_IDLE_LADDER = ((3, 2.0), (10, 5.0), (20, 15.0), (None, 30.0))
+
+SWEEP_SECONDS = 30.0       # stale-claim sweep cadence while there is work about
+# ...and while there is not. The two sweeps are two more reads of the same table on the
+# same timer, so leaving them at 30s would have left them as the LARGEST remaining
+# source of requests once the claim poll backed off (about 23,000 a day against 11,500).
+#
+# Stretching them costs recovery time in exactly one case: a worker that dies mid-render
+# leaves a 'running' row, which no claim poll can see, so only the stale sweep frees it.
+# Worst case that job now waits STALE_AFTER_SECONDS + 90s instead of + 30s -- about a
+# minute more, for one agent, in a situation where a render had already been lost. And
+# when the sweep does requeue something it rings the doorbell, so the rest of the fleet
+# takes it immediately instead of waiting out its own ramp. Everything else the sweeps
+# do is measured in tens of minutes (QUEUED_ESCAPE_SECONDS) and cannot tell the
+# difference.
+SWEEP_SECONDS_IDLE = 90.0
+
+# The in-container doorbell. enqueue() replaces this file; every waiting consumer reads
+# it once a second, which costs no request, no egress and no log line. /tmp because that
+# is what the container gives us and this is per-deploy state that may vanish at any
+# time -- losing it only means falling back to the ramp. 0700, like the URA snapshot
+# directory next door, so nothing else on the box can write our doorbell.
+VIDEO_QUEUE_RUNTIME_DIR = os.environ.get("VIDEO_QUEUE_RUNTIME_DIR",
+                                         "/tmp/nestlist_video_queue")
+DOORBELL_READ_SECONDS = 1.0
 
 # How long a job may sit in 'queued' untouched before we conclude nothing is draining
 # the queue and set the listing free again.
@@ -525,6 +604,98 @@ def _exec(build, what, idempotent=True, attempts=3):
     return _db_execute(build, what=what, idempotent=idempotent, attempts=attempts)
 
 
+# ---------------------------------------------------------------------------
+# Waking up. PostgREST cannot wake us, so the poll interval backs off when the queue is
+# empty -- and these two doorbells are what stop that backoff costing an agent anything.
+# See "WHY POLLING" in the module docstring. BOTH ARE BEST EFFORT BY DESIGN: a ring that
+# never arrives costs one rung of the ladder, never a lost job, because the poll that
+# follows finds the row regardless. Nothing here may raise into an enqueue.
+# ---------------------------------------------------------------------------
+_wake_loop = None            # the event loop run_consumer() is running on
+_wake_event = None           # set from any thread to cut an idle sleep short
+_doorbell_dir = None
+_doorbell_dir_checked = False
+
+
+def _runtime_dir():
+    """The private per-container directory for the doorbell, or None if unusable.
+
+    Decided once: if /tmp is read-only, or the directory is somebody else's, there is no
+    point asking again on every poll."""
+    global _doorbell_dir, _doorbell_dir_checked
+    if _doorbell_dir_checked:
+        return _doorbell_dir
+    _doorbell_dir_checked = True
+    try:
+        os.makedirs(VIDEO_QUEUE_RUNTIME_DIR, mode=0o700, exist_ok=True)
+        st = os.stat(VIDEO_QUEUE_RUNTIME_DIR)
+        if (os.path.isdir(VIDEO_QUEUE_RUNTIME_DIR)
+                and (not hasattr(os, "getuid") or st.st_uid == os.getuid())):
+            _doorbell_dir = VIDEO_QUEUE_RUNTIME_DIR
+    except Exception:
+        _doorbell_dir = None
+    if _doorbell_dir is None:
+        logger.info(
+            "video_jobs: no usable doorbell directory (%s) -- a render enqueued by one "
+            "worker is picked up by its siblings on the poll interval instead of at "
+            "once. Nothing breaks; pickup is simply slower when the enqueuing worker "
+            "is already busy.", VIDEO_QUEUE_RUNTIME_DIR)
+    return _doorbell_dir
+
+
+def _doorbell_path():
+    d = _runtime_dir()
+    return os.path.join(d, "enqueued.doorbell") if d else None
+
+
+def _doorbell_token():
+    """What the doorbell currently reads, or None when there is no readable doorbell."""
+    path = _doorbell_path()
+    if not path:
+        return None
+    try:
+        with open(path) as fh:
+            return fh.read(64)
+    except Exception:
+        return None
+
+
+def _wake_local_consumer():
+    """Cut THIS process's consumer sleep short. Safe from any thread; never raises."""
+    loop, event = _wake_loop, _wake_event
+    if loop is None or event is None:
+        return
+    try:
+        loop.call_soon_threadsafe(event.set)
+    except Exception:
+        # The loop is closed (shutdown) or never ran. The next poll finds the row.
+        pass
+
+
+def ring_doorbell():
+    """Tell every consumer in this container that there is work, right now.
+
+    The write is atomic -- temp file, then rename -- so a reader always sees either the
+    old token or the new one, never a half-written file. The token is a nanosecond clock
+    reading rather than the file's mtime, because mtime granularity varies by
+    filesystem and a ring that looks identical to the last one is a ring that is
+    missed."""
+    _wake_local_consumer()
+    path = _doorbell_path()
+    if not path:
+        return
+    tmp = "%s.%d.%s.tmp" % (path, os.getpid(), uuid.uuid4().hex[:8])
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(str(time.time_ns()))
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 # The reason the probe must write, not just read, and what it leaves behind.
 PROBE_LISTING_ID = "__nestlist_startup_probe__"
 
@@ -638,6 +809,10 @@ def enqueue(job_type, listing_id, agent_id, payload):
         res = _exec(lambda db: db.table(TABLE).insert(row),
                     what="video_jobs enqueue insert", idempotent=False)
         if res.data:
+            # Wake this container's consumers now rather than let them wait out the idle
+            # ramp. This is what keeps the backoff from costing the agent who pressed
+            # Generate anything at all -- see "WHY POLLING".
+            ring_doorbell()
             return res.data[0], True
     except Exception as e:
         if not _is_unique_violation(e):
@@ -647,6 +822,12 @@ def enqueue(job_type, listing_id, agent_id, payload):
 
     existing = find_active(job_type, listing_id)
     if existing:
+        if existing.get("status") == STATUS_QUEUED:
+            # Usually a double-clicked Generate, where the ring is harmless. But this is
+            # also the path a deployment that does not return the inserted
+            # representation takes after a SUCCESSFUL insert, and that row does need
+            # somebody woken for it.
+            ring_doorbell()
         return existing, False
     # The unique index fired but the row is gone already (it finished in the microsecond
     # between). Re-read failed to find anything active, so let the caller treat this as
@@ -699,30 +880,87 @@ def get_job(job_id):
 # ---------------------------------------------------------------------------
 # Claiming
 # ---------------------------------------------------------------------------
+# How many queued rows one poll reads. Per type, capped overall, because the cap is
+# there to bound the bytes on the wire and a fairness order needs candidates of more
+# than just the first type to order.
+CLAIM_CANDIDATES_PER_TYPE = 10
+CLAIM_CANDIDATES_MAX = 30
+
+
 def claim_next(job_type):
     """Take the oldest runnable job of this type, or return None.
 
-    Candidates are read first and then claimed one at a time by conditional UPDATE. The
-    SELECT is only a hint -- it may be stale the instant it returns, and that is fine,
-    because nothing is decided by it. The UPDATE decides, and it decides atomically (see
-    the module docstring). Losing the race just means trying the next candidate.
-    """
-    cfg = JOB_TYPES[job_type]
+    Kept as the single-type spelling, used by callers and tests that mean one type.
+    claim_next_any() is what the consumer loop uses, and is the only implementation."""
+    return claim_next_any([job_type])
 
-    # Fleet-wide gate, for types bound by an external service rather than by our CPU.
-    # This is only a cheap pre-filter; the authoritative check happens after the claim,
-    # in confirm_account_slot(), because a count read can always be stale.
-    if cfg.account_limit is not None and _running_count(job_type) >= cfg.account_limit:
+
+def claim_next_any(job_types):
+    """Take the oldest runnable job of ANY of these types, in ONE read.
+
+    `job_types` is in PREFERENCE ORDER -- the consumer's round robin -- and that order
+    is what keeps one type from starving another now the reads have been collapsed into
+    one. It used to be one read per type, issued in round-robin order, so the order of
+    the READS was the fairness. The order of the CANDIDATES is the fairness now: a
+    single `job_type=in.(...)` read comes back oldest-first, and the candidates are then
+    STABLY re-sorted by preference, so every job of the preferred type is tried before
+    any job of the next one and each group keeps its oldest-first order. Same outcome,
+    ONE request where there were three today and five with the Elegant switched on --
+    see "WHY POLLING" for what the old cadence cost.
+
+    Candidates are a hint and nothing more. The SELECT may be stale the instant it
+    returns, and that is fine, because nothing is decided by it: the conditional UPDATE
+    in _try_claim decides, atomically (see the module docstring). Losing a race just
+    means trying the next candidate.
+
+    ONLY FOUR COLUMNS ARE READ. A queued row carries its render payload -- chosen photo
+    urls, music track -- and this read happens every few seconds for the life of the
+    process, so there is no reason to pull that down the wire. The claim's own UPDATE
+    returns the full row, which is what the caller gets back.
+    """
+    order = [t for t in job_types if t in JOB_TYPES]
+    if not order:
         return None
 
     now = _iso(_now())
+    limit = min(CLAIM_CANDIDATES_MAX, CLAIM_CANDIDATES_PER_TYPE * len(order))
     res = _exec(
-        lambda db: db.table(TABLE).select("*")
-        .eq("job_type", job_type).eq("status", STATUS_QUEUED)
+        lambda db: db.table(TABLE).select("id,job_type,attempts,started_at")
+        .in_("job_type", order).eq("status", STATUS_QUEUED)
         .lte("run_after", now)
-        .order("created_at").limit(10),
+        .order("created_at").limit(limit),
         what="video_jobs claim candidates")
-    for candidate in (res.data or []):
+
+    candidates = list(res.data or [])
+    if len(order) > 1 and candidates:
+        rank = {job_type: i for i, job_type in enumerate(order)}
+        # Stable, so the oldest-first order the database returned survives within each
+        # type's group.
+        candidates.sort(key=lambda c: rank.get(c.get("job_type"), len(order)))
+
+    # Fleet-wide gate, for types bound by an external service rather than by our CPU.
+    # ASKED LAZILY -- only once a candidate of that type has actually turned up, and at
+    # most once per type per poll. It is a second request, and an empty queue must not
+    # pay for it: this count alone was one of the three requests this loop used to make
+    # every two seconds, and two of the five with the Elegant switched on. Still only a
+    # cheap pre-filter -- confirm_account_slot() after the claim is the authority,
+    # because a count read can always be stale.
+    gate = {}
+    for candidate in candidates:
+        job_type = candidate.get("job_type")
+        cfg = JOB_TYPES.get(job_type)
+        if cfg is None:
+            # A leftover row of a withdrawn type cannot appear here (the read filters on
+            # the types we were asked for) but a type removed from JOB_TYPES mid-deploy
+            # could. Never claim what we cannot configure.
+            continue
+        if cfg.account_limit is not None:
+            if job_type not in gate:
+                gate[job_type] = _running_count(job_type) < cfg.account_limit
+            if not gate[job_type]:
+                # This type is at its fleet-wide limit. Carry on down the list: another
+                # type's job must not wait behind it.
+                continue
         claimed = _try_claim(candidate)
         if claimed is not None:
             return claimed
@@ -1529,10 +1767,66 @@ def claimable_types(order, running):
     return out
 
 
-def _poll_delay(has_capacity):
-    """Poll briskly while there is somewhere to put work; idle back when there is not."""
-    base = POLL_SECONDS if has_capacity else POLL_SECONDS_BUSY
+def _idle_interval(empty_polls):
+    """Where `empty_polls` consecutive empty reads puts us on POLL_IDLE_LADDER.
+
+    A pure function of one number, so the ramp can be read off and tested without a
+    loop, a clock or a database."""
+    seen = 0
+    for count, interval in POLL_IDLE_LADDER:
+        if count is None:
+            return interval
+        seen += count
+        if empty_polls < seen:
+            return interval
+    return POLL_IDLE_LADDER[-1][1]
+
+
+def _poll_delay(has_capacity, empty_polls=0):
+    """How long to wait before asking the queue again.
+
+    Brisk while there is somewhere to put work AND work keeps turning up; backing off up
+    the ladder while the queue keeps coming back empty; a flat slower cadence when this
+    process has no free slot, which costs nothing anyway because a worker with no free
+    slot does not read the queue at all."""
+    if not has_capacity:
+        base = POLL_SECONDS_BUSY
+    else:
+        base = max(POLL_SECONDS, _idle_interval(empty_polls))
     return base * (1.0 - POLL_JITTER + random.random() * 2 * POLL_JITTER)
+
+
+async def _wait_for_work(delay, doorbell_seen):
+    """Sleep up to `delay` seconds, but come back the instant work appears.
+
+    Returns True when a doorbell rang -- the caller then drops back to the brisk rung --
+    and False when the wait simply ran out.
+
+    The wait is taken in short hops, for three reasons. The in-container doorbell is a
+    FILE, which has to be read rather than waited on. Shutdown has to be noticed in
+    about a second rather than at the end of a 30-second rung, or a redeploy would hold
+    in-flight jobs 'running' for that much longer. And a hop costs nothing: no request,
+    no egress, no log line, about four file reads a second across the whole container.
+    """
+    event = _wake_event
+    deadline = time.monotonic() + max(0.0, delay)
+    while not _shutting_down:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        hop = min(DOORBELL_READ_SECONDS, remaining)
+        if event is None:
+            await asyncio.sleep(hop)
+        else:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=hop)
+                return True
+            except asyncio.TimeoutError:
+                pass
+        token = _doorbell_token()
+        if token is not None and token != doorbell_seen:
+            return True
+    return False
 
 
 async def run_consumer():
@@ -1569,6 +1863,8 @@ async def run_consumer():
     if not available():
         return
 
+    global _wake_loop, _wake_event
+
     running = {}
     tasks = set()
     last_sweep = 0.0
@@ -1576,17 +1872,41 @@ async def run_consumer():
     # Which registered type gets first refusal on the next pass. Advanced ONLY when a
     # job is actually claimed, so the types take turns; see the loop below.
     rr_start = 0
+    # How many reads in a row have come back with nothing. Drives the idle ladder.
+    empty_polls = 0
+    # The in-process doorbell: enqueue() sets this from the request's thread, which cuts
+    # the sleep below short on the one worker most likely to have a free render slot.
+    _wake_event = asyncio.Event()
+    _wake_loop = asyncio.get_running_loop()
+    _runtime_dir()      # decide the cross-worker doorbell once, and log it if unusable
     logger.info("video_jobs: consumer started (worker %s)", WORKER_ID)
 
     while not _shutting_down:
         picked = False
+        polled = False
         has_capacity = True
+        # Cleared BEFORE the read, and the doorbell token taken BEFORE it too, so a
+        # video enqueued WHILE this read is in flight still cuts the sleep that follows
+        # short instead of falling down the gap between the two.
+        _wake_event.clear()
+        doorbell = _doorbell_token()
         try:
             now = time.monotonic()
-            if now - last_sweep > SWEEP_SECONDS * (0.7 + random.random() * 0.6):
+            # The sweeps are reads of this same table on their own timer, so they back
+            # off with everything else once nothing has turned up for a few polls. See
+            # SWEEP_SECONDS_IDLE for the one recovery case that pays for it.
+            sweep_every = (SWEEP_SECONDS_IDLE
+                           if empty_polls >= (POLL_IDLE_LADDER[0][0] or 1)
+                           else SWEEP_SECONDS)
+            if now - last_sweep > sweep_every * (0.7 + random.random() * 0.6):
                 last_sweep = now
-                await asyncio.to_thread(sweep_stale)
+                reclaimed = await asyncio.to_thread(sweep_stale)
                 await asyncio.to_thread(sweep_abandoned_queue)
+                if reclaimed:
+                    # Those rows are queued again. Ring, so whichever worker has a free
+                    # slot takes them now instead of waiting out its own ramp -- the
+                    # agent whose render was lost has already waited once.
+                    ring_doorbell()
             if now - last_prune > PRUNE_EVERY_SECONDS:
                 last_prune = now
                 await asyncio.to_thread(prune_finished)
@@ -1608,30 +1928,37 @@ async def run_consumer():
             # empty queue never costs another its turn. With one type registered this is
             # a single-element loop and behaves exactly as it did before -- kept so that
             # adding a second type does not reintroduce the starvation.
+            #
+            # THE ORDER IS NOW PASSED TO ONE READ rather than deciding the order of
+            # several. claim_next_any() applies it to the candidates of a single
+            # `job_type=in.(...)` query, which is the same fairness for one request
+            # instead of one per type; see "WHY POLLING".
             types = sorted(_RENDERERS)
             rr_start %= max(1, len(types))
             order = types[rr_start:] + types[:rr_start]
             # Which types this process may take one more of. See claimable_types: a full
             # render slot no longer stops this worker starting a job that only waits on
             # somebody else's API, and a waiting job no longer stops it rendering.
-            # Which types this process may take one more of. See claimable_types: a full
-            # render slot no longer stops this worker starting a job that only waits on
-            # somebody else's API, and a waiting job no longer stops it rendering.
             #
-            # ASKED AGAIN FOR EACH TYPE, against the CURRENT `running`, rather than once
+            # RE-ASKED AFTER EVERY CLAIM, against the CURRENT `running`, rather than once
             # for the whole pass. Claiming a job changes what else this process may take
             # -- a worker that has just claimed a Classic must not then also claim a
             # Dramatic -- and a list computed before the first claim would not know that.
-            has_capacity = False
-            for job_type in order:
-                if not claimable_types([job_type], running):
-                    continue
-                has_capacity = True
-                job = await asyncio.to_thread(claim_next, job_type)
+            claimable = claimable_types(order, running)
+            has_capacity = bool(claimable)
+            # Bounded by what one process is allowed to hold at once, so a pass can
+            # never turn into an unbounded claiming spree however the limits are retuned.
+            claims_left = max(1, PER_PROCESS_RENDER_LIMIT + PER_PROCESS_WAITING_LIMIT)
+            while claimable and claims_left and not _shutting_down:
+                polled = True
+                claims_left -= 1
+                job = await asyncio.to_thread(claim_next_any, claimable)
                 if job is None:
-                    continue
+                    break
+                job_type = job.get("job_type")
                 picked = True
-                rr_start = types.index(job_type) + 1
+                if job_type in types:
+                    rr_start = types.index(job_type) + 1
                 running[job_type] = running.get(job_type, 0) + 1
                 task = asyncio.create_task(asyncio.to_thread(execute_job, job))
                 tasks.add(task)
@@ -1644,13 +1971,32 @@ async def run_consumer():
                                      job_type, t.exception())
 
                 task.add_done_callback(_finished)
+                claimable = claimable_types(order, running)
+
+            if picked:
+                # Work is about: back to the brisk rung at once.
+                empty_polls = 0
+            elif polled:
+                empty_polls += 1
+            # A pass that never READ the queue -- no free slot -- leaves the ladder
+            # exactly where it was. Being busy is not evidence that the queue is empty,
+            # and a worker must not come out of a render to find itself on the
+            # 30-second rung.
         except Exception as e:
             # The consumer loop must never die: if it does, this worker stops taking
             # work for the life of the process and nothing says so.
+            #
+            # The ladder is deliberately left ALONE here. A failed poll is not an empty
+            # queue -- backing off on the strength of an error would slow pickup exactly
+            # when the database is already unhappy -- and it is not a claim either, so
+            # it does not reset the ramp.
             logger.warning("video_jobs: consumer poll failed (%s: %s)", type(e).__name__, e)
             has_capacity = True
 
-        await asyncio.sleep(0.05 if picked else _poll_delay(has_capacity))
+        if await _wait_for_work(_poll_delay(has_capacity, empty_polls), doorbell):
+            # Somebody rang: a video has just been enqueued, or a sweep has just put one
+            # back. Come back to the brisk rung immediately.
+            empty_polls = 0
 
 
 def begin_shutdown():

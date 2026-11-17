@@ -5,10 +5,12 @@ WORKER_ID, its own local state and its own registry -- the same isolation four u
 worker processes have. All of them are pointed at one shared FakeDB, which is the only
 thing they have in common, exactly as in production.
 """
+import asyncio
 import importlib.util
 import os
 import random
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -800,6 +802,293 @@ check("only one row exists", len(db.rows) == 1, "rows=%d" % len(db.rows))
 check("find_active resolves either spelling",
       w.find_active(w.JOB_TYPE_CLASSIC, upper) is not None
       and w.find_active(w.JOB_TYPE_CLASSIC, lower) is not None)
+
+
+# ===========================================================================
+print("\n[17] The idle poll ladder: it ramps, and it never ramps back down by itself")
+# ===========================================================================
+# Covers the cost fix of 2026-11-17. The queue was making ~600,000 requests a day
+# against an almost always empty table -- see "WHY POLLING" in video_jobs.py for the
+# measured egress and log-ingestion bill. These are the two pure pieces of the fix.
+db = FakeDB()
+w = load_worker(db, 1700)
+
+rungs = [w._idle_interval(n) for n in range(0, 80)]
+check("a fresh ladder is POLL_SECONDS", w._idle_interval(0) == w.POLL_SECONDS,
+      "%.1fs" % w._idle_interval(0))
+climb = (w._idle_interval(0), w._idle_interval(3), w._idle_interval(13), w._idle_interval(33))
+check("it climbs 2s -> 5s -> 15s -> 30s", climb == (2.0, 5.0, 15.0, 30.0), str(climb))
+check("it never steps back down on its own", all(b >= a for a, b in zip(rungs, rungs[1:])))
+check("and it stops at the ceiling rather than climbing forever",
+      w._idle_interval(10 ** 6) == 30.0, "%.1fs" % w._idle_interval(10 ** 6))
+
+lo, hi = 1.0 - w.POLL_JITTER, 1.0 + w.POLL_JITTER
+brisk = [w._poll_delay(True, 0) for _ in range(200)]
+idled = [w._poll_delay(True, 500) for _ in range(200)]
+busy = [w._poll_delay(False, 500) for _ in range(200)]
+check("a brisk poll sits inside the jitter window around POLL_SECONDS",
+      all(2.0 * lo <= d <= 2.0 * hi for d in brisk))
+check("a fully idled-out poll waits about 30s", all(30.0 * lo <= d <= 30.0 * hi for d in idled))
+check("the jitter survived the change (four workers still cannot synchronise)",
+      len(set(brisk)) > 150, "distinct delays=%d" % len(set(brisk)))
+check("a worker with no free slot keeps its own flat cadence and ignores the ladder "
+      "(it does not read the queue at all on those passes)",
+      all(5.0 * lo <= d <= 5.0 * hi for d in busy))
+check("resetting the count is what snaps the interval back",
+      w._poll_delay(True, 0) <= 2.0 * hi < w._poll_delay(True, 500))
+
+
+# ===========================================================================
+print("\n[18] One read per cycle for every type, and the round robin survives it")
+# ===========================================================================
+db = FakeDB()
+w = load_worker(db, 1900)
+ALL_TYPES = (w.JOB_TYPE_CLASSIC, w.JOB_TYPE_DRAMATIC, w.JOB_TYPE_ELEGANT)
+
+
+def selects():
+    return db.calls.get("select", 0)
+
+
+before = selects()
+empty = w.claim_next_any(list(ALL_TYPES))
+check("an empty queue of three types yields nothing", empty is None)
+check("...and costs ONE request, where it used to cost five "
+      "(one read per type plus a fleet-limit count for two of them)",
+      selects() - before == 1, "requests=%d" % (selects() - before))
+
+w.enqueue(w.JOB_TYPE_CLASSIC, "c-old", "agent-1", {})
+w.enqueue(w.JOB_TYPE_CLASSIC, "c-new", "agent-2", {})
+w.enqueue(w.JOB_TYPE_DRAMATIC, "d-mid", "agent-3", {})
+w.enqueue(w.JOB_TYPE_ELEGANT, "e-mid", "agent-4", {})
+# Unambiguous ages, so "oldest first" is a statement about the data and not about how
+# fast the four enqueues above happened to run.
+ages = {"c-old": "2026-11-17T00:00:01+00:00", "d-mid": "2026-11-17T00:00:02+00:00",
+        "e-mid": "2026-11-17T00:00:03+00:00", "c-new": "2026-11-17T00:00:09+00:00"}
+for row in db.rows:
+    row["created_at"] = ages[row["listing_id"]]
+
+before = selects()
+first = w.claim_next_any([w.JOB_TYPE_DRAMATIC, w.JOB_TYPE_ELEGANT, w.JOB_TYPE_CLASSIC])
+check("whichever type's turn it is goes first, even though another type has an older job",
+      first is not None and first["job_type"] == w.JOB_TYPE_DRAMATIC,
+      "claimed=%s" % (first or {}).get("job_type"))
+check("that cost one candidate read plus the one fleet-limit count the dramatic needs",
+      selects() - before == 2, "requests=%d" % (selects() - before))
+
+before = selects()
+second = w.claim_next_any([w.JOB_TYPE_CLASSIC, w.JOB_TYPE_ELEGANT, w.JOB_TYPE_DRAMATIC])
+check("next turn is the classic's -- and within a type it is still strictly oldest first",
+      second is not None and second["job_type"] == w.JOB_TYPE_CLASSIC
+      and second["listing_id"] == "c-old",
+      "claimed=%s" % (second or {}).get("listing_id"))
+check("a type with no fleet-wide limit costs one request and no count",
+      selects() - before == 1, "requests=%d" % (selects() - before))
+
+third = w.claim_next_any([w.JOB_TYPE_ELEGANT, w.JOB_TYPE_CLASSIC, w.JOB_TYPE_DRAMATIC])
+check("and the third type gets its turn rather than starving behind the busier two",
+      third is not None and third["job_type"] == w.JOB_TYPE_ELEGANT)
+check("one read for all three types does not read the render payload down the wire",
+      "id,job_type,attempts,started_at" in open(MODULE_PATH).read())
+
+# A type at its fleet-wide limit must be stepped OVER, not block the types behind it.
+db = FakeDB()
+w = load_worker(db, 1901)
+w.enqueue(w.JOB_TYPE_ELEGANT, "e-waiting", "agent-1", {})
+w.enqueue(w.JOB_TYPE_CLASSIC, "c-waiting", "agent-2", {})
+for row in db.rows:
+    row["created_at"] = ("2026-11-17T00:00:01+00:00" if row["listing_id"] == "e-waiting"
+                         else "2026-11-17T00:00:05+00:00")
+# Another worker in the fleet already holds the single Elegant slot.
+db.rows.append({"id": "held-elsewhere", "job_type": w.JOB_TYPE_ELEGANT,
+                "listing_id": "e-elsewhere", "agent_id": "agent-9", "status": "running",
+                "attempts": 1, "claimed_by": "another-worker", "payload": {},
+                "created_at": "2026-11-17T00:00:00+00:00",
+                "run_after": "2026-11-17T00:00:00+00:00"})
+stepped_over = w.claim_next_any([w.JOB_TYPE_ELEGANT, w.JOB_TYPE_CLASSIC])
+check("a type at its fleet-wide limit is stepped over, not allowed to block the queue",
+      stepped_over is not None and stepped_over["job_type"] == w.JOB_TYPE_CLASSIC,
+      "claimed=%s" % (stepped_over or {}).get("job_type"))
+check("the elegant it skipped is still waiting its turn, not failed",
+      any(r["listing_id"] == "e-waiting" and r["status"] == "queued" for r in db.rows))
+
+
+# ===========================================================================
+print("\n[19] An idle consumer stops hammering the queue -- and still starts a render "
+      "the moment an agent asks for one")
+# ===========================================================================
+def recording_db_execute(db, log):
+    """make_db_execute, plus a timestamp for every candidate read the consumer makes."""
+    inner = make_db_execute(db)
+
+    def db_execute(build, attempts=3, what="query", idempotent=True):
+        if what == "video_jobs claim candidates":
+            log.append(time.monotonic())
+        return inner(build, attempts=attempts, what=what, idempotent=idempotent)
+    return db_execute
+
+
+def shrink_intervals(module, ladder):
+    """Production's numbers are seconds and minutes; the SHAPE is what is under test."""
+    module.POLL_SECONDS = 0.02
+    module.POLL_SECONDS_BUSY = 0.05
+    module.POLL_JITTER = 0.0
+    module.POLL_IDLE_LADDER = ladder
+    module.DOORBELL_READ_SECONDS = 0.01
+    module.SWEEP_SECONDS = module.SWEEP_SECONDS_IDLE = 10 ** 9
+    module.PRUNE_EVERY_SECONDS = 10 ** 9
+    module.VIDEO_QUEUE_RUNTIME_DIR = tempfile.mkdtemp(prefix="nestlist-doorbell-")
+
+
+def start_consumer(module):
+    """Run this worker's consumer on its own event loop, as uvicorn does."""
+    thread = threading.Thread(target=lambda: asyncio.run(module.run_consumer()),
+                              daemon=True)
+    thread.start()
+    return thread
+
+
+def wait_for(predicate, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+db = FakeDB()
+reads = []
+w = load_worker(db, 1800)
+w.configure(recording_db_execute(db, reads))
+w._table_available = True
+shrink_intervals(w, ((2, 0.02), (None, 0.5)))
+rendered = []
+w.register_renderer(w.JOB_TYPE_CLASSIC,
+                    run=lambda job: (rendered.append(job["listing_id"]),
+                                     ("https://example.invalid/v.mp4", []))[1])
+consumer_thread = start_consumer(w)
+
+time.sleep(1.2)
+flat_out = int(1.2 / 0.02)
+check("an idle consumer backs off instead of reading the queue flat out",
+      len(reads) <= flat_out // 4,
+      "reads=%d in 1.2s; the old flat cadence would have been ~%d" % (len(reads), flat_out))
+gaps = [b - a for a, b in zip(reads, reads[1:])]
+check("by the end of that it is on the ceiling rung, not the brisk one",
+      bool(gaps) and gaps[-1] > 0.3, "last gap=%.3fs" % (gaps[-1] if gaps else -1))
+
+mark = len(reads)
+asked_at = time.monotonic()
+w.enqueue(w.JOB_TYPE_CLASSIC, "listing-wake", "agent-1", {})
+wait_for(lambda: bool(rendered), 2.0)
+pickup = time.monotonic() - asked_at
+check("pressing Generate wakes the consumer instead of waiting out the ramp",
+      rendered == ["listing-wake"] and pickup < 0.25,
+      "render started %.3fs after the enqueue; the rung it was on was 0.5s" % pickup)
+
+wait_for(lambda: len(reads) > mark + 1, 1.0)
+claim_at = reads[mark]
+soon_after = [t for t in reads[mark:] if t - claim_at <= 0.35]
+check("a claim snaps the interval back to the brisk rung, ready for the next listing",
+      len(soon_after) >= 2,
+      "reads within 0.35s of the claim=%d (on the 0.5s rung there would be one)"
+      % len(soon_after))
+
+w.begin_shutdown()
+consumer_thread.join(timeout=3)
+check("and the loop notices a shutdown in about a second, not at the end of its rung",
+      not consumer_thread.is_alive())
+
+# The worker that SERVES the request is not always the worker with a free render slot.
+# A separate import is a separate process here, exactly as in production, so nothing
+# but the doorbell file connects these two.
+db = FakeDB()
+reads = []
+consumer_w = load_worker(db, 1801)
+sibling_w = load_worker(db, 1802)
+shared_dir = tempfile.mkdtemp(prefix="nestlist-doorbell-shared-")
+for module in (consumer_w, sibling_w):
+    shrink_intervals(module, ((1, 0.02), (None, 2.0)))
+    module.VIDEO_QUEUE_RUNTIME_DIR = shared_dir
+consumer_w.configure(recording_db_execute(db, reads))
+consumer_w._table_available = True
+rendered = []
+consumer_w.register_renderer(
+    consumer_w.JOB_TYPE_CLASSIC,
+    run=lambda job: (rendered.append(job["listing_id"]),
+                     ("https://example.invalid/v.mp4", []))[1])
+sibling_thread = start_consumer(consumer_w)
+time.sleep(0.4)                      # long enough to be sitting on the 2s rung
+asked_at = time.monotonic()
+sibling_w.enqueue(sibling_w.JOB_TYPE_CLASSIC, "listing-sibling", "agent-1", {})
+wait_for(lambda: bool(rendered), 3.0)
+pickup = time.monotonic() - asked_at
+check("a job enqueued by a SIBLING worker is picked up at once rather than on the ramp",
+      rendered == ["listing-sibling"] and pickup < 0.6,
+      "render started %.3fs after the enqueue; the rung it was on was 2.0s" % pickup)
+consumer_w.begin_shutdown()
+sibling_thread.join(timeout=3)
+
+# And if the doorbell cannot be used at all -- read-only disk, or workers spread over
+# more than one container -- nothing breaks. The ramp is simply the only thing left.
+db = FakeDB()
+stranded = load_worker(db, 1803)
+stranded.VIDEO_QUEUE_RUNTIME_DIR = "/proc/nestlist-cannot-write-here"
+check("an unusable doorbell directory reads as absent rather than raising",
+      stranded._doorbell_path() is None and stranded._doorbell_token() is None)
+stranded.ring_doorbell()
+job, created = stranded.enqueue(stranded.JOB_TYPE_CLASSIC, "listing-nodoor", "agent-1", {})
+check("and an enqueue with nowhere to ring still writes the job",
+      created is True and job["listing_id"] == "listing-nodoor")
+check("which a poll then finds, exactly as it always did",
+      (stranded.claim_next(stranded.JOB_TYPE_CLASSIC) or {}).get("listing_id")
+      == "listing-nodoor")
+
+
+# ===========================================================================
+print("\n[20] Four real consumer loops still drain a deep queue, exactly once each")
+# ===========================================================================
+# [9] proves the CLAIM protocol under load by calling claim_next directly. This proves
+# the restructured LOOP around it: one combined read per pass, claiming until this
+# process is full, and the backoff never leaving a queued job sitting there.
+db = FakeDB()
+modules = [load_worker(db, 1950 + i) for i in range(4)]
+shared_dir = tempfile.mkdtemp(prefix="nestlist-doorbell-deep-")
+rendered = []
+rendered_lock = threading.Lock()
+
+
+def deep_render(job):
+    with rendered_lock:
+        rendered.append(job["listing_id"])
+    time.sleep(0.02)
+    return ("https://example.invalid/%s.mp4" % job["listing_id"], [])
+
+
+for module in modules:
+    shrink_intervals(module, ((2, 0.02), (None, 0.5)))
+    module.VIDEO_QUEUE_RUNTIME_DIR = shared_dir
+    module.register_renderer(module.JOB_TYPE_CLASSIC, run=deep_render)
+threads = [start_consumer(module) for module in modules]
+for n in range(12):
+    modules[n % 4].enqueue(modules[0].JOB_TYPE_CLASSIC,
+                           "deep-%02d" % n, "agent-%02d" % n, {})
+drained = wait_for(
+    lambda: len(db.rows) == 12 and all(r["status"] in ("done", "failed") for r in db.rows),
+    20.0)
+for module in modules:
+    module.begin_shutdown()
+for thread in threads:
+    thread.join(timeout=5)
+check("every one of the 12 queued renders was drained",
+      drained and all(r["status"] == "done" for r in db.rows),
+      "statuses=%s" % sorted({r["status"] for r in db.rows}))
+check("and not one listing was rendered twice",
+      sorted(rendered) == sorted(set(rendered)),
+      "renders=%d distinct=%d" % (len(rendered), len(set(rendered))))
+check("every drained job recorded a result url",
+      all(r["result_url"] for r in db.rows))
 
 
 # ===========================================================================
