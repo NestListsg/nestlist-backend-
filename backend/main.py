@@ -5423,6 +5423,48 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
         f"SGD {price_psf:,} psf" if price_psf else "",
     ]
 
+    # THE POTENTIAL STYLE'S FACTS, and the reason it gets its own set is that `stats` is
+    # the wrong shape to carry the number a landed buyer cares about most. `stats` is a
+    # fixed four-slot list of strings dating from the original ten templates, and LAND
+    # SIZE has never been in it -- so the first real Potential poster showed 5 rooms,
+    # 5,868 sqft built-up and SGD 1,875 psf, and left 5,573 sqft of land off the page
+    # entirely. The renderer has accepted richer label/value/unit `facts` since the Bold
+    # family was built; nothing was passing them.
+    #
+    # WHAT IS ON IT, AND WHAT IS NOT. The fact row draws at most four, so this is a
+    # choice rather than a list:
+    #   1. LAND SIZE. On landed property it is the number buyers lead with -- the land is
+    #      the asset, and the built-up is what happens to stand on it today.
+    #   2. BUILT-UP. How much house there is to live in.
+    #   3. ROOMS. The first filter in every buyer's head.
+    #   4. PSF. Last, deliberately: it is a derived ratio, the buyer can compute it from a
+    #      price that is already on the poster, and on a landed listing it is the weakest
+    #      of the four. It is the one that goes if a fifth fact is ever added.
+    # BATHROOMS IS DELIBERATELY ABSENT -- it is the slot land size takes. Of the five it is
+    # the least decision-relevant and the most often left unfilled, where land size is
+    # recorded on every landed listing.
+    #
+    # NOTHING IS INVENTED TO FILL SPACE. The renderer drops any item whose value is blank
+    # or zero, so a listing with no land area shows three facts rather than an empty slot,
+    # and a condo -- where _strip_land_fields_for_strata zeroes land_size, because strata
+    # property has none -- shows three without this code needing to know what a condo is.
+    #
+    # ONLY THIS STYLE GETS THEM. The other ten templates never see `facts` at all, and the
+    # four Bold layouts keep deriving theirs from `stats`, so every other poster in the app
+    # renders the same pixels today as it did yesterday.
+    land_num = _to_number(listing.get("land_size"))
+    potential_facts = [
+        {"icon": "plot", "label": "Land size", "unit": "sqft",
+         "value": f"{land_num:,.0f}" if land_num > 0 else ""},
+        {"icon": "house", "label": "Built-up", "unit": "sqft",
+         "value": f"{built_up_num:,.0f}" if built_up_num > 0 else ""},
+        ({"icon": "bed", "label": "Layout", "value": "Studio", "unit": ""}
+         if _listing_is_studio(listing)
+         else {"icon": "bed", "label": "Rooms", "value": bedrooms_val, "unit": ""}),
+        {"icon": "tag", "label": "Price", "unit": "psf",
+         "value": f"{price_psf:,}" if price_psf else ""},
+    ]
+
     # Price is optional. A blank price would otherwise render as "SGD " (empty garbage),
     # so fall back to "Price on request". (The PSF stat above already self-omits at price 0.)
     price_text = f"SGD {_format_price_millions(price_source)}" if price_num > 0 else "Price on request"
@@ -5515,6 +5557,13 @@ def generate_poster(listing_id: str, photo_index: int = 0, template_id: str = No
             template_id=chosen_template_id,
             compliance_line=compliance_line,
             makeover_photo_url=makeover_photo_url,
+            # Passed for the Potential style ALONE. render_poster forwards facts to any
+            # template that declares them, which includes the four Bold layouts -- and
+            # those are covered by the pixel-identical golden test, so handing them facts
+            # here would change their output and rightly fail it. None is what every other
+            # template has always received.
+            facts=(potential_facts if chosen_template_id == POTENTIAL_TEMPLATE_ID
+                   else None),
         )
         poster_image = rendered.image
     except Exception as e:
@@ -5703,6 +5752,12 @@ def generate_poster_concept(listing_id: str, photo_index: int = 0,
             generate_image=fal_images.generate,
             store_image=lambda role, key, data: _store_generated_image(
                 listing_id, role, key, data),
+            # CROP TO THE HOUSE BEFORE FAL SEES THE PHOTO. fal fetches a URL rather than
+            # taking bytes, so a cropped copy has to be stored for it to fetch -- which is
+            # why the fetcher is injected here and the upload goes through the same
+            # _store_generated_image as everything else. Omitting this argument is the
+            # whole backout: fal then gets the original photograph, exactly as before.
+            fetch_photo=poster_renderer.concept_source_photo,
             makeovers_used_this_month=used,
         )
         spent = makeover.images_paid

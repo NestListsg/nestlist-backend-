@@ -81,13 +81,17 @@ MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024
 MAX_SOURCE_PIXELS = 80_000_000
 
 
-def _fetch_image(url, attempts=2):
+def _fetch_image(url, attempts=2, timeout=(5, 25)):
     """Downloads one photo, with a hard byte cap and one retry -- a single flaky CDN read
-    shouldn't cost the agent a whole poster."""
+    shouldn't cost the agent a whole poster.
+
+    `timeout` is (connect, read). The default is every existing caller's; the concept
+    crop passes a tighter one, because there a slow read must cost the crop rather than
+    the agent's wait."""
     last_error = None
     for attempt in range(attempts):
         try:
-            with requests.get(url, timeout=(5, 25), stream=True) as response:
+            with requests.get(url, timeout=timeout, stream=True) as response:
                 response.raise_for_status()
                 declared = response.headers.get("content-length")
                 if declared and int(declared) > MAX_DOWNLOAD_BYTES:
@@ -1599,6 +1603,115 @@ POTENTIAL_PROMPT_FINGERPRINT = hashlib.sha1(
 # so a poster makeover and a video's rebuilt exterior never land on the same path.
 POTENTIAL_ROLE = "poster_potential"
 
+# The cropped copy of the agent's own photograph that fal is given to work from. A
+# SEPARATE ROLE because it is a different kind of object: not generated, not publishable,
+# and never drawn on a poster -- it exists only because fal fetches a URL rather than
+# accepting bytes. See _concept_source_url.
+POTENTIAL_SOURCE_ROLE = "poster_potential_source"
+
+
+# --- cropping to the house BEFORE the AI sees the photograph ---------------
+#
+# WHY THIS IS NOT A PROMPT PROBLEM. Measured twice on Jane's Mugliston Road exterior,
+# 2026-11-17: a white lorry parked at the left edge survived both the original prompt and
+# a rewrite that leads with "FIRST, CLEAR THE SCENE" and names vans, lorries, tarpaulins,
+# bins and crates explicitly. The second attempt did remove a flag from the balcony, add
+# planting and clean the facade -- so the model is reading the instructions -- but it
+# would not shift that vehicle.
+#
+# The lorry is not a fault in the house. It is a fault in where the photographer stood.
+# A crop removes it with certainty, for nothing, and with nothing to disclose: no pixel
+# is invented, so none of the four disclosure guards has anything new to police. Asking a
+# generative model to repaint a framing mistake is paying four cents for a maybe.
+#
+# A HEURISTIC IS ACCEPTABLE HERE, AND THE REASON IS SPECIFIC. Every concept is reviewed
+# by the agent before anything is published, and "No thanks" is free. So a crop that
+# occasionally frames badly costs a look, not a bad advertisement. That is not licence to
+# be careless -- it is the reason not to block this on building a building-detector.
+#
+# AND THE FAILURE DIRECTION IS CHOSEN. Doing nothing is correct: an uncropped photograph
+# is exactly what this feature sent to fal yesterday. Cutting into the building is not
+# correct. So every check below either leaves the photo alone or trims its edges, and
+# anything unmeasurable (a photo that will not open, a probe that raises) means no crop.
+
+# Bump to recrop every listing's concept deliberately -- a changed rule, a different
+# geometry -- WITHOUT editing the constants below. Part of the cache key.
+POTENTIAL_CROP_VERSION = 1
+
+# THE GEOMETRY. Centre-weighted, because an exterior shot centres the building and the
+# clutter (parked vehicles, bins, a neighbour's frontage) collects at the left and right
+# edges. The numbers come from the crop Jane made by hand on the Mugliston photograph and
+# was happy with: 420x330 out of 640x480, which is 66% of the width and 69% of the
+# height, offset right and down.
+CROP_KEEP_W = 0.68
+CROP_KEEP_H = 0.72
+# How much of the trimmed height comes off the TOP. Below a half on purpose: her crop
+# kept the roofline and the sky and spent the trim on the foreground road and driveway,
+# which is where a 4:3 exterior shot wastes its frame.
+CROP_TOP_SHARE = 0.34
+
+# --- and the three ways the crop declines to happen ------------------------
+# 1. NOT A WIDE SHOT. The whole premise is side room to give away. A square or portrait
+#    frame has none, and trimming 32% of its width would cut the building.
+CROP_MIN_ASPECT = 1.15
+# 2. TOO SMALL TO SPEND PIXELS. The crop goes to fal, not to the poster, so what matters
+#    is that the model still has a real photograph to work from. 300 is below the 336 a
+#    640x480 source yields, so the common case still crops.
+CROP_MIN_SHORT_EDGE = 300
+# 3. ALREADY TIGHT, measured rather than assumed. The question "does the building run to
+#    the edge of the frame?" is answered with the cheapest honest proxy there is: a
+#    building is the most STRUCTURED thing in a house photograph -- walls, windows,
+#    railings, a roofline -- while road, sky, grass, a plain lorry flank and a sheet of
+#    tarpaulin are comparatively featureless. So the edge strips are compared with the
+#    middle on mean edge energy. Strips as busy as the middle mean the subject reaches
+#    the edge, and the photo is left alone.
+#
+#    IT IS A PROXY AND IT WILL BE WRONG SOMETIMES, in both directions: a frontage behind
+#    a row of parked cars and foliage reads as busy and will be left uncropped (a missed
+#    improvement, which is the harmless way to be wrong), and a plain-walled house
+#    against plain sky reads as crop-able even when tightly framed (a bad frame, which
+#    the agent sees and rejects). Chosen over a fixed crop because a fixed crop has no
+#    way at all to decline, and over a detector because a detector is weeks of work for a
+#    picture a human is going to look at anyway.
+CROP_EDGE_BAND = 0.15
+CROP_TIGHT_RATIO = 0.85
+# The probe size. Fixed, so the measurement does not depend on the source's resolution --
+# two copies of the same photograph at different sizes must reach the same verdict, or
+# the hires twin and the original would disagree about whether to crop.
+CROP_PROBE = (160, 120)
+
+# A ceiling on what is uploaded for fal to fetch, and it is a STORAGE decision more than
+# a quality one. The crop is taken from the biggest honest copy we hold (the upload-time
+# upscaled twin, aimed at a 3200px long edge), so uncapped we would store a multi-megabyte
+# object per concept -- and these objects accumulate exactly as the generated concepts do,
+# with nothing clearing them up. 1600 keeps a 4:3 crop at roughly 1600x1270, still above
+# the 1200px the poster hero is drawn at, and keeps the crop the SMALLER of the two things
+# a concept stores rather than the larger.
+CROP_MAX_EDGE = 1600
+CROP_JPEG_QUALITY = 86
+
+
+def _crop_fingerprint():
+    """A hash of every constant that decides what fal is given to work from.
+
+    DERIVED, for the same reason the prompt's fingerprint is: a retuned constant must
+    become a cache miss WITHOUT anyone remembering to bump a number. It goes in the cache
+    key, so a different crop rule is a different concept -- and because approvals are
+    recorded against that key, an approval given to yesterday's framing cannot carry over
+    to a newly cropped image. POTENTIAL_CROP_VERSION covers the one case a hash of
+    constants cannot see: a change to the ALGORITHM rather than to its numbers.
+
+    A function rather than an inline expression so a test can re-derive it the same way
+    the module does, instead of keeping a second copy of the tuple that could drift."""
+    return hashlib.sha1(repr((
+        POTENTIAL_CROP_VERSION, CROP_KEEP_W, CROP_KEEP_H, CROP_TOP_SHARE,
+        CROP_MIN_ASPECT, CROP_MIN_SHORT_EDGE, CROP_EDGE_BAND, CROP_TIGHT_RATIO,
+        CROP_PROBE, CROP_MAX_EDGE, CROP_JPEG_QUALITY,
+    )).encode("utf-8")).hexdigest()[:8]
+
+
+POTENTIAL_CROP_FINGERPRINT = _crop_fingerprint()
+
 # Column names for the per-agent month-to-date tally, declared HERE so main.py's wiring
 # and the migration cannot disagree about them. main.py already has the generic
 # compare-and-swap that writes a tally of this shape (_add_old_to_new_images takes the
@@ -1611,6 +1724,22 @@ POTENTIAL_USAGE_COUNT_COLUMN = "potential_makeovers_used"
 # A healthy nano-banana edit lands in 10-25s. Past 45 the agent gets their ordinary
 # poster now rather than a spinner, which is the right trade for a press of a button.
 POTENTIAL_BUDGET_SECONDS = 45
+
+# THE CROP SHARES THAT BUDGET RATHER THAN EXTENDING IT, which is the same discipline
+# fal_images applies to a plan of several images: a slow step eats into the plan instead
+# of lengthening the agent's wait. The frontend has already told the agent to expect
+# about POTENTIAL_BUDGET_SECONDS + 15, and a download and an upload bolted on the front
+# would quietly make a liar of it.
+#
+#   HEADROOM -- the crop is only ATTEMPTED when at least this much of the budget is left.
+#   Below it, fal gets the original photograph: a worse frame is a far better outcome
+#   than a request that runs past what the agent was promised.
+POTENTIAL_CROP_HEADROOM_SECONDS = 25
+#   AND THE FLOOR UNDER THE BILLABLE CALL. If the crop has eaten the budget down past
+#   this, nothing is submitted at all. Submitting at the deadline is the one shape of
+#   failure that costs money for certain and returns nothing: fal bills on accepting the
+#   job, and the collection would be cut off mid-poll. No spend beats a paid nothing.
+POTENTIAL_FAL_MIN_SECONDS = 15
 
 
 # --- white type over a photograph, made legible by measurement ------------
@@ -2102,14 +2231,163 @@ def _register_concept_style(template_id, template_fn, reporting_fn):
 _register_concept_style("potential", _render_potential, _render_potential_reporting)
 
 
+# --- cropping the source photograph ---------------------------------------
+
+def concept_source_photo(url):
+    """The biggest honest copy of a listing photo we hold, for the crop to be taken from.
+
+    Prefers the upload-time upscaled twin, exactly as _fetch_listing_photo does for the
+    poster hero, and for a sharper reason here: fal is given a URL, so whatever we upload
+    is the ceiling on what the model has to work from. A 640x480 original cropped to 68%
+    hands fal 448x336; the same crop off a 2560x1920 twin hands it 1740x1382, and the
+    crop stops being a trade at all.
+
+    NEVER RAISES and returns None rather than failing: no photo means no crop, which is
+    yesterday's behaviour.
+
+    ONE ATTEMPT AND TIGHT TIMEOUTS, and the numbers are chosen to fit the headroom rather
+    than to feel small: two candidate fetches at 4s to connect and 7s to read is 22
+    seconds at the very worst, inside the POTENTIAL_CROP_HEADROOM_SECONDS = 25 that was
+    reserved before this was called. A slow CDN must cost the crop, never the agent's
+    wait -- and the floor under the billable call is the backstop if it ever does."""
+    hires = photo_upscale.hires_url_for(url)
+    for candidate in ([hires] if hires else []) + [url]:
+        try:
+            return _fetch_image(candidate, attempts=1, timeout=(4, 7))
+        except Exception as e:
+            print(f"potential: could not fetch {'the hires twin' if candidate == hires else 'the photo'} "
+                  f"for the concept crop ({type(e).__name__}: {e})")
+    return None
+
+
+def _edge_energy(edges, box):
+    """Mean edge strength over one slice of the probe. 0 when the slice is empty."""
+    x0, y0, x1, y1 = box
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return ImageStat.Stat(edges.crop(box)).mean[0]
+
+
+def _frame_is_tight(image):
+    """Does the subject already run to the left or right edge of this frame?
+
+    True means LEAVE IT ALONE. Anything that cannot be measured also returns True: an
+    unreadable photo is not an invitation to guess at where the building is."""
+    try:
+        grey = image.convert("L").resize(CROP_PROBE, Image.BOX)
+        # FIND_EDGES reads outside the image at its border and leaves a bright frame
+        # there, which would make every photograph look busy at exactly the edges this
+        # is asking about. So the outermost pixel ring is dropped before measuring.
+        edges = grey.filter(ImageFilter.FIND_EDGES).crop(
+            (1, 1, CROP_PROBE[0] - 1, CROP_PROBE[1] - 1))
+        w, h = edges.size
+        band = max(1, round(w * CROP_EDGE_BAND))
+        if w <= band * 2:
+            return True
+        middle = _edge_energy(edges, (band, 0, w - band, h))
+        sides = max(_edge_energy(edges, (0, 0, band, h)),
+                    _edge_energy(edges, (w - band, 0, w, h)))
+        # A blank middle makes this comparison meaningless and the ratio infinite, so it
+        # lands on "tight" and nothing is cropped. Correct: there is no visible subject
+        # to frame on.
+        return sides >= CROP_TIGHT_RATIO * middle
+    except Exception as e:
+        print(f"potential: could not measure the framing, so the photo is left "
+              f"uncropped ({type(e).__name__}: {e})")
+        return True
+
+
+def crop_plan(image):
+    """(box, reason) for one photograph -- box is None when it is left alone.
+
+    `reason` is a plain sentence for the log and for a test to assert on, so "why was
+    this photo not cropped?" has an answer that does not require re-deriving the rule."""
+    if image is None:
+        return None, "there is no photo to crop"
+    w, h = image.size
+    if w <= 0 or h <= 0:
+        return None, "the photo has no size"
+    if w < h * CROP_MIN_ASPECT:
+        return None, f"{w}x{h} is not a wide shot, so there is no side room to trim"
+    box_w, box_h = int(round(w * CROP_KEEP_W)), int(round(h * CROP_KEEP_H))
+    if min(box_w, box_h) < CROP_MIN_SHORT_EDGE:
+        return None, f"a crop would leave only {box_w}x{box_h} for the model to work from"
+    if _frame_is_tight(image):
+        return None, "the subject already reaches the edge of the frame"
+    x0 = (w - box_w) // 2
+    y0 = int(round((h - box_h) * CROP_TOP_SHARE))
+    return (x0, y0, x0 + box_w, y0 + box_h), f"{box_w}x{box_h} out of {w}x{h}"
+
+
+def cropped_jpeg(image, box):
+    """The crop as JPEG bytes, with its long edge capped. Returns (bytes, size)."""
+    crop = image.convert("RGB").crop(box)
+    if max(crop.size) > CROP_MAX_EDGE:
+        scale = CROP_MAX_EDGE / max(crop.size)
+        crop = crop.resize((max(1, round(crop.width * scale)),
+                            max(1, round(crop.height * scale))), Image.LANCZOS)
+    buffer = io.BytesIO()
+    crop.save(buffer, format="JPEG", quality=CROP_JPEG_QUALITY, optimize=True)
+    return buffer.getvalue(), crop.size
+
+
+def _concept_source_url(source_photo_url, key, fetch_photo, store_image):
+    """The URL fal should work from: a cropped copy when cropping helps, else the
+    original photograph.
+
+    NEVER RAISES. Every failure -- a photo that will not download, a probe that cannot
+    be measured, an upload that fails -- returns the original URL, which is exactly what
+    this feature sent to fal before the crop existed. The crop is an improvement on the
+    input, never a precondition for the feature working.
+    """
+    image = None
+    try:
+        image = fetch_photo(source_photo_url)
+    except Exception as e:
+        print(f"potential: the photo could not be fetched for cropping "
+              f"({type(e).__name__}: {e}); fal gets the original")
+    if image is None:
+        return source_photo_url, "no photo to crop"
+
+    box, reason = crop_plan(image)
+    if box is None:
+        print(f"potential: the photo is sent to fal uncropped -- {reason}")
+        return source_photo_url, reason
+    try:
+        data, size = cropped_jpeg(image, box)
+        url = store_image(POTENTIAL_SOURCE_ROLE, key, data)
+    except Exception as e:
+        print(f"potential: the crop could not be stored ({type(e).__name__}: {e}); "
+              "fal gets the original")
+        return source_photo_url, "the crop could not be stored"
+    if not url:
+        return source_photo_url, "the crop could not be stored"
+    print(f"potential: cropped to the house before generating -- {reason}, "
+          f"uploaded at {size[0]}x{size[1]}")
+    return url, f"cropped to {size[0]}x{size[1]} ({reason})"
+
+
 # --- getting the makeover image -------------------------------------------
 
 def potential_cache_key(source_url):
     """A short, stable key for one listing's makeover. The source url is hashed rather
     than stored, so the cache never becomes a second place that knows a photo's address.
-    Same shape as old_to_new.cache_key, deliberately."""
+    Same shape as old_to_new.cache_key, deliberately.
+
+    THE CROP IS IN THE KEY, and it has to be: a differently framed input is a different
+    concept, and an approval is recorded against this key, so a retuned crop must not let
+    yesterday's yes publish a picture nobody has looked at.
+
+    IT IS THE RULE THAT IS IN THE KEY, NOT THE MEASURED GEOMETRY, and that is deliberate.
+    The key is computed in three places, two of which (the free GET of a listing's
+    concept state, and the poster render itself) must never download a photo to answer
+    it -- at fifty agents that would be a fetch per photo per page view. The crop is a
+    pure function of the image, and the image is a pure function of its URL, so
+    (URL, crop rule) already names exactly one cropped input. Nothing is lost by not
+    measuring it here."""
     digest = hashlib.sha1(str(source_url or "").encode("utf-8")).hexdigest()[:20]
-    return f"v{POTENTIAL_PROMPT_VERSION}.{POTENTIAL_PROMPT_FINGERPRINT}:{POTENTIAL_ROLE}:{digest}"
+    return (f"v{POTENTIAL_PROMPT_VERSION}.{POTENTIAL_PROMPT_FINGERPRINT}"
+            f".{POTENTIAL_CROP_FINGERPRINT}:{POTENTIAL_ROLE}:{digest}")
 
 
 def read_makeover_cache(stored):
@@ -2197,7 +2475,7 @@ class Makeover:
 
 
 def makeover_image(source_photo_url, cache, generate_image, store_image,
-                   makeovers_used_this_month=0, deadline=None):
+                   makeovers_used_this_month=0, deadline=None, fetch_photo=None):
     """The makeover image for one listing photo, from cache if we already have it.
 
     NEVER RAISES. Every failure returns a Makeover with url=None and a note, because a
@@ -2209,6 +2487,10 @@ def makeover_image(source_photo_url, cache, generate_image, store_image,
                       injected so this module is testable without a network or a key --
                       the same injection old_to_new.build_plan takes.
     store_image(role, key, data) -> public url. main.py owns storage.
+    fetch_photo(url) -> PIL image or None. Injected for the same reason, and OMITTED
+                      MEANS NO CROP: without it fal is sent the original URL, which is
+                      exactly what this function did before the crop existed. main.py
+                      passes concept_source_photo.
     makeovers_used_this_month -- IMAGES this agent has been billed for this calendar
                       month, from the POTENTIAL_USAGE_* columns. The thing with a price.
 
@@ -2260,8 +2542,36 @@ def makeover_image(source_photo_url, cache, generate_image, store_image,
 
     overall = (deadline if deadline is not None
                else time.monotonic() + POTENTIAL_BUDGET_SECONDS)
+
+    # CROP TO THE HOUSE BEFORE FAL SEES IT. Free, certain, and nothing to disclose --
+    # see the crop block above for why this is not a prompt problem. It happens here,
+    # AFTER the cache read and the ceiling check and BEFORE the only billable call, so a
+    # cached concept costs no download and an agent at their limit costs no upload.
+    #
+    # The crop runs inside the SAME budget as the generation. If there is not enough of
+    # it left to do both, fal gets the original photograph: a worse frame beats a request
+    # that outlives what the agent was told to expect.
+    source_for_fal = source_photo_url
+    if fetch_photo is not None:
+        if time.monotonic() + POTENTIAL_CROP_HEADROOM_SECONDS > overall:
+            print("potential: too little of the budget left to crop; fal gets the "
+                  "original photograph")
+        else:
+            source_for_fal, _why = _concept_source_url(
+                source_photo_url, key, fetch_photo, store_image)
+
+    if time.monotonic() + POTENTIAL_FAL_MIN_SECONDS > overall:
+        # NOT SUBMITTED, so NOT BILLED. fal charges on accepting a job, and a job accepted
+        # this close to the deadline would be cut off during collection -- paid for and
+        # unavailable, the single worst outcome this module has. The agent presses again.
+        result.note = ("The concept is taking longer than expected. Please try again in "
+                       "a moment -- nothing has been used from your allowance.")
+        print("potential: not enough of the budget left to generate safely; "
+              "nothing was submitted and nothing was billed")
+        return result
+
     try:
-        data = generate_image(POTENTIAL_MAKEOVER_PROMPT, [source_photo_url], overall)
+        data = generate_image(POTENTIAL_MAKEOVER_PROMPT, [source_for_fal], overall)
     except Exception as e:
         # COUNT WHAT FAL BILLED, NOT WHAT ARRIVED. Five measured failure shapes leave fal
         # paid and nothing in our hands (an incident where every collect attempt 502s, a
@@ -2287,6 +2597,19 @@ def makeover_image(source_photo_url, cache, generate_image, store_image,
         return result
 
     result.images_paid += 1
+    # WHAT SIZE FAL ACTUALLY GIVES BACK, logged because nobody here knows yet and the
+    # answer decides whether the crop above is free or a trade. The crop is taken from
+    # the upscaled twin where there is one, so fal is handed a BIGGER picture than the
+    # original either way -- but if fal mirrors its input, a listing with no twin is
+    # handing it 435x346 and getting that back for a 1200px hero. One press of Generate
+    # in production prints the answer; grep "potential: fal returned" in Railway.
+    # Wrapped, because a log line must never be the thing that loses a paid image.
+    try:
+        probe = Image.open(io.BytesIO(data))
+        print(f"potential: fal returned {probe.width}x{probe.height} "
+              f"({len(data) // 1024}KB)")
+    except Exception as e:
+        print(f"potential: could not read the generated image's size ({e})")
     try:
         result.url = store_image(POTENTIAL_ROLE, key, data)
     except Exception as e:

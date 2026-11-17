@@ -365,7 +365,177 @@ check("an approval cannot outlive the picture it refers to",
       PR.read_makeover_approvals(PR.write_makeover_cache({K2: "https://b"}, [K1])) == set())
 check("a reworded prompt changes every key, so yesterday's yes cannot carry over",
       PR.potential_cache_key("https://x/y.jpg").startswith(
-          f"v{PR.POTENTIAL_PROMPT_VERSION}.{PR.POTENTIAL_PROMPT_FINGERPRINT}:"))
+          f"v{PR.POTENTIAL_PROMPT_VERSION}.{PR.POTENTIAL_PROMPT_FINGERPRINT}"
+          f".{PR.POTENTIAL_CROP_FINGERPRINT}:"))
+check("the key still fits the 128 characters generate-poster accepts it back in",
+      len(PR.potential_cache_key("https://x/" + "y" * 400 + ".jpg")) <= 128)
+
+# ---------------------------------------------------------------------------
+print("\n[8] the crop: a framing problem is fixed by framing, not by the model")
+
+# Two photographs built so the framing question has a known right answer. "Busy" is
+# coarse blocks rather than fine lines, because the tightness probe measures a 160x120
+# reduction and anything finer would average away into flat grey.
+def photo(w, h, centre=True, edges=False, shade=(150, 150, 145)):
+    img = Image.new("RGB", (w, h), shade)
+    d = PR.ImageDraw.Draw(img)
+    step, bar = max(8, w // 16), max(4, w // 32)
+    def bars(x0, x1):
+        for x in range(int(x0), int(x1), step):
+            d.rectangle((x, 0, x + bar, h), fill=(30, 30, 30))
+    if centre:
+        bars(w * 0.2, w * 0.8)
+    if edges:
+        bars(0, w * 0.15)
+        bars(w * 0.85, w)
+    return img
+
+
+# The shape of Jane's Mugliston exterior: 4:3, the house through the middle, a plain
+# lorry flank and a tarpaulin at the edges.
+WIDE = photo(640, 480)
+box, why = PR.crop_plan(WIDE)
+check("a wide shot with plain edges is cropped to the middle", box is not None, why)
+if box:
+    x0, y0, x1, y1 = box
+    check("the crop lands near the one Jane made by hand (420x330 of 640x480)",
+          abs((x1 - x0) - 420) <= 40 and abs((y1 - y0) - 330) <= 40,
+          f"{x1 - x0}x{y1 - y0}")
+    check("it is horizontally centred and keeps more of the top than the bottom",
+          abs(x0 - (640 - (x1 - x0)) / 2) <= 1 and y0 < (480 - (y1 - y0)) / 2,
+          f"x0={x0} y0={y0}")
+    check("it never reaches outside the photograph",
+          0 <= x0 < x1 <= 640 and 0 <= y0 < y1 <= 480)
+
+check("a frame whose subject runs to the edges is LEFT ALONE",
+      PR.crop_plan(photo(640, 480, edges=True))[0] is None,
+      PR.crop_plan(photo(640, 480, edges=True))[1])
+check("a portrait or square frame has no side room, so it is left alone",
+      PR.crop_plan(photo(480, 640))[0] is None and PR.crop_plan(photo(600, 600))[0] is None,
+      PR.crop_plan(photo(480, 640))[1])
+check("a photo too small to spare the pixels is left alone",
+      PR.crop_plan(photo(400, 300))[0] is None, PR.crop_plan(photo(400, 300))[1])
+check("no photo at all is not a crash", PR.crop_plan(None)[0] is None)
+check("an unmeasurable photo is left alone, not guessed at",
+      PR._frame_is_tight("not an image") is True)
+check("the verdict does not depend on the source's resolution",
+      (PR.crop_plan(photo(640, 480))[0] is not None)
+      == (PR.crop_plan(photo(1280, 960))[0] is not None)
+      == (PR.crop_plan(photo(2560, 1920))[0] is not None))
+
+big = photo(2560, 1920)
+data, size = PR.cropped_jpeg(big, PR.crop_plan(big)[0])
+check("the uploaded crop is capped, and still far bigger than the 1200px hero",
+      max(size) <= PR.CROP_MAX_EDGE and min(size) >= 1200 and data[:2] == b"\xff\xd8",
+      f"{size[0]}x{size[1]}, {len(data) // 1024}KB")
+
+# --- the crop's failure modes all land on "send the original" --------------
+ROLES = []
+
+
+def store_roles(role, key, data):
+    ROLES.append(role)
+    return f"https://example.invalid/{role}/{key}.jpg"
+
+
+def boom_fetch(url):
+    raise RuntimeError("the CDN is having a day")
+
+
+for label, fetch in [("the photo cannot be fetched", boom_fetch),
+                     ("there is no photo to crop", lambda u: None),
+                     ("the frame is already tight",
+                      lambda u: photo(640, 480, edges=True))]:
+    url, why = PR._concept_source_url(SRC, "k", fetch, store_roles)
+    check(f"{label}: fal is sent the ORIGINAL photograph", url == SRC, why)
+
+url, why = PR._concept_source_url(SRC, "k", lambda u: WIDE, boom)
+check("the crop cannot be stored: fal is sent the original photograph", url == SRC, why)
+ROLES.clear()
+url, why = PR._concept_source_url(SRC, "k", lambda u: WIDE, store_roles)
+check("a crop that worked is uploaded under its own role, never the concept's",
+      url != SRC and ROLES == [PR.POTENTIAL_SOURCE_ROLE]
+      and PR.POTENTIAL_SOURCE_ROLE != PR.POTENTIAL_ROLE, (url, ROLES))
+
+# --- and what fal is actually asked to work from ---------------------------
+SENT = []
+
+
+def watch(prompt, urls, deadline):
+    SENT.append(list(urls))
+    return b"\xff\xd8jpeg"
+
+
+os.environ["FAL_KEY"] = "local-injection-not-a-real-key"
+try:
+    SENT.clear()
+    res = PR.makeover_image(SRC, {}, watch, store_roles, fetch_photo=lambda u: WIDE)
+    check("the CROPPED copy is what fal is given, not the original",
+          res.url and SENT and SENT[-1] != [SRC] and len(SENT[-1]) == 1, SENT)
+    SENT.clear()
+    PR.makeover_image(SRC, {}, watch, store_roles)
+    check("no fetcher injected = no crop: the original url, exactly as before",
+          SENT[-1] == [SRC], SENT)
+
+    # The crop shares the generation's budget rather than extending it.
+    SENT.clear()
+    cropped = PR.makeover_image(SRC, {}, watch, store_roles, fetch_photo=lambda u: WIDE,
+                                deadline=PR.time.monotonic() + 20)
+    check("too little budget left to crop: the original goes, and a poster still comes out",
+          cropped.url and SENT[-1] == [SRC], SENT)
+
+    SENT.clear()
+    broke = PR.makeover_image(SRC, {}, watch, store_roles, fetch_photo=lambda u: WIDE,
+                              deadline=PR.time.monotonic() + 2)
+    check("past the floor: NOTHING is submitted, so nothing is billed",
+          broke.url is None and broke.images_paid == 0 and not SENT
+          and "allowance" in broke.note, (broke, SENT))
+finally:
+    os.environ.pop("FAL_KEY", None)
+
+# --- and the key, which is what stops an old yes publishing a new picture ---
+check("the cache key carries the crop rule's fingerprint",
+      PR.POTENTIAL_CROP_FINGERPRINT in PR.potential_cache_key(SRC))
+_was_keep = PR.CROP_KEEP_W
+_key_before = PR.potential_cache_key(SRC)
+_approved_before = PR.write_makeover_cache({_key_before: "https://cdn/c.jpg"},
+                                           [_key_before])
+try:
+    PR.CROP_KEEP_W = 0.5
+    PR.POTENTIAL_CROP_FINGERPRINT = "deadbeef"
+    check("retuning the crop changes every key, so a differently framed concept is a miss",
+          PR.potential_cache_key(SRC) != _key_before)
+    check("and yesterday's approval cannot carry over to the new framing",
+          PR.potential_cache_key(SRC)
+          not in PR.read_makeover_approvals(_approved_before))
+finally:
+    PR.CROP_KEEP_W = _was_keep
+    PR.POTENTIAL_CROP_FINGERPRINT = PR._crop_fingerprint()
+check("the fingerprint in the module really is this crop rule's",
+      PR.POTENTIAL_CROP_FINGERPRINT == PR._crop_fingerprint()
+      and PR.potential_cache_key(SRC) == _key_before)
+
+# ---------------------------------------------------------------------------
+print("\n[9] the facts: land size is on the poster, and nothing is invented")
+
+LANDED = [{"icon": "plot", "label": "Land size", "value": "5,573", "unit": "sqft"},
+          {"icon": "house", "label": "Built-up", "value": "5,868", "unit": "sqft"},
+          {"icon": "bed", "label": "Rooms", "value": "5", "unit": ""},
+          {"icon": "tag", "label": "Price", "value": "1,875", "unit": "psf"}]
+
+labels = [f["label"] for f in PR._bold_facts(LANDED)]
+check("all four facts survive, land size first", labels == ["LAND SIZE", "BUILT-UP", "ROOMS", "PRICE"],
+      labels)
+no_land = [dict(LANDED[0], value=""), *LANDED[1:]]
+check("no land area recorded: three facts, not an empty slot",
+      [f["label"] for f in PR._bold_facts(no_land)] == ["BUILT-UP", "ROOMS", "PRICE"])
+check("a zero land area is 'never filled in', not a claim of no land",
+      [f["label"] for f in PR._bold_facts([dict(LANDED[0], value="0"), *LANDED[1:]])]
+      == ["BUILT-UP", "ROOMS", "PRICE"])
+check("the land size really reaches the pixels (the poster differs without it)",
+      render(facts=LANDED).tobytes() != render(facts=no_land).tobytes())
+check("every fact the poster can draw has an icon that exists",
+      all(f["icon"] in PR._BOLD_ICONS for f in LANDED))
 
 print(f"\n{PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

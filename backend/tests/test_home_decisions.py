@@ -574,7 +574,7 @@ check("My Listings rows are served through the same strip",
 # ---------------------------------------------------------------------------
 print("\n[8] poster: condo price + CEA footer; landed poster byte-identical")
 import poster_renderer as PR  # noqa: E402
-from PIL import Image  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
 
 def _git_show(spec):
     """Source of a file at a pushed commit, or None when not inside the git repo (e.g. a
@@ -612,6 +612,9 @@ check("band never raises on junk (returns the poster)", PR._add_compliance_band(
       in ((1200, 1500), (10, 10)))
 
 POSTER_CALLS = []
+# The photograph the concept crop is handed. None = nothing to crop, so fal gets the
+# original url -- which is what every case here wants except the crop case itself.
+CONCEPT_PHOTO = [None]
 # None = mimic a healthy render (the concept is used when one was supplied); False =
 # force the renderer's own fallback, which is what the guards do when the concept cannot
 # be shown honestly. That second case is the one the API used to lie about.
@@ -632,6 +635,11 @@ NS["poster_renderer"] = types.SimpleNamespace(
     # The Potential paths use the REAL module functions, so this exercises the actual
     # budget/cache/billing code rather than a second copy of it.
     makeover_image=PR.makeover_image,
+    # The crop that happens BEFORE fal sees the photograph. Injected rather than
+    # downloading: None means "no photo to crop", which is the uncropped path every case
+    # below but the crop case itself takes.
+    concept_source_photo=lambda url: CONCEPT_PHOTO[0],
+    POTENTIAL_SOURCE_ROLE=PR.POTENTIAL_SOURCE_ROLE,
     read_makeover_cache=PR.read_makeover_cache,
     read_makeover_approvals=PR.read_makeover_approvals,
     write_makeover_cache=PR.write_makeover_cache,
@@ -744,6 +752,39 @@ check("no concept made yet: real photo, nothing bought, and the agent is told",
       POSTER_CALLS[-1]["makeover_photo_url"] is None and res["concept_used"] is False
       and not TALLY and not STORED
       and any("hasn't been made yet" in w for w in res["warnings"]), res["warnings"])
+
+# --- the other fault found by running this for real on 2026-11-17 ----------
+# The poster showed 5 rooms, 5,868 sqft built-up and SGD 1,875 psf, and left 5,573 sqft of
+# LAND off the page -- the one number a landed buyer leads with. The cause was that the
+# endpoint only ever passed the legacy four-slot `stats`, so the renderer derived its facts
+# from that; `land_size` has never been in it. These four cases pin the fix: land size is
+# on, bathrooms is the slot it took, a listing without land shows three facts rather than an
+# empty slot, and no other template's input changes.
+MUGLISTON = dict(_listing({KEY: "https://cdn/c.jpg"}, [KEY]))
+MUGLISTON.update({"land_size": 5573, "built_up": 5868, "bedrooms": "5",
+                  "bathrooms": "6", "price": "11000000"})
+res = _poster(listing=MUGLISTON)
+facts = POSTER_CALLS[-1]["facts"] or []
+check("the Potential poster is handed land size FIRST, then built-up, rooms, psf",
+      [(f["label"], f["value"], f["unit"]) for f in facts]
+      == [("Land size", "5,573", "sqft"), ("Built-up", "5,868", "sqft"),
+          ("Rooms", "5", ""), ("Price", "1,875", "psf")], facts)
+check("bathrooms is the slot land size took, so it is not among them",
+      not any("ath" in f["label"] for f in facts))
+
+no_land = dict(MUGLISTON)
+no_land["land_size"] = 0
+_poster(listing=no_land)
+blank = [f for f in (POSTER_CALLS[-1]["facts"] or []) if not f["value"]]
+check("no land area: the item is blank so the renderer drops it -- nothing is invented",
+      len(blank) == 1 and blank[0]["label"] == "Land size",
+      POSTER_CALLS[-1]["facts"])
+
+NS["POSTER_TEMPLATES"] = [{"id": "editorial"}]
+_use(_DBS(BARE_AGENT, dict(MUGLISTON)))
+NS["generate_poster"]("L1", template_id="editorial", agent=BARE_AGENT)
+check("every other template is handed facts=None, exactly as before",
+      POSTER_CALLS[-1]["facts"] is None and POSTER_CALLS[-1]["template_id"] == "editorial")
 
 res = _poster(listing=_listing({KEY: "https://cdn/c.jpg"}))
 check("CONCEPT CACHED BUT NOT APPROVED: still the real photo -- the gate holds",
@@ -864,6 +905,44 @@ res = _concept(listing=_listing({KEY: "https://cdn/c.jpg"}))
 check("a cached concept is free to look at again",
       res["concept_url"] == "https://cdn/c.jpg" and res["from_cache"] is True
       and not TALLY and not MERGED, res)
+
+# --- the crop, wired through the real endpoint -----------------------------
+# The two faults found by running this for real on 2026-11-17: a parked lorry the model
+# refused to remove whatever the prompt said, and a poster with no land size on it. This
+# half is the lorry. The endpoint must send fal a CROPPED copy of the photograph, stored
+# under its own role, and must still produce a concept when the crop cannot be made.
+SENT_TO_FAL = []
+
+
+def _watch_generate(prompt, urls, deadline):
+    SENT_TO_FAL.append(list(urls))
+    return b"\xff\xd8jpeg-bytes"
+
+
+WIDE_PHOTO = Image.new("RGB", (640, 480), (150, 150, 145))
+for _x in range(128, 512, 40):
+    ImageDraw.Draw(WIDE_PHOTO).rectangle((_x, 0, _x + 20, 480), fill=(30, 30, 30))
+
+CONCEPT_PHOTO[0] = WIDE_PHOTO
+SENT_TO_FAL.clear()
+try:
+    res = _concept(generate=_watch_generate)
+finally:
+    CONCEPT_PHOTO[0] = None
+check("the concept is generated from a CROPPED copy, not the photo as shot",
+      res["concept_url"] == "https://cdn/makeover.jpg"
+      and SENT_TO_FAL and SENT_TO_FAL[-1] != [PHOTO], SENT_TO_FAL)
+check("the crop is uploaded under its own role, so it can never be mistaken for a concept",
+      any(role == PR.POTENTIAL_SOURCE_ROLE for _lid, role, _key in STORED)
+      and any(role == PR.POTENTIAL_ROLE for _lid, role, _key in STORED), STORED)
+check("only the CONCEPT is cached against the listing -- never the crop",
+      MERGED and MERGED[-1][2] == {KEY: "https://cdn/makeover.jpg"}, MERGED)
+
+SENT_TO_FAL.clear()
+res = _concept(generate=_watch_generate)
+check("no photo to crop: fal gets the original and a concept still comes out",
+      res["concept_url"] == "https://cdn/makeover.jpg"
+      and SENT_TO_FAL[-1] == [PHOTO], SENT_TO_FAL)
 
 
 class _Billed(PR.fal_images.FalTemporary):
