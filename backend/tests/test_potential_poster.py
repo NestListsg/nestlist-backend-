@@ -258,10 +258,22 @@ check("the prompt is screened before it can be sent, and passes",
       PR.fal_images.screen_prompt(PR.POTENTIAL_MAKEOVER_PROMPT) is None)
 check("the prompt forbids inventing a house number or any lettering",
       "no house number" in PR.POTENTIAL_MAKEOVER_PROMPT
-      and "no lettering is added anywhere" in PR.POTENTIAL_MAKEOVER_PROMPT)
-check("the prompt leaves the neighbours alone",
+      and "sign or lettering anywhere" in PR.POTENTIAL_MAKEOVER_PROMPT
+      and "stays exactly as it is" in PR.POTENTIAL_MAKEOVER_PROMPT)
+# The neighbours' BUILDINGS are the guarantee, not the clutter in front of them.
+# Rewritten 2026-11-17 and the loosening is deliberate: the first real generation
+# changed almost nothing, because "keep the road and the kerb exactly as
+# photographed, not tidied" contradicted the instruction to clear the lorry and the
+# tarpaulin, and the model resolved the contradiction by doing nothing. Transient
+# objects may now be cleared wherever they stand; a neighbour's HOUSE still may not
+# be rebuilt, restyled or given a new roof, which is the line Jane actually drew.
+check("the prompt leaves the neighbouring buildings alone",
       "neighbouring buildings" in PR.POTENTIAL_MAKEOVER_PROMPT
-      and "not repainted and not tidied" in PR.POTENTIAL_MAKEOVER_PROMPT)
+      and "neither rebuilt nor restyled" in PR.POTENTIAL_MAKEOVER_PROMPT
+      and "same shape and the same height" in PR.POTENTIAL_MAKEOVER_PROMPT)
+check("the prompt still forbids adding anything that is not there",
+      "ADD NOTHING" in PR.POTENTIAL_MAKEOVER_PROMPT
+      and "no cars" in PR.POTENTIAL_MAKEOVER_PROMPT)
 check("the prompt keeps the real sky, per the no-sky-replacement rule",
       "Keep the sky" in PR.POTENTIAL_MAKEOVER_PROMPT)
 check("the prompt keeps the building honest (same structure and camera)",
