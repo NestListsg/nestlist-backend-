@@ -361,8 +361,20 @@ def _collect(accepted, deadline):
 
 
 def generate_clip(prompt, start_url, end_url=None, seconds=CLIP_SECONDS_SHORT,
-                  negative_prompt=None, deadline=None):
+                  *, negative_prompt=None, deadline=None):
     """One generated clip's mp4 bytes. Raises a FalError; never returns None.
+
+    THE LAST TWO ARE KEYWORD-ONLY, AND THAT IS A SCAR. They used to be positional, and
+    old_to_new's clip loop passed its shared deadline fifth -- into `negative_prompt`.
+    A float then reached screen_prompt, which called .lower() on it, so EVERY Elegant
+    clip died of an AttributeError before the request was built: no HTTP call, no fal
+    billing, and -- because an AttributeError is not a FalError -- none of the
+    classification or the seconds accounting below ever ran. It was invisible for
+    another reason too: build_clip_plan documents the injected contract as
+    (prompt, start_url, end_url, seconds, deadline), every test stub implements THAT
+    signature, and nothing compared the stub with the real function. Keyword-only makes
+    the same slip a TypeError on the first call instead of a silent film of stills.
+    See test_elegant_render's injected-contract check.
 
     `start_url` and `end_url` are PUBLIC urls fal fetches itself -- the listing bucket is
     already public -- so several megabytes of keyframe never pass through our process on

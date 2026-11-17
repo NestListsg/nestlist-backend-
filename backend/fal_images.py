@@ -274,7 +274,13 @@ def screen_prompt(prompt):
     plan around it -- knowing a room cannot be generated BEFORE the agent waits is worth
     more than discovering it afterwards.
     """
-    low = (prompt or "").lower()
+    # str() rather than trusting the caller. This read `(prompt or "").lower()` and a
+    # float reached it -- fal_video.generate_clip's deadline, passed into the wrong
+    # parameter -- so screening raised AttributeError from OUTSIDE the FalError
+    # hierarchy, which meant no classification, no billing count and no degradation
+    # note: every Elegant clip failed silently. The call bug is fixed at its two ends;
+    # this is so the screen can never again be the thing that explodes.
+    low = str(prompt or "").lower()
     for word in REFUSED_WORDS:
         if word in low:
             return word

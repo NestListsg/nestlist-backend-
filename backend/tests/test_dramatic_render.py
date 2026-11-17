@@ -190,8 +190,12 @@ def capture(plan, **kwargs):
                 f.write(b"\0" * 2048)
     photos = kwargs.pop("photos")
     saved = (vr._run_ffmpeg, vr._fetch_image, vr._probe_duration, vr._has_ffmpeg_filter,
-             vr._render_contact_card)
+             vr._render_contact_card, vr._clip_has_picture)
     vr._run_ffmpeg = fake_run
+    # The shots here are 2048 zero bytes, not video, so the real blank check would have
+    # to fail-open on every one of them. Stubbed to keep this file's "no ffmpeg" claim
+    # true; the check's own behaviour is proved in section [4a] below.
+    vr._clip_has_picture = lambda path, seconds: True
     vr._fetch_image = lambda url, attempts=2, deadline=None: photos[url]
     vr._probe_duration = lambda path, fallback: fallback
     vr._has_ffmpeg_filter = lambda name: name == "cas"
@@ -204,7 +208,7 @@ def capture(plan, **kwargs):
         result = vr.render_dramatic_video(plan, **kwargs)
     finally:
         (vr._run_ffmpeg, vr._fetch_image, vr._probe_duration, vr._has_ffmpeg_filter,
-         vr._render_contact_card) = saved
+         vr._render_contact_card, vr._clip_has_picture) = saved
         vr._clarity_filter_cache = None
     return commands, result
 
@@ -251,6 +255,20 @@ check("BUILDS: the new room rises from the floor with a soft edge",
       any("clip((Y-H*(1-clip(T/" in g for g in bodies))
 check("PUNCH: a hard cut inside a white flash, and the zoom peaks in the middle",
       any("if(lt(T,2.500),A,B)" in g and g.count(":color=white") == 2 for g in bodies))
+# THE MUGLISTON ROAD BLANK. The check above counts the two white fades and says nothing
+# about WHEN they apply, which is why it passed while the fourth room shipped as 5.5
+# seconds of plain white. ffmpeg's fade does not confine itself to its own window: t=out
+# holds the fade colour for every frame after st+d, and t=in holds it for every frame
+# before st, so two bare fades white out each other's half and the whole shot goes. Each
+# one must be gated to the half it owns.
+punch_graph = [g for g in bodies if "if(lt(T,2.500),A,B)" in g]
+check("the punch's white fades are GATED, so the flash cannot white out the whole shot",
+      len(punch_graph) == 1
+      and "fade=t=out:st=2.380:d=0.120:color=white:enable='lt(t,2.500)'" in punch_graph[0]
+      and "fade=t=in:st=2.500:d=0.120:color=white:enable='gte(t,2.500)'" in punch_graph[0],
+      punch_graph[0][-260:] if punch_graph else "no punch shot found")
+check("every white fade in the film is gated to a span -- none is left bare",
+      all(g.count(":color=white") == g.count(":color=white:enable=") for g in bodies))
 punch = [s for s in vr.dramatic_shots(True, True, [True] * 4)
          if s.get("treatment") == vr.TREATMENT_PUNCH][0]
 mid = vr._zoom_at(punch["knots"], int(round(punch["seconds"] * vr.FPS)) // 2)

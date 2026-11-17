@@ -1130,6 +1130,64 @@ def _probe_duration(path, fallback):
     return fallback
 
 
+# --- is there actually a picture in this shot? -------------------------------------
+# THE ONE CHECK THAT IS NOT ABOUT FAILING. Every other guard in this module catches a
+# shot that did not render: ffmpeg exits non-zero, the download dies, the mask is
+# unusable. None of them can see a shot that renders PERFECTLY and is blank -- exit code
+# 0, the duration exact to the frame, the treatment the one that was asked for. That is
+# the worst failure we have, because the agent is told the film is fine and posts it.
+BLANK_SAMPLE_FPS = 2        # frames sampled per second of shot
+BLANK_SAMPLE_PX = 32        # each one shrunk to this square, in grey
+BLANK_MAX_SAMPLES = 40      # ceiling, so one long shot cannot cost more than the rest
+# Measured on the Mugliston Road film that found this: real shots scored 30-47, the
+# closing card 61, and the blank shot 5.8 -- and that 5.8 was entirely the disclosure
+# badge in the corner, so a blank shot with no notice scores near zero. 12 sits with a
+# 2.5x margin on both sides.
+BLANK_MIN_STDDEV = 12.0
+
+
+def _frame_stddev(raw, count):
+    """Spread of grey levels in each of `count` packed BLANK_SAMPLE_PX frames."""
+    size = BLANK_SAMPLE_PX * BLANK_SAMPLE_PX
+    for index in range(count):
+        frame = raw[index * size:(index + 1) * size]
+        if len(frame) < size:
+            break
+        mean = sum(frame) / float(size)
+        yield (sum((v - mean) ** 2 for v in frame) / float(size)) ** 0.5
+
+
+def _clip_has_picture(path, seconds):
+    """True if any sampled frame of this finished shot has a picture in it.
+
+    ANY frame, not every frame: the punch treatment's flash really is a white frame, a
+    dissolve really does pass through a flat moment, and condemning those would be worse
+    than the bug this catches. A shot is only called blank when NOTHING in it has detail.
+
+    Never raises, and on its own failure returns True. A flaky check must not be able to
+    throw away a good shot -- it is here to catch a blank one, not to become a new way
+    for a render to fail.
+    """
+    try:
+        frames = max(1, min(BLANK_MAX_SAMPLES,
+                            int(round(seconds * BLANK_SAMPLE_FPS))))
+        out = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path,
+             "-vf", f"fps={BLANK_SAMPLE_FPS},scale={BLANK_SAMPLE_PX}:"
+                    f"{BLANK_SAMPLE_PX},format=gray",
+             "-frames:v", str(frames), "-f", "rawvideo", "-"],
+            capture_output=True, timeout=TIMEOUT_PROBE, check=True,
+        )
+        measured = list(_frame_stddev(out.stdout, frames))
+        if not measured:
+            return True
+        return max(measured) >= BLANK_MIN_STDDEV
+    except Exception as e:
+        logger.warning("could not check %s for a picture (%s); assuming it has one",
+                       path, e)
+        return True
+
+
 def _escape_filter_path(path):
     """Paths land inside an ffmpeg filter argument, where ':' separates options and
     '\\' escapes. Our own paths never contain either, but the font/text files are
@@ -4147,9 +4205,21 @@ def _dramatic_room_clip(before, after, out_path, workdir, name, treatment, knots
         tail.append(clarity)
     if treatment == TREATMENT_PUNCH:
         half = seconds / 2.0
+        # EACH FADE IS GATED TO ITS OWN HALF, AND THAT GATE IS NOT COSMETIC.
+        # ffmpeg's fade does not only touch the window it is given: t=out HOLDS the
+        # fade colour for every frame AFTER st+d, and t=in holds it for every frame
+        # BEFORE st. Chained bare, each one's hold covers the half the other was
+        # meant to own and the entire shot comes out plain white -- with the notice
+        # still legible on top of it, because the notice is drawn after these. The
+        # whole shot renders, ffmpeg exits 0 and the duration is exactly right, so
+        # nothing downstream can tell; see the content check in _run_ffmpeg's
+        # caller. `enable` bypasses a filter outside its span, which leaves the
+        # frame untouched, so the flash is the only thing either fade now does.
         tail.append(f"fade=t=out:st={half - FLASH_SECONDS:.3f}"
-                    f":d={FLASH_SECONDS:.3f}:color=white")
-        tail.append(f"fade=t=in:st={half:.3f}:d={FLASH_SECONDS:.3f}:color=white")
+                    f":d={FLASH_SECONDS:.3f}:color=white"
+                    f":enable='lt(t,{half:.3f})'")
+        tail.append(f"fade=t=in:st={half:.3f}:d={FLASH_SECONDS:.3f}:color=white"
+                    f":enable='gte(t,{half:.3f})'")
     tail += _notice_filters(notice, workdir, name)
     tail.append("format=yuv420p")
     filters.append(last + ",".join(tail) + "[v]")
@@ -4571,6 +4641,17 @@ def render_dramatic_video(plan, agent_name="", agent_contact_line="",
                     logger.warning("dramatic: shot %d (%s) failed (%s); skipping it",
                                    position, shot["role"], e)
                     degradations.append("one shot failed to render and was left out")
+                    continue
+                if not _clip_has_picture(clip_path, shot["seconds"]):
+                    # It rendered, and it rendered nothing. Dropped rather than kept,
+                    # because seconds of flat colour in the middle of a film is worse
+                    # than the cut that replaces it -- and REPORTED, which is the whole
+                    # point: until this existed, this was the one failure the agent was
+                    # never told about.
+                    logger.error("dramatic: shot %d (%s, %s) rendered blank; dropping "
+                                 "it", position, shot["role"], shot["kind"])
+                    degradations.append(
+                        "one shot came out blank and was left out of the video")
                     continue
                 clip_paths.append(clip_path)
                 # The seconds of the shots that SURVIVED, in case ffprobe cannot read the

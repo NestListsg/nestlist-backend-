@@ -736,6 +736,41 @@ os.environ.pop("FAL_KEY", None)
 # ===========================================================================
 print("\n[6] build_clip_plan: what it buys, what it caches, what it degrades")
 # ===========================================================================
+# THE INJECTED CONTRACT MUST MATCH THE REAL FUNCTION. Nothing in this file used to
+# compare them, and that gap cost Jane the whole feature: build_clip_plan called
+# generate_clip with the shared deadline FIFTH and positional, fal_video's fifth
+# parameter was `negative_prompt`, and so a float reached screen_prompt and every single
+# Elegant clip died of an AttributeError before any request was built -- no fal billing,
+# no FalError, no degradation note, a film of stills every time. Every Spy below takes
+# `deadline` fifth, so every test here passed while production failed 100% of the time.
+# This binds the REAL signature against the exact shape build_clip_plan calls it with.
+import inspect as _inspect
+
+def _binds(*args, **kwargs):
+    """Can the REAL generate_clip be called this way at all?"""
+    try:
+        _inspect.signature(fal_video.generate_clip).bind(*args, **kwargs)
+        return True
+    except TypeError:
+        return False
+
+_ARGS = ("a prompt", "https://x/a.jpg", "https://x/b.jpg", 5)
+check("the real generate_clip accepts the call build_clip_plan actually makes",
+      _binds(*_ARGS, deadline=123.0))
+check("the deadline passed POSITIONALLY is now refused outright, instead of silently "
+      "becoming the negative prompt",
+      not _binds(*_ARGS, 123.0))
+def _screens_a_float():
+    """Caught, so a regression here FAILS this check rather than aborting the file."""
+    try:
+        return fal_images.screen_prompt(123.0) is None
+    except Exception:
+        return False
+
+check("screen_prompt survives a non-string rather than raising AttributeError outside "
+      "the FalError hierarchy", _screens_a_float())
+
+
 def make_plan(rooms=2, cleared=True, contents=None):
     plan = old_to_new.Plan()
     plan.opening_url = "https://x/anon.jpg"

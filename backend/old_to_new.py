@@ -1394,9 +1394,14 @@ def build_clip_plan(plan, treatment, generate_clip=None, store_clip=None,
                      are filled in, and any degradation is appended to its own list so
                      ONE list of plain-language notes reaches the agent.
     treatment     -- an ElegantTreatment, or its id.
-    generate_clip(prompt, start_url, end_url, seconds, deadline) -> mp4 bytes.
+    generate_clip(prompt, start_url, end_url, seconds, *, deadline) -> mp4 bytes.
                      fal_video.generate_clip, injected so this module is testable without
-                     a network, without a key and without spending money.
+                     a network, without a key and without spending money. DEADLINE IS
+                     KEYWORD-ONLY and this line is a contract: it once read as a fifth
+                     POSITIONAL argument, the real function's fifth parameter was
+                     `negative_prompt`, and every Elegant clip failed in production while
+                     every stub built to this line passed. A stub must now match the real
+                     signature, and a test checks that it does.
     store_clip(stage, key, data) -> public url. main.py owns storage.
     clip_cache    -- {key: url} already on the listing (read_clip_cache).
     seconds_used_this_month -- SECONDS of video this agent has already been billed for
@@ -1602,8 +1607,10 @@ def build_clip_plan(plan, treatment, generate_clip=None, store_clip=None,
         it returns bytes or raises, and every counter, every store and every persist
         happens back on the main thread. That is what keeps the money accounting
         single-threaded while the waiting is not."""
+        # `deadline` BY NAME. Passed positionally it landed on fal_video.generate_clip's
+        # `negative_prompt` and killed every clip before it was sent; see that function.
         return generate_clip(item["prompt"], item["start_url"], item["end_url"],
-                             item["seconds"], overall)
+                             item["seconds"], deadline=overall)
 
     index = 0
     while index < len(budgeted):
